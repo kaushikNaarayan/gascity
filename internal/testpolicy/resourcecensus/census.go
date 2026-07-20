@@ -167,7 +167,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeCmdGCUntagged,
 			Resource:        ResourceEnvironment,
-			BaselineCalls:   4344,
+			BaselineCalls:   4346,
 			BaselineFiles:   205,
 			ReportedCalls:   3960,
 			ReportedFiles:   184,
@@ -375,7 +375,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeCmdGCUntagged,
 			Resource:        ResourceEnvironment,
-			BaselineCalls:   4338,
+			BaselineCalls:   4340,
 			BaselineFiles:   205,
 			ReportedCalls:   4348,
 			ReportedFiles:   200,
