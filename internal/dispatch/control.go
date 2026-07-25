@@ -374,6 +374,19 @@ func markControllerSpawnError(store beads.Store, beadID string, err error, opts 
 	metadata := map[string]string{
 		beadmeta.ControllerErrorMetadataKey: err.Error(),
 	}
+	// A persist-only failure means the work completed and only recording it
+	// failed. Retry the persist; never fall through to the hard branch below,
+	// which would close the bead failed and discard the completed result.
+	// partialAttemptAttachError is a different type (checked above via
+	// isPartialAttemptAttachError) so it does not reach here.
+	if isPersistFailureError(err) {
+		metadata[beadmeta.ControllerErrorClassMetadataKey] = beadmeta.FailureClassPersist
+		metadata[beadmeta.ControllerRetryableMetadataKey] = "true"
+		if writeErr := store.SetMetadataBatch(beadID, metadata); writeErr != nil {
+			opts.tracef("controller-spawn-error bead=%s recording persist failure metadata failed err=%v", beadID, writeErr)
+		}
+		return true
+	}
 	if IsTransientControllerError(err) && !isPartialAttemptAttachError(err) {
 		metadata[beadmeta.ControllerErrorClassMetadataKey] = beadmeta.FailureClassTransient
 		metadata[beadmeta.ControllerRetryableMetadataKey] = "true"
@@ -1757,22 +1770,29 @@ func copyNonGCMetadata(dst, src map[string]string) {
 	}
 }
 
+// updateMetadataAndClose records a bead's final metadata and closes it. Every
+// error it returns is a persist-only failure: the outcome/metadata the caller
+// wants written is already decided, so a store.Update / store.Get / store.Close
+// failure here means only the recording of a completed result failed, not the
+// work. It tags those errors with persistFailureError so the retry engine
+// classifies them as beadmeta.FailureClassPersist (retry the persist step)
+// rather than transient (re-run the attempt) or hard (discard the result).
 func updateMetadataAndClose(store beads.Store, beadID string, metadata map[string]string) error {
 	status := "closed"
 	if err := store.Update(beadID, beads.UpdateOpts{
 		Status:   &status,
 		Metadata: metadata,
 	}); err != nil {
-		return err
+		return wrapPersistFailure(err)
 	}
 	bead, err := store.Get(beadID)
 	if err != nil {
-		return fmt.Errorf("verifying close of %s: %w", beadID, err)
+		return wrapPersistFailure(fmt.Errorf("verifying close of %s: %w", beadID, err))
 	}
 	if bead.Status == "closed" {
 		return nil
 	}
-	return store.Close(beadID)
+	return wrapPersistFailure(store.Close(beadID))
 }
 
 // Note: setOutcomeAndClose, propagateRetrySubjectMetadata,

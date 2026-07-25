@@ -88,6 +88,14 @@ const (
 const (
 	FailureClassTransient = "transient"
 	FailureClassHard      = "hard"
+	// FailureClassPersist is a third class, distinct from transient and hard:
+	// the WORK (or terminal decision) already succeeded, only the store-side
+	// persist that records it (metadata update / close) failed. Unlike
+	// FailureClassTransient it does not mean "re-run the attempt" — the attempt
+	// is done — it means "retry only the persist step; keep the completed
+	// result." Unlike FailureClassHard it must never give up: discarding a
+	// completed root because its bookkeeping close failed would lose real work.
+	FailureClassPersist = "persist"
 )
 
 // FormulaContractGraphV2 is the value of FormulaContractMetadataKey
