@@ -1953,6 +1953,7 @@ gc hook [agent] [flags]
 | `--drain-ack` | bool |  | with --claim, acknowledge runtime drain when no work is available |
 | `--inject` | bool |  | silent legacy Stop-hook compatibility; skip work query and exit 0 |
 | `--json` | bool |  | with --claim, emit a JSON protocol result |
+| `--wait` | duration | `1m0s` | with --claim, block until work is claimable or the timeout elapses (zero-token event-driven wake); optional duration, e.g. --wait=5m |
 
 | Subcommand | Description |
 |------------|-------------|
