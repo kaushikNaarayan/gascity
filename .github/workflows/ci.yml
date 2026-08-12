@@ -51,6 +51,14 @@ jobs:
     name: Detect changes
     needs: runner-policy
     runs-on: ${{ needs.runner-policy.outputs.runner_2vcpu }}
+    # dorny/paths-filter calls pulls.listFiles() on pull_request events. The
+    # workflow-level `permissions: contents: read` alone makes that API call
+    # fail with "Resource not accessible by integration", which then cascades:
+    # every gated job is skipped and worker-core-summary /
+    # worker-core-phase2-summary assert on a matrix that never ran and exit 1.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       # Gated outputs fold in the `shared` filter: a change to a cross-cutting
       # core path runs the full suite (union run) even when the path-scoped
