@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -135,6 +137,12 @@ type nudgeStatusJSON struct {
 	Pending       []queuedNudge     `json:"pending"`
 	InFlight      []queuedNudge     `json:"in_flight"`
 	Dead          []queuedNudge     `json:"dead"`
+
+	// DispatchSkips is the dispatch tick's running, city-wide (not
+	// agent-scoped) count of silent skips by reason, since the queue state
+	// file was created. Omitted when empty (legacy-mode cities never
+	// populate it; a fresh queue has no ticks recorded yet).
+	DispatchSkips map[string]int64 `json:"dispatch_skips,omitempty"`
 }
 
 type nudgeStatusCounts struct {
@@ -339,6 +347,16 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 		return 1
 	}
 
+	// City-wide (not agent-scoped) skip-reason totals from the supervisor
+	// dispatch tick, read directly off the persisted queue state — a raw
+	// read so this doesn't re-run the maintenance sweep listQueuedNudgesForTarget
+	// above already ran. Best-effort: a load failure here must not fail the
+	// whole status command over a diagnostics-only field.
+	var dispatchSkips map[string]int64
+	if qs, qsErr := nudgequeue.LoadState(target.cityPath); qsErr == nil {
+		dispatchSkips = qs.DispatchSkips
+	}
+
 	if jsonOutput {
 		if err := writeCLIJSONLine(stdout, nudgeStatusJSON{
 			SchemaVersion: "1",
@@ -352,9 +370,10 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 				InFlight: len(inFlight),
 				Dead:     len(dead),
 			},
-			Pending:  nonNilQueuedNudges(pending),
-			InFlight: nonNilQueuedNudges(inFlight),
-			Dead:     nonNilQueuedNudges(dead),
+			Pending:       nonNilQueuedNudges(pending),
+			InFlight:      nonNilQueuedNudges(inFlight),
+			Dead:          nonNilQueuedNudges(dead),
+			DispatchSkips: dispatchSkips,
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc nudge status: writing JSON: %v\n", err) //nolint:errcheck
 			return 1
@@ -389,7 +408,25 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 				item.ID, deadReason(item), item.Source, item.Message)
 		}
 	}
+	if len(dispatchSkips) > 0 {
+		fmt.Fprintln(stdout, "")                                                         //nolint:errcheck
+		fmt.Fprintln(stdout, "dispatch-tick skips (city-wide, all agents, cumulative):") //nolint:errcheck
+		for _, reason := range sortedNudgeDispatchSkipReasons(dispatchSkips) {
+			_, _ = fmt.Fprintf(stdout, "  %s=%d\n", reason, dispatchSkips[reason])
+		}
+	}
 	return 0
+}
+
+// sortedNudgeDispatchSkipReasons returns counts's keys in deterministic
+// (alphabetical) order for stable CLI output.
+func sortedNudgeDispatchSkipReasons(counts map[string]int64) []string {
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	return reasons
 }
 
 func nonNilQueuedNudges(items []queuedNudge) []queuedNudge {
@@ -1994,6 +2031,10 @@ func takeQueuedNudgesByID(items []queuedNudge, id string, removed []queuedNudge)
 }
 
 func enqueueQueuedNudgeWithStore(cityPath string, store beads.NudgesStore, item queuedNudge) error {
+	return enqueueQueuedNudgeWithStoreAndClock(cityPath, store, item, clock.Real{})
+}
+
+func enqueueQueuedNudgeWithStoreAndClock(cityPath string, store beads.NudgesStore, item queuedNudge, clk clock.Clock) error {
 	ownStore := false
 	if store.Store == nil {
 		store = openNudgeBeadStore(cityPath)
@@ -2014,15 +2055,15 @@ func enqueueQueuedNudgeWithStore(cityPath string, store beads.NudgesStore, item 
 		item.BeadID = beadID
 	}
 	err = withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
-		now := time.Now()
+		now := clk.Now()
 		deadline := now.Add(nudgeEnqueueMaintenanceBudget)
-		if err := recoverExpiredInFlightNudges(state, front, now, deadline); err != nil {
+		if err := recoverExpiredInFlightNudgesWithClock(state, front, now, deadline, clk); err != nil {
 			return err
 		}
-		if err := pruneExpiredQueuedNudges(state, front, now, deadline); err != nil {
+		if err := pruneExpiredQueuedNudgesWithClock(state, front, now, deadline, clk); err != nil {
 			return err
 		}
-		if err := pruneDeadQueuedNudges(state, front, now, deadline); err != nil {
+		if err := pruneDeadQueuedNudgesWithClock(state, front, now, deadline, clk); err != nil {
 			return err
 		}
 		if queuedNudgeExists(state, item.ID) {
@@ -2037,7 +2078,7 @@ func enqueueQueuedNudgeWithStore(cityPath string, store beads.NudgesStore, item 
 			}
 			filtered := state.Pending[:0]
 			for i, existing := range state.Pending {
-				if time.Now().After(deadline) {
+				if clk.Now().After(deadline) {
 					filtered = append(filtered, state.Pending[i:]...)
 					break
 				}
@@ -2059,7 +2100,7 @@ func enqueueQueuedNudgeWithStore(cityPath string, store beads.NudgesStore, item 
 			// This causes at most one redundant delivery, not data corruption.
 			inFlight := state.InFlight[:0]
 			for i, existing := range state.InFlight {
-				if time.Now().After(deadline) {
+				if clk.Now().After(deadline) {
 					inFlight = append(inFlight, state.InFlight[i:]...)
 					break
 				}
@@ -2336,10 +2377,34 @@ func noMaintenanceDeadline() time.Time {
 	return time.Now().Add(24 * time.Hour)
 }
 
+// recordNudgeDispatchSkips merges a dispatch tick's per-reason skip counts
+// into the queue state's running totals. Called at most once per tick, after
+// the per-session loop finishes, so it never nests inside the loop's own
+// withNudgeQueueState-backed calls (claimDueQueuedNudgesForTarget et al) —
+// the queue lock is a per-process flock and is not reentrant.
+func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
+	if len(counts) == 0 {
+		return nil
+	}
+	return withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
+		if state.DispatchSkips == nil {
+			state.DispatchSkips = make(map[string]int64, len(counts))
+		}
+		for reason, n := range counts {
+			state.DispatchSkips[reason] += n
+		}
+		return nil
+	})
+}
+
 func pruneExpiredQueuedNudges(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time) error {
+	return pruneExpiredQueuedNudgesWithClock(state, front, now, deadline, clock.Real{})
+}
+
+func pruneExpiredQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time, clk clock.Clock) error {
 	filtered := state.Pending[:0]
 	for i, item := range state.Pending {
-		if time.Now().After(deadline) {
+		if clk.Now().After(deadline) {
 			filtered = append(filtered, state.Pending[i:]...)
 			break
 		}
@@ -2362,9 +2427,13 @@ func pruneExpiredQueuedNudges(state *nudgeQueueState, front *nudgequeue.Store, n
 }
 
 func recoverExpiredInFlightNudges(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time) error {
+	return recoverExpiredInFlightNudgesWithClock(state, front, now, deadline, clock.Real{})
+}
+
+func recoverExpiredInFlightNudgesWithClock(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time, clk clock.Clock) error {
 	filtered := state.InFlight[:0]
 	for i, item := range state.InFlight {
-		if time.Now().After(deadline) {
+		if clk.Now().After(deadline) {
 			filtered = append(filtered, state.InFlight[i:]...)
 			break
 		}
@@ -2396,10 +2465,14 @@ func recoverExpiredInFlightNudges(state *nudgeQueueState, front *nudgequeue.Stor
 // when a durable terminal bead record exists in the store. Items without a confirmed terminal
 // bead are retained so terminal history is not lost if the bead store write failed.
 func pruneDeadQueuedNudges(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time) error {
+	return pruneDeadQueuedNudgesWithClock(state, front, now, deadline, clock.Real{})
+}
+
+func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time, clk clock.Clock) error {
 	cutoff := now.Add(-defaultQueuedNudgeDeadRetention)
 	filtered := state.Dead[:0]
 	for i, item := range state.Dead {
-		if time.Now().After(deadline) {
+		if clk.Now().After(deadline) {
 			filtered = append(filtered, state.Dead[i:]...)
 			break
 		}

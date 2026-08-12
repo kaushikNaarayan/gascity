@@ -307,6 +307,7 @@ func requestedRigEndpointState(rig config.Rig, currentState, cityState contract.
 			EndpointStatus: contract.EndpointStatusVerified,
 			DoltHost:       "127.0.0.1",
 			DoltPort:       strings.TrimSpace(opts.Port),
+			DoltMode:       "server",
 		}
 		if opts.AdoptUnverified {
 			state.EndpointStatus = contract.EndpointStatusUnverified
@@ -326,6 +327,7 @@ func requestedRigEndpointState(rig config.Rig, currentState, cityState contract.
 		DoltHost:       strings.TrimSpace(opts.Host),
 		DoltPort:       strings.TrimSpace(opts.Port),
 		DoltUser:       user,
+		DoltMode:       "server",
 	}
 	if opts.AdoptUnverified {
 		state.EndpointStatus = contract.EndpointStatusUnverified
@@ -360,6 +362,14 @@ func requireCanonicalScopeMetadata(fs fsys.FS, scopeRoot string) error {
 	return nil
 }
 
+// ensureCanonicalScopeMetadataIfPresent canonicalizes an existing scope's
+// metadata to server mode, for the endpoint commands (`gc rig set-endpoint`,
+// `gc beads city use-managed`/`use-external`).
+//
+// It announces the mode change for the same reason ensureCanonicalScopeMetadata
+// does: this is the identical rewrite through a different door, and a warning
+// that depends on which command performed the flip is a warning an operator
+// cannot rely on.
 func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
 	path := filepath.Join(scopeRoot, ".beads", "metadata.json")
 	doltDatabase, err := func() (string, error) {
@@ -375,6 +385,7 @@ func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
 	if err != nil {
 		return err
 	}
+	announceStorageModeChange(fs, path, "server", doltDatabase)
 	_, err = contract.EnsureCanonicalMetadata(fs, path, contract.MetadataState{
 		Database:     "dolt",
 		Backend:      "dolt",
