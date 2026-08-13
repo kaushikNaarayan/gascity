@@ -1,5 +1,10 @@
 name: RC Release
 
+# material-lab-io/gascity runs this on our own self-hosted [self-hosted, gt2]
+# runners (see fork-verify.yml, gcf-kt2; release.yml). The job condition below
+# is widened from gastownhall-only to include material-lab-io/gascity — this
+# fork needs to be able to draft its own RC releases, same as gastownhall.
+
 on:
   push:
     tags:
@@ -25,8 +30,8 @@ permissions: {}
 jobs:
   rc-release:
     name: Draft RC release
-    if: ${{ github.repository == 'gastownhall/gascity' }}
-    runs-on: ubuntu-latest
+    if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) }}
+    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:
@@ -43,6 +48,9 @@ jobs:
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
+
+      - name: Verify gh is present (no sudo install on self-hosted)
+        run: command -v gh || { echo "gh missing on this runner — sudo apt-get is not available on gt2, install it out-of-band"; exit 1; }
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:

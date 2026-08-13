@@ -1,5 +1,12 @@
 name: Release
 
+# material-lab-io/gascity runs this on our own self-hosted [self-hosted, gt2]
+# runners (see fork-verify.yml, gcf-kt2): this fork's included Actions minutes
+# are exhausted, so every hosted job dies in seconds. gastownhall/gascity keeps
+# ubuntu-latest. GoReleaser cross-compiles linux/darwin from a single Linux
+# runner (CGO_ENABLED=0, see .goreleaser.yml), so gt2 is sufficient to build
+# all four release platform/arch combinations.
+
 on:
   push:
     tags:
@@ -18,7 +25,7 @@ jobs:
   release:
     name: Release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:
@@ -69,7 +76,7 @@ jobs:
     name: Attest release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
     permissions:
       attestations: write
       contents: write
@@ -77,6 +84,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify gh is present (no sudo install on self-hosted)
+        run: command -v gh || { echo "gh missing on this runner — sudo apt-get is not available on gt2, install it out-of-band"; exit 1; }
 
       - name: Resolve release asset paths
         id: assets
