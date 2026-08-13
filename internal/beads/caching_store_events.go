@@ -465,9 +465,16 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if hasCacheEventField(fields, "priority") {
 		merged.Priority = cloneIntPtr(patch.Priority)
 	}
-	if hasCacheEventField(fields, "created_at") {
-		merged.CreatedAt = patch.CreatedAt
-	}
+	// created_at is deliberately never merged in from the event payload: bd
+	// has no operation that edits a bead's creation timestamp, so the cached
+	// value (established when the row was first absorbed) is already
+	// authoritative. Installing the event snapshot's created_at instead risks
+	// a precision mismatch against the backing store's own truncated reads
+	// (BdStore.toBead, DoltliteReadStore's row scan both truncate to second
+	// precision; a live bd-hook payload is not guaranteed to match) — the next
+	// reconcile full scan would then see a spurious diff on a field that never
+	// actually changed and emit an unwarranted bead.updated attributed to
+	// cache-reconcile (gcf-ocm).
 	if hasCacheEventField(fields, "assignee") {
 		merged.Assignee = patch.Assignee
 	}
