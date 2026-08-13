@@ -1045,6 +1045,16 @@ func (c *CachingStore) prime(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.mutationSeq == startSeq {
+		// A row that just lost its ready-projection verdict (enrichReadyProjectionForCache
+		// failed this cycle only — the common case is a transient bd/Dolt subprocess
+		// timeout under restart contention) must not silently drop to IsBlocked=nil
+		// here. Every other absorb site in the package runs through
+		// absorbReadyProjectionLocked's "keep the cached verdict when unanswerable"
+		// rule; this fast-path full-replace bypassed it, so a transient prime failure
+		// wiped every row's verdict and the next successful reconcile then saw the
+		// real verdict reappear as an apparent change — flooding bead.updated for the
+		// entire active set on restart (gcf-du3 / gp-ly85g).
+		c.preserveCachedReadyProjectionLocked(beadMap, depMap, depsComplete && depErr == nil)
 		nextBeads := beadMap
 		nextDeps := depsFromBeads(beadMap, depMap, depsComplete && depErr == nil)
 		nextDirty := make(map[string]struct{})
