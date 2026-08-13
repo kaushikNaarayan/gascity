@@ -87,6 +87,20 @@ func TestRootCommandOptionsSkipPackDiscoveryForBuiltinCommands(t *testing.T) {
 		{name: "bd after terminator", args: []string{"--", "bd"}},
 		{name: "unknown flag", args: []string{"--unknown", "metrics"}},
 		{name: "bd after unknown flag", args: []string{"--unknown", "bd"}},
+		{name: "version", args: []string{"version"}, skip: true},
+		{name: "scoped version", args: []string{"--city", "/tmp/city", "version"}, skip: true},
+		{name: "help", args: []string{"help"}, skip: true},
+		{name: "help leaf", args: []string{"help", "status"}, skip: true},
+		{name: "completion", args: []string{"completion"}, skip: true},
+		{name: "completion leaf", args: []string{"completion", "bash"}, skip: true},
+		{name: "bare", args: nil, skip: true},
+		{name: "empty", args: []string{}, skip: true},
+		{name: "long help flag", args: []string{"--help"}, skip: true},
+		{name: "short help flag", args: []string{"-h"}, skip: true},
+		{name: "long version flag", args: []string{"--version"}, skip: true},
+		{name: "scoped help flag", args: []string{"--city", "/tmp/city", "--help"}, skip: true},
+		{name: "help flag before command still discovers", args: []string{"--help", "status"}},
+		{name: "version is city value", args: []string{"--city", "version", "status"}},
 	}
 
 	for _, test := range tests {
@@ -192,38 +206,50 @@ func TestRootConstructionUsesInjectedArgsInsteadOfAmbientOSArgs(t *testing.T) {
 	}{
 		{
 			name:        "ordinary injected args discover packs",
-			ambientArgs: []string{"version"},
-			injected:    []string{"version"},
+			ambientArgs: []string{"status"},
+			injected:    []string{"status"},
 			wantPack:    true,
 		},
 		{
 			name:        "ambient metrics cannot suppress ordinary discovery",
 			ambientArgs: []string{"metrics", "status"},
-			injected:    []string{"version"},
+			injected:    []string{"status"},
 			wantPack:    true,
 		},
 		{
 			name:        "injected metrics suppresses ordinary ambient discovery",
-			ambientArgs: []string{"version"},
+			ambientArgs: []string{"status"},
 			injected:    []string{"metrics", "status"},
 			wantPack:    false,
 		},
 		{
 			name:        "injected bd suppresses ordinary ambient discovery",
-			ambientArgs: []string{"version"},
+			ambientArgs: []string{"status"},
 			injected:    []string{"bd", "list"},
 			wantPack:    false,
 		},
 		{
 			name:        "ambient credential helper cannot suppress ordinary discovery",
 			ambientArgs: []string{"git-credential", "get"},
-			injected:    []string{"version"},
+			injected:    []string{"status"},
 			wantPack:    true,
 		},
 		{
 			name:        "injected credential helper suppresses ordinary ambient discovery",
-			ambientArgs: []string{"version"},
+			ambientArgs: []string{"status"},
 			injected:    []string{"git-credential", "get"},
+			wantPack:    false,
+		},
+		{
+			name:        "injected version suppresses ordinary ambient discovery",
+			ambientArgs: []string{"status"},
+			injected:    []string{"version"},
+			wantPack:    false,
+		},
+		{
+			name:        "injected help flag suppresses ordinary ambient discovery",
+			ambientArgs: []string{"status"},
+			injected:    []string{"--help"},
 			wantPack:    false,
 		},
 	}
