@@ -1,18 +1,24 @@
 name: fork-verify
 
-# Minimal fork-only CI for gascity forks. Verifies WIP feature branches
-# WITHOUT upstream's Blacksmith
-# self-hosted runners, runner-policy gating, or secrets — none of which a fork
-# has. ubuntu-latest compiles the Dolt go-icu-regex CGO dependency cleanly; the
-# `unicode/regex.h` build failure is macOS-only (icu4c@78 header layout), so a
-# Linux runner is exactly what's needed to get a real green/red signal.
+# Real CI gate for gascity forks, on OUR self-hosted [self-hosted, gt2]
+# runners — not GitHub-hosted ubuntu-latest. This fork's included Actions
+# minutes are exhausted, so every hosted job dies in seconds with "recent
+# account payments have failed"; gt2 is the only runner pool that actually
+# executes anything here. gt2 is shared across the whole org (3 runners,
+# ~90% disk), so this workflow stays intentionally light: build, vet, the
+# cipolicy hash check, and four targeted unit-test slices — not the full
+# 47-job upstream matrix.
 #
-# Reuses the upstream composite action .github/actions/setup-gascity-ubuntu so
-# the Go + Dolt + native-dependency setup is not re-solved here.
+# Does NOT reuse .github/actions/setup-gascity-ubuntu: that composite runs
+# `sudo apt-get install -y tmux jq`, and self-hosted runners do not grant
+# passwordless root. Setup is inlined below using each install script's
+# --cache mode (installs under RUNNER_TOOL_CACHE/HOME, no sudo required).
+# Do not edit the shared composite action — ci.yml depends on it.
 
 on:
+  pull_request:
   push:
-    branches: ["feat/**", "fix/**"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -20,25 +26,32 @@ permissions:
 
 jobs:
   verify:
-    # Canonical PR branches already run the complete Blacksmith CI graph.
-    # This lightweight fallback exists only for forks that cannot use those
-    # runners or repository secrets.
+    # Canonical PR branches on the upstream repo already run the complete
+    # Blacksmith CI graph. This gate exists only for the fork, which cannot
+    # use those runners or repository secrets.
     if: ${{ github.repository != 'gastownhall/gascity' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     env:
       DOLT_VERSION: "2.1.7"
       BD_VERSION: "v1.1.0"
+      GO_VERSION: "1.26.5"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: ./.github/actions/setup-gascity-ubuntu
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
-          install-claude-cli: "false"
+          go-version: ${{ env.GO_VERSION }}
+      - name: Verify jq is present (no sudo install on self-hosted)
+        run: command -v jq || { echo "jq missing on this runner — sudo apt-get is not available on gt2, install it out-of-band"; exit 1; }
+      - name: Install dolt v${{ env.DOLT_VERSION }} (cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ env.DOLT_VERSION }}" --cache
+      - name: Install bd ${{ env.BD_VERSION }} (cached, no sudo)
+        run: .github/scripts/install-bd-archive.sh "${{ env.BD_VERSION }}" --cache
       - name: Build (compiles the whole tree — catches compile errors the macOS ICU break hides)
         run: go build ./...
-      - name: Vet changed package
-        run: go vet ./cmd/gc/...
+      - name: Vet (whole tree — verified clean locally on gt2 before widening)
+        run: go vet ./...
+      - name: cipolicy — CI execution hash must match workflow reality
+        run: go test ./scripts/cipolicy/... -count=1 -v
       - name: Unit tests — cross-store work delivery
         run: go test ./cmd/gc/ -run 'TestFilterAssignedWorkBeads|TestAssignedWork|TestFirstStoreWithWork|TestCrossStoreClaimDir|TestRunBDForBead|TestGateOpenWorkBounded|TestCrossStorePipeline' -count=1 -v
       - name: Unit tests — cross-store reachability predicate + fail-loud guard
