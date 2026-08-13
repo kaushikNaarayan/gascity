@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 203,
+  "next_id": 204,
   "permanent_ids": [
     {
       "name": "help",
@@ -3749,6 +3749,21 @@
       "classification": "session-suspend",
       "owner": "immediate",
       "id": 153
+    },
+    {
+      "path": "gc session sweep-parked",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-sweep-parked",
+      "owner": "immediate",
+      "id": 203
     },
     {
       "path": "gc session unpin",

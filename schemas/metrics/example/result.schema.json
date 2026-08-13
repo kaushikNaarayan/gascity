@@ -212,7 +212,8 @@
               "storage-status",
               "ready",
               "storage-recover-stranded",
-              "beads-metadata-cas"
+              "beads-metadata-cas",
+              "session-sweep-parked"
             ]
           },
           "event_id": {

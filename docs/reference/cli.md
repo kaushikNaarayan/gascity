@@ -3943,6 +3943,7 @@ gc session
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
+| [gc session sweep-parked](#gc-session-sweep-parked) | Detect (and by default recover) seats parked with a typed-but-unsubmitted prompt |
 | [gc session unpin](#gc-session-unpin) | Remove a session awake pin |
 | [gc session wait](#gc-session-wait) | Register a dependency wait for a session |
 | [gc session wake](#gc-session-wake) | Wake a session (request start and clear holds) |
@@ -4226,6 +4227,29 @@ gc session suspend <session-id-or-alias> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+
+## gc session sweep-parked
+
+Peeks every active session's pane and flags one that is settled at its
+ready prompt with content already typed into it but never submitted (gcf-0d7).
+A seat in this state composes its own next instruction, the text lands in the
+prompt buffer, and it is never sent — "gc session list" still reports
+state=active and LAST ACTIVE keeps looking recent, so the stall is invisible
+to any check that trusts session state instead of the pane itself.
+
+With --fix (the default), each parked seat is recovered by resubmitting its
+own typed text with intent=interrupt_now — the same text the seat already
+composed, so recovery does not invent a new instruction. Without --fix,
+parked seats are only reported, e.g. for mailing the owning rig PM the list.
+
+```
+gc session sweep-parked [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--fix` | bool | `true` | resubmit each parked seat's own typed text |
+| `--json` | bool |  | emit JSONL result |
 
 ## gc session unpin
 

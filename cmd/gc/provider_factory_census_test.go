@@ -78,6 +78,7 @@ var canonicalProviderCalls = map[string]int{
 	"cmd_session.go:doSessionListFallback:withSessionProviderConstructionContext:bind-error":                                                   1,
 	"cmd_session.go:doSessionPeekFallback:newSessionProvider:bind-error":                                                                       1,
 	"cmd_session_reset.go:cmdSessionReset:newSessionProvider:bind-error":                                                                       1,
+	"cmd_session_sweep_parked.go:cmdSessionSweepParked:newSessionProvider:bind-error":                                                           1,
 	"cmd_sling.go:cmdSlingWithJSON:newSessionProvider:bind-error":                                                                              1,
 	"cmd_start.go:doStartStandalone:newSessionProviderForCity:bind-error":                                                                      1,
 	"cmd_status.go:cmdRigStatus:newStatusSessionProviderForCityWithSnapshot:bind-error":                                                        1,
