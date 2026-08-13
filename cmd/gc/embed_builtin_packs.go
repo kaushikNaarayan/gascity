@@ -27,9 +27,10 @@ import (
 var builtinRuntimeReadyCache sync.Map
 
 type builtinRuntimeState struct {
-	mu          sync.Mutex
-	ready       bool
-	lastWarning string
+	mu                  sync.Mutex
+	durableStampChecked bool
+	ready               bool
+	lastWarning         string
 }
 
 // ensureBuiltinPacksForConfigLoad is the shared config-load boundary for
@@ -67,6 +68,26 @@ func EnsureBuiltinRuntimeAssets(cityPath string, warningWriter io.Writer) error 
 	if state.ready && requiredBuiltinSourcesUsable(cityPath) && lockedBundledImportsUsable(cityPath) {
 		return nil
 	}
+	// The in-process cache above never fires for the CLI hot path: gc forks a
+	// fresh process per invocation, so state.ready always starts false. On the
+	// FIRST attempt for a city in this process only, consult the durable
+	// cross-process stamp a prior process left on disk. If it matches the
+	// current binary's embedded pack content, the current city's required and
+	// locked-bundled source set, and a cheap per-source marker check, the
+	// exact readiness decision a previous full pass already made still holds
+	// — trust it instead of re-walking every bundled pack file's content.
+	// Subsequent calls in this same process fall through to the full
+	// requiredBuiltinSourcesUsable/lockedBundledImportsUsable walk above on
+	// every call, same as before the stamp existed, so a cache that rots
+	// mid-process is still caught exactly as it was.
+	if !state.ready && !state.durableStampChecked {
+		state.durableStampChecked = true
+		if builtinRuntimeStampTrusted(cityPath) {
+			state.ready = true
+			state.lastWarning = ""
+			return nil
+		}
+	}
 	state.ready = false
 
 	var problems []error
@@ -95,6 +116,7 @@ func EnsureBuiltinRuntimeAssets(cityPath string, warningWriter io.Writer) error 
 	}
 	state.ready = true
 	state.lastWarning = ""
+	writeBuiltinRuntimeStamp(cityPath, warningWriter)
 	return nil
 }
 
