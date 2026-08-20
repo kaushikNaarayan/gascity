@@ -82,30 +82,27 @@ bead with `gc.root_bead_id` and `gc.continuation_group`, it preassigns other
 open, unassigned siblings in that group to `$GC_SESSION_NAME` so they stay with
 your live context. The JSON result lists them in `continuation_assigned`.
 
-## Polling Before Drain
+## Waiting Before Drain
 
-After closing a bead, if `gc hook --claim --json` returns no work, do NOT drain
-immediately. The workflow controller may need a few seconds to process control
-beads and unlock your next step.
+After closing a bead, do NOT drain immediately. The workflow controller may need
+a few seconds to process control beads and unlock your next step.
 
-Poll up to 60 seconds (6 attempts, 10 seconds apart):
-
-```bash
-for i in $(seq 1 6); do
-  NEXT=$(gc hook --claim --json 2>/dev/null || true)
-  if printf '%s\n' "$NEXT" | grep -q '"action":"work"'; then
-    # Found work — continue working
-    break
-  fi
-  sleep 10
-done
-```
-
-If no work appears after 60 seconds, drain:
+Use the built-in event-driven wait — ONE blocking call that spends zero model
+tokens. It claims immediately if work is ready, otherwise blocks on the city
+event stream and re-probes when activity arrives, and returns a drain result if
+nothing becomes claimable within the budget (default 60s):
 
 ```bash
-gc hook --claim --drain-ack --json
+gc hook --claim --wait --drain-ack --json
 ```
+
+- `action":"work"` → you have a new bead; read it and continue.
+- `action":"drain"` → no work arrived within the budget; your session is done.
+
+`--wait=<duration>` overrides the budget (e.g. `--wait=5m`). If the streaming API
+is unavailable the call fails open to the historical sleep-poll cadence, so it
+never hangs or drains early. This single call replaces the old in-context
+`for i in $(seq 1 6); do ...; sleep 10; done` poll loop.
 
 ## Important Metadata
 

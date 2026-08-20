@@ -116,10 +116,17 @@ const (
 	// Emitted by the session reconciler's start-result commit path; the
 	// envelope's Subject carries the session name.
 	SessionColdStartTimeout = "session.cold_start_timeout"
-	ConvoyCreated           = "convoy.created"
-	ConvoyClosed            = "convoy.closed"
-	ControllerStarted       = "controller.started"
-	ControllerStopped       = "controller.stopped"
+	// SessionWedged fires when a worker's zero-token wake watcher
+	// (gc hook --claim --wait) observed repeated candidate wake events but
+	// could not claim any work across N consecutive cycles — the classifier
+	// absorbed activity without progressing, which may indicate a stuck queue
+	// or a routing mismatch. It escalates instead of spinning silently. The
+	// lifecycle payload carries the session ID, template, and cycle count.
+	SessionWedged     = "session.wedged"
+	ConvoyCreated     = "convoy.created"
+	ConvoyClosed      = "convoy.closed"
+	ControllerStarted = "controller.started"
+	ControllerStopped = "controller.stopped"
 	// SupervisorStarted fires once per supervisor startup, after the
 	// instance lock is acquired. Its payload classifies how the previous
 	// supervisor instance exited (clean, crash, or unknown), derived from

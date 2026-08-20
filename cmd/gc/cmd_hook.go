@@ -28,6 +28,7 @@ func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 	var claim bool
 	var drainAck bool
 	var jsonOut bool
+	var waitTimeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "hook [agent]",
 		Short: "Find routed work for an agent",
@@ -39,13 +40,15 @@ With --claim: runs the standard startup claim protocol for one work item.
 
 		The agent is determined from $GC_AGENT or a positional argument.`,
 		Args: cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(c *cobra.Command, args []string) error {
 			opts := hookCommandOptions{
-				Inject:     inject,
-				HookFormat: hookFormat,
-				Claim:      claim,
-				DrainAck:   drainAck,
-				JSON:       jsonOut,
+				Inject:      inject,
+				HookFormat:  hookFormat,
+				Claim:       claim,
+				DrainAck:    drainAck,
+				JSON:        jsonOut,
+				Wait:        c.Flags().Changed("wait"),
+				WaitTimeout: waitTimeout,
 			}
 			if cmdHookWithOptions(args, opts, stdout, stderr) != 0 {
 				return errExit
@@ -58,6 +61,11 @@ With --claim: runs the standard startup claim protocol for one work item.
 	cmd.Flags().BoolVar(&claim, "claim", false, "atomically claim one routed work item for the current session")
 	cmd.Flags().BoolVar(&drainAck, "drain-ack", false, "with --claim, acknowledge runtime drain when no work is available")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "with --claim, emit a JSON protocol result")
+	cmd.Flags().DurationVar(&waitTimeout, "wait", defaultHookWaitTimeout, "with --claim, block until work is claimable or the timeout elapses (zero-token event-driven wake); optional duration, e.g. --wait=5m")
+	// Bare --wait (no value) uses the default budget; --wait=DUR overrides it.
+	if flag := cmd.Flags().Lookup("wait"); flag != nil {
+		flag.NoOptDefVal = defaultHookWaitTimeout.String()
+	}
 	if flag := cmd.Flags().Lookup("hook-format"); flag != nil {
 		flag.Hidden = true
 	}
@@ -220,11 +228,13 @@ func drainHookStdin(ctx context.Context, stdin io.Reader) []byte {
 }
 
 type hookCommandOptions struct {
-	Inject     bool
-	HookFormat string
-	Claim      bool
-	DrainAck   bool
-	JSON       bool
+	Inject      bool
+	HookFormat  string
+	Claim       bool
+	DrainAck    bool
+	JSON        bool
+	Wait        bool
+	WaitTimeout time.Duration
 }
 
 // cmdHook is the CLI entry point for gc hook. Resolves the agent from
@@ -247,6 +257,10 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	_ = opts.HookFormat
 	if opts.DrainAck && !opts.Claim {
 		fmt.Fprintln(stderr, "gc hook: --drain-ack requires --claim") //nolint:errcheck
+		return 1
+	}
+	if opts.Wait && !opts.Claim {
+		fmt.Fprintln(stderr, "gc hook: --wait requires --claim") //nolint:errcheck
 		return 1
 	}
 
@@ -455,6 +469,35 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			Env:          queryEnv,
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
+		}
+		if opts.Wait {
+			// Zero-token event-driven wake: block on the event stream between
+			// claim probes instead of the caller spending model tokens on an
+			// in-context sleep-poll loop (gp-7rch.16). The probe reuses the exact
+			// federated claim path; only the poll cadence changes.
+			probe := func(drainAck, jsonMode bool) (string, int, []byte) {
+				var buf bytes.Buffer
+				po := claimOpts
+				po.DrainAck = drainAck
+				po.JSON = jsonMode
+				code := claimHookWork(cityPath, workQuery, workDir, queryEnv, stores, po, emitQueryFailure, &buf, stderr)
+				return parseHookClaimAction(buf.Bytes()), code, buf.Bytes()
+			}
+			waitCfg := hookWaitConfig{
+				Timeout:        opts.WaitTimeout,
+				CallerDrainAck: opts.DrainAck,
+				CallerJSON:     opts.JSON,
+			}
+			waitOps := hookWaitOps{
+				Probe: probe,
+				WaitForEvent: func(timeout time.Duration) hookWaitEventResult {
+					return hookWaitForCandidateEvent(timeout, stderr)
+				},
+				EmitWedged: func(cycles int) {
+					emitCitySessionWedged(cityPath, stderr, os.Getenv("GC_SESSION_ID"), strings.TrimSpace(os.Getenv("GC_TEMPLATE")), cycles)
+				},
+			}
+			return runHookClaimWait(waitCfg, waitOps, stdout, stderr)
 		}
 		return claimHookWork(cityPath, workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
