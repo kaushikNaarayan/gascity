@@ -1286,6 +1286,7 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	// token the previous instance's STOPPING path left behind (if any)
 	// and classify how that instance exited.
 	previousExit, previousExitDetail := supervisor.ConsumePreviousExit(supervisor.DefaultHome(), priorInstanceRan)
+	logSessionLeaderInvariant(stderr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
