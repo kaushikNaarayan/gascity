@@ -29,6 +29,7 @@ import (
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -1404,6 +1405,19 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if len(items) == 0 {
 		return false, bookkeepErr
 	}
+	// gcf-1n2: every prior attempt at this batch failed with
+	// ErrNudgeSubmitUnconfirmed (paste + submit keys were handed to tmux,
+	// but the busy indicator was never observed inside the short per-attempt
+	// polling budget), and the session has since shown real activity after
+	// that attempt — proof the earlier submit actually landed. Re-running
+	// handle.Nudge here would re-paste the identical text a second time,
+	// which is the "duplicated, not lost" failure gcf-1n2 documents. Ack
+	// without redelivering instead.
+	if queuedNudgeAlreadyConfirmedByActivity(items, obs) {
+		telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
+		stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+		return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
+	}
 	var msg string
 	if target.sessionTransport() == "acp" {
 		msg = formatNudgeRuntimeMessage(items)
@@ -1453,6 +1467,46 @@ func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t tim
 	// Best-effort stamp. Delivery already succeeded, so a metadata write
 	// failure here must not bubble back to the caller and force a redelivery.
 	_ = sessFront.SetMarker(sessionID, session.MetadataLastNudgeDeliveredAt, t.UTC().Format(time.RFC3339))
+}
+
+// queuedNudgeAlreadyConfirmedByActivity reports whether a claimed batch can
+// safely be treated as already delivered instead of redelivered.
+//
+// tmux.NudgeSession's busy-observation confirmation window is short (a few
+// hundred milliseconds per submit attempt): it exists so a genuinely lost
+// Enter (ga-bwm) gets re-sent, not to prove delivery for every seat. A seat
+// that processes the nudge and finishes its turn faster than the poll
+// window, or whose busy indicator this fork doesn't reliably detect, never
+// shows busy — the submit is reported unconfirmed even though the text was
+// pasted and submitted exactly once. Because ErrNudgeSubmitUnconfirmed is
+// handled the same as any other delivery failure, the queue retries the
+// whole batch on the next tick, and the retry re-pastes the identical text
+// into the pane a second time (gcf-1n2: nudges are duplicated, not lost).
+//
+// A live-activity timestamp strictly after the failed attempt is strong
+// independent evidence the earlier submit actually landed: the session did
+// something, then went quiet again by the time this tick observed it. That
+// signal only trusted when every item in the batch failed with exactly
+// ErrNudgeSubmitUnconfirmed — any other failure (send-keys error, session
+// gone) means the text may genuinely not have reached the pane, so this
+// must not short-circuit those cases into a false "delivered".
+func queuedNudgeAlreadyConfirmedByActivity(items []queuedNudge, obs worker.LiveObservation) bool {
+	if len(items) == 0 || obs.LastActivity == nil || obs.LastActivity.IsZero() {
+		return false
+	}
+	unconfirmed := sessiontmux.ErrNudgeSubmitUnconfirmed.Error()
+	for _, item := range items {
+		if item.LastAttemptAt.IsZero() {
+			return false
+		}
+		if !strings.Contains(item.LastError, unconfirmed) {
+			return false
+		}
+		if !obs.LastActivity.After(item.LastAttemptAt) {
+			return false
+		}
+	}
+	return true
 }
 
 func pollerSessionIdleEnough(target nudgeTarget, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) bool {

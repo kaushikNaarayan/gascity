@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
@@ -1175,6 +1176,98 @@ func TestDeliverSessionNudgeWithProviderWaitIdleStartsClaudePollerWhenQueued(t *
 	}
 	if !strings.Contains(stdout.String(), "Queued nudge for worker") {
 		t.Fatalf("stdout = %q, want queued confirmation", stdout.String())
+	}
+}
+
+// TestQueuedNudgeAlreadyConfirmedByActivityTreatsPostAttemptActivityAsConfirmed
+// proves the gcf-1n2 fix: a batch whose only recorded failure is
+// ErrNudgeSubmitUnconfirmed, followed by observed session activity after
+// that attempt, is treated as already delivered.
+func TestQueuedNudgeAlreadyConfirmedByActivityTreatsPostAttemptActivityAsConfirmed(t *testing.T) {
+	attemptAt := time.Now().Add(-5 * time.Second)
+	activity := attemptAt.Add(2 * time.Second)
+	items := []queuedNudge{{
+		ID:            "n1",
+		LastAttemptAt: attemptAt,
+		LastError:     sessiontmux.ErrNudgeSubmitUnconfirmed.Error(),
+	}}
+	obs := worker.LiveObservation{LastActivity: &activity}
+
+	if !queuedNudgeAlreadyConfirmedByActivity(items, obs) {
+		t.Fatal("queuedNudgeAlreadyConfirmedByActivity = false, want true (activity after unconfirmed attempt confirms delivery)")
+	}
+}
+
+// TestQueuedNudgeAlreadyConfirmedByActivityRequiresActivityAfterAttempt proves
+// activity that predates (or exactly matches) the failed attempt is not
+// evidence of delivery — the session may simply have been active before we
+// tried to send, and never actually received the message.
+func TestQueuedNudgeAlreadyConfirmedByActivityRequiresActivityAfterAttempt(t *testing.T) {
+	attemptAt := time.Now()
+	stale := attemptAt.Add(-2 * time.Second)
+	items := []queuedNudge{{
+		ID:            "n1",
+		LastAttemptAt: attemptAt,
+		LastError:     sessiontmux.ErrNudgeSubmitUnconfirmed.Error(),
+	}}
+	obs := worker.LiveObservation{LastActivity: &stale}
+
+	if queuedNudgeAlreadyConfirmedByActivity(items, obs) {
+		t.Fatal("queuedNudgeAlreadyConfirmedByActivity = true, want false (activity predates the attempt)")
+	}
+}
+
+// TestQueuedNudgeAlreadyConfirmedByActivityRequiresUnconfirmedSubmitError
+// proves any other failure (a genuine send-keys error, session gone) is
+// never short-circuited into a false "delivered" just because the session
+// happened to be active — only the specific unconfirmed-submit signature
+// gcf-1n2 documents is trusted.
+func TestQueuedNudgeAlreadyConfirmedByActivityRequiresUnconfirmedSubmitError(t *testing.T) {
+	attemptAt := time.Now().Add(-5 * time.Second)
+	activity := attemptAt.Add(2 * time.Second)
+	items := []queuedNudge{{
+		ID:            "n1",
+		LastAttemptAt: attemptAt,
+		LastError:     "session not found",
+	}}
+	obs := worker.LiveObservation{LastActivity: &activity}
+
+	if queuedNudgeAlreadyConfirmedByActivity(items, obs) {
+		t.Fatal("queuedNudgeAlreadyConfirmedByActivity = true, want false (not the unconfirmed-submit error)")
+	}
+}
+
+// TestQueuedNudgeAlreadyConfirmedByActivityRequiresEveryItemConfirmed proves a
+// mixed batch — one item with an unrelated failure — is not confirmed even
+// if the other item matches, since redelivering the batch is the only way
+// to actually retry the genuinely-failed item.
+func TestQueuedNudgeAlreadyConfirmedByActivityRequiresEveryItemConfirmed(t *testing.T) {
+	attemptAt := time.Now().Add(-5 * time.Second)
+	activity := attemptAt.Add(2 * time.Second)
+	items := []queuedNudge{
+		{ID: "n1", LastAttemptAt: attemptAt, LastError: sessiontmux.ErrNudgeSubmitUnconfirmed.Error()},
+		{ID: "n2", LastAttemptAt: attemptAt, LastError: "session not found"},
+	}
+	obs := worker.LiveObservation{LastActivity: &activity}
+
+	if queuedNudgeAlreadyConfirmedByActivity(items, obs) {
+		t.Fatal("queuedNudgeAlreadyConfirmedByActivity = true, want false (one item in the batch is unconfirmed for a different reason)")
+	}
+}
+
+// TestQueuedNudgeAlreadyConfirmedByActivityRequiresLastActivity proves a
+// missing/zero LastActivity (no observed signal at all) never confirms —
+// there is nothing to compare against the failed attempt.
+func TestQueuedNudgeAlreadyConfirmedByActivityRequiresLastActivity(t *testing.T) {
+	attemptAt := time.Now().Add(-5 * time.Second)
+	items := []queuedNudge{{
+		ID:            "n1",
+		LastAttemptAt: attemptAt,
+		LastError:     sessiontmux.ErrNudgeSubmitUnconfirmed.Error(),
+	}}
+
+	if queuedNudgeAlreadyConfirmedByActivity(items, worker.LiveObservation{}) {
+		t.Fatal("queuedNudgeAlreadyConfirmedByActivity = true, want false (no LastActivity observed)")
 	}
 }
 
@@ -2459,6 +2552,83 @@ func TestCmdNudgeStatusSurfacesDispatchSkips(t *testing.T) {
 	}
 	if !strings.Contains(textOut.String(), "not-running=3") || !strings.Contains(textOut.String(), "observe-error=1") {
 		t.Fatalf("text status missing skip-reason lines, got: %s", textOut.String())
+	}
+}
+
+// TestTryDeliverQueuedNudgesByPollerSkipsRedeliveryAfterUnconfirmedSubmitWithActivity
+// reproduces gcf-1n2 end to end: a batch's only prior attempt failed with
+// ErrNudgeSubmitUnconfirmed, and the session shows real activity after that
+// attempt (proof the earlier submit actually landed). The next dispatch tick
+// must ack the item without calling Nudge again — the pre-fix behavior
+// re-pasted the identical message a second time into the agent's pane.
+func TestTryDeliverQueuedNudgesByPollerSkipsRedeliveryAfterUnconfirmedSubmitWithActivity(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	enqueuedAt := time.Now().Add(-1 * time.Minute)
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", enqueuedAt)); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+
+	store := openNudgeBeadStore(dir)
+
+	// Simulate the prior tick: claim the item and record exactly the failure
+	// mode gcf-1n2 documents, backdated far enough that DeliverAfter has
+	// already elapsed by the time the real dispatch call below runs.
+	claimed, err := claimDueWorkerNudges(dir)
+	if err != nil {
+		t.Fatalf("claimDueWorkerNudges: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %d, want 1", len(claimed))
+	}
+	attemptAt := time.Now().Add(-30 * time.Second)
+	if err := recordQueuedNudgeFailureWithStore(dir, store, queuedNudgeIDs(claimed), sessiontmux.ErrNudgeSubmitUnconfirmed, attemptAt); err != nil {
+		t.Fatalf("recordQueuedNudgeFailureWithStore: %v", err)
+	}
+
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Activity after the failed attempt: the earlier submit landed and the
+	// session briefly went busy before this tick observed it.
+	activityAt := attemptAt.Add(5 * time.Second)
+	fake.Activity = map[string]time.Time{info.SessionName: activityAt}
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionID:   info.ID,
+		resolved:    &config.ResolvedProvider{Name: "codex"},
+		sessionName: info.SessionName,
+	}
+	obs := worker.LiveObservation{Running: true, LastActivity: &activityAt}
+
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, fake, 3*time.Second, obs)
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
+	}
+	if !delivered {
+		t.Fatal("delivered = false, want true (activity after the unconfirmed attempt confirms delivery)")
+	}
+
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" {
+			t.Fatalf("unexpected redelivery: Nudge called with %#v — the message would be pasted into the pane a second time", call)
+		}
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 0/0/0 (item acked, not left for another retry)", len(pending), len(inFlight), len(dead))
 	}
 }
 
