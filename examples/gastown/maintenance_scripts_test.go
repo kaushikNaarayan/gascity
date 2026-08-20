@@ -7643,6 +7643,13 @@ func runScriptResult(t *testing.T, script string, env map[string]string) ([]byte
 	return cmd.CombinedOutput()
 }
 
+func runScriptArgsResult(t *testing.T, script string, args []string, env map[string]string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command(script, args...)
+	cmd.Env = mergeTestEnv(env)
+	return cmd.CombinedOutput()
+}
+
 func runReaperCloseFixture(t *testing.T, fixture string) (doltLog string, gcLog string) {
 	t.Helper()
 	cityDir := t.TempDir()
