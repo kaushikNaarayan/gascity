@@ -725,13 +725,24 @@ func newSessionListCmd(stdout, stderr io.Writer) *cobra.Command {
 	var stateFilter string
 	var templateFilter string
 	var jsonOutput bool
+	var columnsFlag string
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List chat sessions",
-		Long:  `List all chat sessions. By default shows active and suspended sessions.`,
-		Args:  cobra.NoArgs,
+		Long: `List all chat sessions. By default shows active and suspended sessions.
+
+Use --columns to restrict the human-readable table to a subset of columns
+(comma-separated, e.g. "id,state,target") for narrow panes. Valid columns: ` +
+			strings.Join(sessionListColumnNames, ", ") + `. Omit --columns for the
+full default table. --columns has no effect on --json output.`,
+		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdSessionList(stateFilter, templateFilter, jsonOutput, stdout, stderr) != 0 {
+			columns, err := parseSessionListColumns(columnsFlag)
+			if err != nil {
+				fmt.Fprintf(stderr, "gc session list: %v\n", err) //nolint:errcheck // best-effort stderr
+				return errExit
+			}
+			if cmdSessionList(stateFilter, templateFilter, jsonOutput, columns, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -740,7 +751,85 @@ func newSessionListCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&stateFilter, "state", "", `filter by state: "active", "suspended", "closed", "all"`)
 	cmd.Flags().StringVar(&templateFilter, "template", "", "filter by template name")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	cmd.Flags().StringVar(&columnsFlag, "columns", "", "comma-separated list of columns to show (default: all)")
 	return cmd
+}
+
+// sessionListColumnNames is the canonical ordered set of columns "gc session
+// list" can render, and the valid values for --columns. last_nudge is only
+// populated on the direct-bd fallback path (the supervisor API's SessionView
+// has no last-nudge field); on the API-rendered path it always shows "-".
+var sessionListColumnNames = []string{"id", "template", "state", "reason", "target", "title", "workdir", "age", "last_active", "last_nudge"}
+
+// sessionListColumnHeaders maps each canonical column name to its table
+// header text.
+var sessionListColumnHeaders = map[string]string{
+	"id":          "ID",
+	"template":    "TEMPLATE",
+	"state":       "STATE",
+	"reason":      "REASON",
+	"target":      "TARGET",
+	"title":       "TITLE",
+	"workdir":     "WORKDIR",
+	"age":         "AGE",
+	"last_active": "LAST ACTIVE",
+	"last_nudge":  "LAST NUDGE",
+}
+
+// parseSessionListColumns validates and normalizes a --columns flag value
+// against sessionListColumnNames, preserving the caller's requested order.
+// An empty raw value returns (nil, nil): the caller falls back to its own
+// default full column set.
+func parseSessionListColumns(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	allowed := make(map[string]bool, len(sessionListColumnNames))
+	for _, c := range sessionListColumnNames {
+		allowed[c] = true
+	}
+	parts := strings.Split(raw, ",")
+	cols := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !allowed[p] {
+			return nil, fmt.Errorf("unknown --columns value %q (valid: %s)", p, strings.Join(sessionListColumnNames, ", "))
+		}
+		cols = append(cols, p)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("--columns requires at least one column")
+	}
+	return cols, nil
+}
+
+// sessionListHeaderRow renders the tab-separated header line for the given
+// columns.
+func sessionListHeaderRow(cols []string) string {
+	headers := make([]string, len(cols))
+	for i, c := range cols {
+		headers[i] = sessionListColumnHeaders[c]
+	}
+	return strings.Join(headers, "\t")
+}
+
+// sessionListDataRow renders one tab-separated data line for the given
+// columns, looking up each column's value from values. A column absent from
+// values (e.g. last_nudge on the API-rendered path) renders as "-".
+func sessionListDataRow(cols []string, values map[string]string) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		v, ok := values[c]
+		if !ok || v == "" {
+			v = "-"
+		}
+		parts[i] = v
+	}
+	return strings.Join(parts, "\t")
 }
 
 // sessionListAPIClient returns (client, "") when the API path is available,
@@ -757,7 +846,7 @@ var sessionListAPIClient = func(cityPath string) (*api.Client, string) {
 // routeSessionList dispatches `session list` to the supervisor API when a
 // controller is up; otherwise falls back to the local iterator. Emits
 // exactly one route=... log line per exit path (gated on GC_DEBUG).
-func routeSessionList(_ string, stateFilter, templateFilter string, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+func routeSessionList(_ string, stateFilter, templateFilter string, c *api.Client, nilReason string, jsonOutput bool, columns []string, stdout, stderr io.Writer) int {
 	var cr api.CachedRead[[]api.SessionView]
 	return routeRead(c, "session list", nilReason, stderr,
 		func() error {
@@ -765,8 +854,10 @@ func routeSessionList(_ string, stateFilter, templateFilter string, c *api.Clien
 			cr, err = c.ListSessions(stateFilter, templateFilter, false)
 			return err
 		},
-		func() int { return renderSessionListFromAPI(cr, jsonOutput, stdout) },
-		func() int { return doSessionListFallback(stateFilter, templateFilter, jsonOutput, stdout, stderr) },
+		func() int { return renderSessionListFromAPI(cr, jsonOutput, columns, stdout) },
+		func() int {
+			return doSessionListFallback(stateFilter, templateFilter, jsonOutput, columns, stdout, stderr)
+		},
 	)
 }
 
@@ -787,7 +878,12 @@ type SessionView = api.SessionView
 // the output is the sessionListJSONEnvelope with _cache_age_s; human output
 // mirrors the fallback tabwriter format and appends a staleness banner when
 // the supervisor cache age crosses the threshold.
-func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool, stdout io.Writer) int {
+// sessionListDefaultAPIColumns is the full column set rendered by the
+// API-sourced path when --columns is omitted. It has no last_nudge column:
+// the supervisor API's SessionView carries no last-nudge field.
+var sessionListDefaultAPIColumns = []string{"id", "template", "state", "reason", "target", "title", "workdir", "age", "last_active"}
+
+func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool, columns []string, stdout io.Writer) int {
 	if jsonOutput {
 		env := sessionListJSONEnvelope{
 			CacheAgeS: cr.AgeSeconds,
@@ -807,8 +903,13 @@ func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool,
 		return 0
 	}
 
+	cols := columns
+	if len(cols) == 0 {
+		cols = sessionListDefaultAPIColumns
+	}
+
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tWORKDIR\tAGE\tLAST ACTIVE") //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(w, sessionListHeaderRow(cols)) //nolint:errcheck // best-effort stdout
 	for _, s := range cr.Body {
 		state := s.State
 		if state == "" {
@@ -818,12 +919,18 @@ func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool,
 		if reason == "" {
 			reason = "-"
 		}
-		target := sessionViewTarget(s)
-		title := sessionViewTitle(s)
-		workDir := sessionViewWorkDir(s)
-		age := sessionViewAge(s.CreatedAt)
-		lastActive := sessionViewLastActive(s.LastActive)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, workDir, age, lastActive) //nolint:errcheck // best-effort stdout
+		values := map[string]string{
+			"id":          s.ID,
+			"template":    s.Template,
+			"state":       state,
+			"reason":      reason,
+			"target":      sessionViewTarget(s),
+			"title":       sessionViewTitle(s),
+			"workdir":     sessionViewWorkDir(s),
+			"age":         sessionViewAge(s.CreatedAt),
+			"last_active": sessionViewLastActive(s.LastActive),
+		}
+		fmt.Fprintln(w, sessionListDataRow(cols, values)) //nolint:errcheck // best-effort stdout
 	}
 	_ = w.Flush() //nolint:errcheck // best-effort stdout
 
@@ -916,9 +1023,9 @@ func sessionViewLastActive(lastActive string) string {
 // cmdSessionList is the CLI entry point for "gc session list". It routes
 // through the supervisor API when a controller is up and falls back to the
 // local iterator otherwise.
-func cmdSessionList(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
+func cmdSessionList(stateFilter, templateFilter string, jsonOutput bool, columns []string, stdout, stderr io.Writer) int {
 	return routeReadCmd("session list", stderr, sessionListAPIClient, func(cityPath string, c *api.Client, nilReason string) int {
-		return routeSessionList(cityPath, stateFilter, templateFilter, c, nilReason, jsonOutput, stdout, stderr)
+		return routeSessionList(cityPath, stateFilter, templateFilter, c, nilReason, jsonOutput, columns, stdout, stderr)
 	})
 }
 
@@ -939,8 +1046,12 @@ func sortSessionsCreatedDesc(sessions []session.Info) {
 	})
 }
 
+// sessionListDefaultFallbackColumns is the full column set rendered by the
+// direct-bd fallback path when --columns is omitted.
+var sessionListDefaultFallbackColumns = []string{"id", "template", "state", "reason", "target", "title", "workdir", "age", "last_active", "last_nudge"}
+
 // doSessionListFallback is the direct-bd path for "gc session list".
-func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
+func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, columns []string, stdout, stderr io.Writer) int {
 	storeStderr := stderr
 	if jsonOutput {
 		storeStderr = io.Discard
@@ -1057,8 +1168,13 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 	// in wakeReasonsInfo.
 	cachedSP := &attachmentCachingProvider{Provider: sp, cache: attachedSet}
 
+	cols := columns
+	if len(cols) == 0 {
+		cols = sessionListDefaultFallbackColumns
+	}
+
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tWORKDIR\tAGE\tLAST ACTIVE\tLAST NUDGE") //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(w, sessionListHeaderRow(cols)) //nolint:errcheck // best-effort stdout
 	for _, s := range sessions {
 		state := string(s.State)
 		if s.State == "" {
@@ -1077,7 +1193,19 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		if !s.LastNudgeDeliveredAt.IsZero() {
 			lastNudge = formatDuration(time.Since(s.LastNudgeDeliveredAt)) + " ago"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, workDir, age, lastActive, lastNudge) //nolint:errcheck // best-effort stdout
+		values := map[string]string{
+			"id":          s.ID,
+			"template":    s.Template,
+			"state":       state,
+			"reason":      reason,
+			"target":      target,
+			"title":       title,
+			"workdir":     workDir,
+			"age":         age,
+			"last_active": lastActive,
+			"last_nudge":  lastNudge,
+		}
+		fmt.Fprintln(w, sessionListDataRow(cols, values)) //nolint:errcheck // best-effort stdout
 	}
 	_ = w.Flush() //nolint:errcheck // best-effort stdout
 	return 0

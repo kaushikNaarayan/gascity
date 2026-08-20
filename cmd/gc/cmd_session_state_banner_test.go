@@ -45,7 +45,7 @@ func sessionListBannerOutput(t *testing.T, ageSeconds float64) string {
 			CreatedAt:  "2026-04-23T10:00:00Z",
 			LastActive: "2026-04-23T12:00:00Z",
 		}},
-	}, false, &stdout)
+	}, false, nil, &stdout)
 	if code != 0 {
 		t.Fatalf("renderSessionListFromAPI = %d, want 0", code)
 	}
@@ -121,7 +121,7 @@ func TestRenderSessionListFromAPIJSONHasNoBanner(t *testing.T) {
 			Template: "worker",
 			State:    "asleep",
 		}},
-	}, true, &stdout)
+	}, true, nil, &stdout)
 	if code != 0 {
 		t.Fatalf("renderSessionListFromAPI = %d, want 0", code)
 	}

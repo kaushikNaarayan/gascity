@@ -4157,12 +4157,17 @@ gc session kill <session-id-or-alias> [flags]
 
 List all chat sessions. By default shows active and suspended sessions.
 
+Use --columns to restrict the human-readable table to a subset of columns
+(comma-separated, e.g. "id,state,target") for narrow panes. Valid columns: id, template, state, reason, target, title, workdir, age, last_active, last_nudge. Omit --columns for the
+full default table. --columns has no effect on --json output.
+
 ```
 gc session list [flags]
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--columns` | string |  | comma-separated list of columns to show (default: all) |
 | `--json` | bool |  | JSON output |
 | `--state` | string |  | filter by state: "active", "suspended", "closed", "all" |
 | `--template` | string |  | filter by template name |
