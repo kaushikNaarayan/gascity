@@ -20,13 +20,20 @@ type ciCriticalPathWorkflow struct {
 type ciCriticalPathJob struct {
 	Name            string                    `yaml:"name"`
 	If              string                    `yaml:"if"`
-	RunsOn          string                    `yaml:"runs-on"`
+	RunsOn          ciCriticalPathRunsOn      `yaml:"runs-on"`
 	Needs           ciCriticalPathNeeds       `yaml:"needs"`
 	Outputs         map[string]string         `yaml:"outputs"`
 	Steps           []ciCriticalPathStep      `yaml:"steps"`
 	Strategy        ciCriticalPathJobStrategy `yaml:"strategy"`
 	ContinueOnError bool                      `yaml:"continue-on-error"`
 }
+
+// ciCriticalPathRunsOn models GitHub Actions' `runs-on`, which is either a
+// scalar (an expression resolving to a label, e.g. "ubuntu-latest") or a
+// sequence of labels (e.g. [self-hosted, gt2] for self-hosted runner
+// groups). Sequence entries are joined so existing string comparisons
+// against known scalar runner labels keep working unchanged.
+type ciCriticalPathRunsOn string
 
 type ciCriticalPathJobStrategy struct {
 	FailFast *bool                   `yaml:"fail-fast"`
@@ -1096,6 +1103,19 @@ func TestPRIntegrationMatrixKeepsHeavyRestCoverageInReleaseGates(t *testing.T) {
 	if !permitsPRSkip {
 		t.Error("ci-integration must treat the push-only REST job as an expected skip on pull requests")
 	}
+}
+
+func (r *ciCriticalPathRunsOn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		*r = ciCriticalPathRunsOn(node.Value)
+		return nil
+	}
+	var values []string
+	if err := node.Decode(&values); err != nil {
+		return err
+	}
+	*r = ciCriticalPathRunsOn(strings.Join(values, ", "))
+	return nil
 }
 
 func (n *ciCriticalPathNeeds) UnmarshalYAML(node *yaml.Node) error {
