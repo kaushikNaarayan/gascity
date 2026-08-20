@@ -28,7 +28,10 @@ CITY="${GC_CITY:-.}"
 # it cannot be used to select wisps; `bd query` does project `ephemeral` and
 # `labels` and is the selection surface this script is contracted to. --all
 # is required because closed ephemeral wisps (the delete path) are excluded
-# from query's default open-only filter.
+# from query's default open-only filter. This calls `gc bd`, not bare `bd`,
+# deliberately: bare `bd` resolves its store from the CWD, which would let
+# the selection query silently scope to a different store than the `gc bd
+# update`/`delete` mutations below use.
 if ! EPHEMERALS=$(gc bd query "ephemeral=true" --all --json -n 0 2>&1); then
     echo "wisp-compact: ERROR: ephemeral-wisp query failed: $EPHEMERALS" >&2
     exit 1
