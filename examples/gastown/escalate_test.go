@@ -36,8 +36,7 @@ exit 0
 		"GC_CITY_PATH": cityDir,
 	}
 
-	args := []string{"--subject", "ESCALATION: Reaper anomalies detected", "--message", "hq: 503 stale open wisps"}
-	out, err := runScriptArgsResult(t, coreScriptPath("escalate.sh"), args, env)
+	out, err := runScriptResult(t, coreScriptPath("escalate.sh"), env, "--subject", "ESCALATION: Reaper anomalies detected", "--message", "hq: 503 stale open wisps")
 	if err != nil {
 		t.Fatalf("escalate.sh failed on dedup skip: %v\n%s", err, out)
 	}
@@ -75,8 +74,7 @@ exit 0
 		"GC_CITY_PATH": cityDir,
 	}
 
-	args := []string{"--subject", "ESCALATION: Reaper anomalies detected", "--message", "hq: 503 stale open wisps"}
-	out, err := runScriptArgsResult(t, coreScriptPath("escalate.sh"), args, env)
+	out, err := runScriptResult(t, coreScriptPath("escalate.sh"), env, "--subject", "ESCALATION: Reaper anomalies detected", "--message", "hq: 503 stale open wisps")
 	if err != nil {
 		t.Fatalf("escalate.sh failed: %v\n%s", err, out)
 	}

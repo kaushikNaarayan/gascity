@@ -7636,14 +7636,7 @@ func runScript(t *testing.T, script string, env map[string]string) {
 	}
 }
 
-func runScriptResult(t *testing.T, script string, env map[string]string) ([]byte, error) {
-	t.Helper()
-	cmd := exec.Command(script)
-	cmd.Env = mergeTestEnv(env)
-	return cmd.CombinedOutput()
-}
-
-func runScriptArgsResult(t *testing.T, script string, args []string, env map[string]string) ([]byte, error) {
+func runScriptResult(t *testing.T, script string, env map[string]string, args ...string) ([]byte, error) {
 	t.Helper()
 	cmd := exec.Command(script, args...)
 	cmd.Env = mergeTestEnv(env)
