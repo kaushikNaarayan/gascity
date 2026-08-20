@@ -48,6 +48,26 @@ fi
 
 RECIPIENT="${GC_ESCALATION_RECIPIENT:-human}"
 
+# Resolve the calling script's city the same way reaper.sh / jsonl-export.sh
+# do, and scope the dedup query to it explicitly via `--city`. Callers set
+# GC_CITY/GC_CITY_PATH before invoking this hook; relying on ambient
+# BEADS_DIR instead (no --city) can hit the wrong store on a host running
+# more than one city.
+CITY="${GC_CITY_PATH:-${GC_CITY:-.}}"
+CITY_ABS="$(cd "$CITY" 2>/dev/null && pwd -P || printf '%s\n' "$CITY")"
+
+# Dedup: skip firing a new mail-wisp when an open one with this exact subject
+# already sits in the recipient's queue. Without this, a persistent condition
+# (e.g. a threshold that stays tripped every patrol cycle) files one new
+# escalation wisp per cycle forever, and the escalation backlog itself can
+# become the largest contributor to whatever it's alarming about. A query
+# failure fails open (still sends) so a broken dedup check never swallows a
+# real alert.
+if EXISTING=$(gc bd --city "$CITY_ABS" query "status=open AND assignee=$RECIPIENT AND title=\"$SUBJECT\"" --json -n 1 2>/dev/null) && \
+   [ "$EXISTING" != "[]" ] && [ -n "$EXISTING" ]; then
+    exit 0
+fi
+
 # Wake the recipient when it is an agent session. Without this the send writes
 # a message bead and emits an event with no subscriber, so a paused agent finds
 # the escalation only on a turn boundary it may never reach — which is how a

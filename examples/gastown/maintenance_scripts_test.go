@@ -11186,10 +11186,10 @@ func TestPruneBranchesNoOpWhenNoGcBranches(t *testing.T) {
 const wispTimestampLayout = "2006-01-02T15:04:05"
 
 // wispCompactEnv installs a `bd` stub that returns the supplied beadsJSON on
-// `bd list --json --all -n 0` and logs all other bd subcommands to BD_LOG.
-// BD_LOG is pre-created empty so skip-path tests can still assert on its
-// (empty) contents. TZ=UTC is pinned for cross-platform date parsing — see
-// wispTimestampLayout. jq is whatever is on PATH.
+// `bd query "ephemeral=true" --all --json -n 0` and logs all other bd
+// subcommands to BD_LOG. BD_LOG is pre-created empty so skip-path tests can
+// still assert on its (empty) contents. TZ=UTC is pinned for cross-platform
+// date parsing — see wispTimestampLayout. jq is whatever is on PATH.
 func wispCompactEnv(t *testing.T, beadsJSON string) (bdLog string, env map[string]string) {
 	t.Helper()
 	binDir := t.TempDir()
@@ -11201,20 +11201,27 @@ func wispCompactEnv(t *testing.T, beadsJSON string) (bdLog string, env map[strin
 	stubPath := filepath.Join(binDir, "bd")
 	// Stub fails fast on any subcommand or flag shape the script doesn't
 	// currently use. This pins the script's bd contract — a regression that
-	// dropped `--json` or `--all` from `bd list` would otherwise silently
-	// pass because cat would still emit valid JSON.
+	// dropped `--json`, `--all`, or the ephemeral=true predicate from
+	// `bd query` would otherwise silently pass because cat would still emit
+	// valid JSON. `bd list` is deliberately NOT stubbed here: wisp-compact.sh
+	// must select through `bd query`, which projects `ephemeral`, not
+	// `bd list`, which historically did not (bd list is only used elsewhere,
+	// never for wisp selection).
 	writeExecutable(t, stubPath, fmt.Sprintf(`#!/bin/sh
 case "$1" in
-  list)
+  query)
     case "$*" in
-      *"--json"*"--all"*"-n 0"*)
-        cat <<'EOF'
-%s
-EOF
+      *"ephemeral=true"*"--all"*"--json"*"-n 0"*)
+        # Real "bd query ephemeral=true" only returns matching rows; filter
+        # the fixture the same way so a fixture that (deliberately) includes
+        # a non-ephemeral bead exercises the same server-side behavior the
+        # production query provides, not a client-side filter the script no
+        # longer performs.
+        echo '%s' | jq -c '[.[] | select(.ephemeral == true)]'
         exit 0
         ;;
       *)
-        echo "bd list called with unexpected args: $*" >&2
+        echo "bd query called with unexpected args: $*" >&2
         exit 2
         ;;
     esac
@@ -11572,7 +11579,7 @@ func TestWispCompactReportsNonZeroCounters(t *testing.T) {
 	writeExecutable(t, filepath.Join(binDir, "bd"), fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> "$BD_LOG"
 case "$1 $2" in
-  "list --json")
+  "query ephemeral=true")
     cat <<'JSON'
 %s
 JSON
@@ -11601,8 +11608,8 @@ exit 0
 	if err != nil {
 		t.Fatalf("ReadFile(bd log): %v", err)
 	}
-	if !strings.Contains(string(logData), "list --json --all -n 0") {
-		t.Fatalf("bd list call not observed:\n%s", logData)
+	if !strings.Contains(string(logData), "query ephemeral=true --all --json -n 0") {
+		t.Fatalf("bd query call not observed:\n%s", logData)
 	}
 
 	want := "wisp-compact: promoted=1 deleted=2 skipped=1"
@@ -11625,7 +11632,7 @@ func TestWispCompactBSDDateZFallbackUsesUTC(t *testing.T) {
 	writeExecutable(t, filepath.Join(binDir, "bd"), fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> "$BD_LOG"
 case "$1 $2" in
-  "list --json")
+  "query ephemeral=true")
     cat <<'JSON'
 %s
 JSON
