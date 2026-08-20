@@ -349,6 +349,11 @@ func classifyRetryAttempt(subject beads.Bead) retryEvalResult {
 		switch strings.TrimSpace(subject.Metadata[beadmeta.FailureClassMetadataKey]) {
 		case beadmeta.FailureClassTransient:
 			return retryEvalResult{Outcome: "transient", Reason: retryFailureReason(subject)}
+		case beadmeta.FailureClassPersist:
+			// The attempt completed; only persisting its result failed. Retry
+			// the persist rather than giving up (hard) — explicit so this does
+			// not silently ride the default/unknown branch below.
+			return retryEvalResult{Outcome: "transient", Reason: "persist_failure"}
 		case beadmeta.FailureClassHard, "":
 			return retryEvalResult{Outcome: "hard", Reason: retryFailureReason(subject)}
 		default:
