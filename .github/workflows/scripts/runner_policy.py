@@ -25,6 +25,23 @@ GITHUB_RUNNERS = {
     "runner_macos": "macos-15",
 }
 
+# Our self-hosted fleet. `gt2` is a single custom label shared by every Linux
+# runner regardless of requested size (we do not size-partition self-hosted
+# capacity); GitHub schedules a job onto any runner carrying the label, so no
+# per-vcpu label is needed. `macos` is Kaushik's Mac Mini.
+SELF_HOSTED_RUNNERS = {
+    "runner_2vcpu": "gt2",
+    "runner_8vcpu": "gt2",
+    "runner_16vcpu": "gt2",
+    "runner_32vcpu": "gt2",
+    "runner_macos": "macos",
+}
+
+# Our fork. Every event on this repo must resolve to our own runners —
+# checked ahead of force_blacksmith so a stray workflow input can never
+# route our traffic to a billed host.
+SELF_HOSTED_REPOSITORIES = {"material-lab-io/gascity"}
+
 
 def load_allowlist(path: Path = ALLOWLIST_PATH) -> set[str]:
     """Load the Blacksmith pull request author allowlist."""
@@ -44,10 +61,17 @@ def select_runners(
     allowlist: set[str],
     *,
     force_blacksmith: bool = False,
+    repository: str = "",
 ) -> tuple[bool, str, dict[str, str]]:
     """Return whether to use Blacksmith, the reason, and runner labels."""
     normalized_event = event_name.strip()
     normalized_author = author.strip()
+    if repository.strip() in SELF_HOSTED_REPOSITORIES:
+        return (
+            False,
+            f"{repository.strip()} routes to our self-hosted fleet for every event",
+            SELF_HOSTED_RUNNERS,
+        )
     if force_blacksmith:
         return True, "Blacksmith forced by workflow input", BLACKSMITH_RUNNERS
     if normalized_event == "pull_request" and normalized_author.lower() in allowlist:
@@ -75,12 +99,19 @@ def append_outputs(use_blacksmith: bool, reason: str, runners: dict[str, str]) -
             output.write(f"{name}={runner}\n")
 
 
-def append_summary(use_blacksmith: bool, reason: str, event_name: str, author: str) -> None:
+def append_summary(
+    use_blacksmith: bool, reason: str, event_name: str, author: str, runners: dict[str, str]
+) -> None:
     """Append a human-readable runner policy summary."""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    backend = "Blacksmith" if use_blacksmith else "GitHub-hosted"
+    if runners == SELF_HOSTED_RUNNERS:
+        backend = "Self-hosted"
+    elif use_blacksmith:
+        backend = "Blacksmith"
+    else:
+        backend = "GitHub-hosted"
     with open(summary_path, "a", encoding="utf-8") as summary:
         summary.write("## Runner policy\n\n")
         summary.write(f"- backend: `{backend}`\n")
@@ -94,14 +125,16 @@ def main() -> None:
     event_name = os.environ["EVENT_NAME"]
     author = os.environ.get("PR_AUTHOR", "").strip()
     force_blacksmith = os.environ.get("FORCE_BLACKSMITH", "").strip().lower() == "true"
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
     use_blacksmith, reason, runners = select_runners(
         event_name,
         author,
         load_allowlist(),
         force_blacksmith=force_blacksmith,
+        repository=repository,
     )
     append_outputs(use_blacksmith, reason, runners)
-    append_summary(use_blacksmith, reason, event_name, author)
+    append_summary(use_blacksmith, reason, event_name, author, runners)
 
 
 if __name__ == "__main__":

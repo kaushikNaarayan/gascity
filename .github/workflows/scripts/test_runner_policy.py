@@ -68,6 +68,63 @@ class RunnerPolicyTests(unittest.TestCase):
         self.assertIn("not on the Blacksmith allowlist", reason)
         self.assertEqual(runners["runner_macos"], "macos-15")
 
+    def test_our_fork_uses_self_hosted_for_every_event(self) -> None:
+        for event_name in (
+            "pull_request",
+            "push",
+            "schedule",
+            "workflow_dispatch",
+            "workflow_call",
+        ):
+            with self.subTest(event=event_name):
+                use_blacksmith, reason, runners = runner_policy.select_runners(
+                    event_name,
+                    "external-contributor",
+                    set(),
+                    repository="material-lab-io/gascity",
+                )
+
+                self.assertFalse(use_blacksmith)
+                self.assertEqual(runners, runner_policy.SELF_HOSTED_RUNNERS)
+                self.assertEqual(runners["runner_2vcpu"], "gt2")
+                self.assertEqual(runners["runner_32vcpu"], "gt2")
+                self.assertEqual(runners["runner_macos"], "macos")
+                self.assertIn("material-lab-io/gascity", reason)
+
+    def test_our_fork_stays_self_hosted_even_with_force_blacksmith(self) -> None:
+        use_blacksmith, reason, runners = runner_policy.select_runners(
+            "workflow_dispatch",
+            "",
+            set(),
+            force_blacksmith=True,
+            repository="material-lab-io/gascity",
+        )
+
+        self.assertFalse(use_blacksmith)
+        self.assertEqual(runners, runner_policy.SELF_HOSTED_RUNNERS)
+
+    def test_our_fork_stays_self_hosted_even_on_the_blacksmith_allowlist(self) -> None:
+        use_blacksmith, reason, runners = runner_policy.select_runners(
+            "pull_request",
+            "julianknutsen",
+            {"julianknutsen"},
+            repository="material-lab-io/gascity",
+        )
+
+        self.assertFalse(use_blacksmith)
+        self.assertEqual(runners, runner_policy.SELF_HOSTED_RUNNERS)
+
+    def test_other_repositories_are_unaffected(self) -> None:
+        use_blacksmith, reason, runners = runner_policy.select_runners(
+            "push",
+            "",
+            set(),
+            repository="gastownhall/gascity",
+        )
+
+        self.assertFalse(use_blacksmith)
+        self.assertEqual(runners, runner_policy.GITHUB_RUNNERS)
+
 
 if __name__ == "__main__":
     unittest.main()
