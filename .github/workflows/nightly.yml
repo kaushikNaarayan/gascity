@@ -15,7 +15,7 @@ env:
 jobs:
   tier-b:
     name: Tier B acceptance tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -37,7 +37,7 @@ jobs:
 
   tier-c:
     name: Tier C acceptance tests (Ollama)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     timeout-minutes: 60
     env:
       ANTHROPIC_BASE_URL: https://ollama.com
@@ -81,7 +81,7 @@ jobs:
 
   integration-sqlite-coordstore:
     name: Integration / SQLite coordination store
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     timeout-minutes: 30
     env:
       DOLT_VERSION: "2.1.7"
@@ -107,7 +107,7 @@ jobs:
   # the pack-gate pin check in ci.yml.
   bundled-pack-pins:
     name: Bundled gastown pack pin check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
