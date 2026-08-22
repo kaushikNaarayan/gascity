@@ -23,6 +23,23 @@ func TestCurrentWorkflowsMatchPolicy(t *testing.T) {
 	}
 }
 
+func TestNoHostedRunnersOutsidePolicy(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	violations, err := checkRunnerLabels(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) > 0 {
+		t.Fatalf(
+			"every workflow job on material-lab-io/gascity must run on our self-hosted "+
+				"fleet (via runner_policy.py outputs, or a bare self-hosted gt2/macos label) "+
+				"unless explicitly allowlisted in approvedHostedExceptions with a stated "+
+				"reason:\n  - %s",
+			strings.Join(violations, "\n  - "),
+		)
+	}
+}
+
 func TestMakeTestCIPolicyRunsStaticScopeContracts(t *testing.T) {
 	const want = "\t$(TEST_ENV) GOFLAGS= GOENV=off GOWORK=off go test -count=1 -run '^(TestPreflightStaticScopesOrdinaryPRsWithoutWeakeningProtectedRuns|TestFullStaticLintExplicitlyOwnsConfiguredGolangCIGovet|TestChangedStaticTargetsScopeLintAndFormattingToTheDiff|TestCIStaticScopeClassifierFailsClosedOutsideValidatedPullRequestMerge)$$' ./scripts"
 
