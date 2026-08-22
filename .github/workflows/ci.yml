@@ -25,9 +25,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # This is our fork's copy of ci.yml: it only ever runs for
+  # material-lab-io/gascity, so the policy job's own bootstrap runs on our
+  # self-hosted fleet directly rather than re-deriving the same answer
+  # runner_policy.py is about to compute.
   runner-policy:
     name: Runner policy
-    runs-on: ${{ inputs.force_blacksmith && 'blacksmith-2vcpu-ubuntu-2404' || (github.event_name == 'pull_request' && contains(fromJSON('["julianknutsen","csells","sjarmak","quad341"]'), github.event.pull_request.user.login) && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest') }}
+    runs-on: [self-hosted, gt2]
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
@@ -664,6 +668,9 @@ jobs:
       - runner-policy
       - changes
     if: needs.changes.outputs.credential_provider == 'true'
+    # Approved hosted-runner exception (gcf-5y0): we have no self-hosted
+    # Windows runner, this job only fires on internal/credentialprovider/**
+    # changes, and its Job Object assertions have no Linux/macOS equivalent.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

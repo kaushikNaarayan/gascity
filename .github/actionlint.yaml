@@ -1,5 +1,7 @@
 self-hosted-runner:
   labels:
+    - gt2
+    - macos
     - blacksmith-2vcpu-ubuntu-2404
     - blacksmith-4vcpu-ubuntu-2404
     - blacksmith-8vcpu-ubuntu-2404
