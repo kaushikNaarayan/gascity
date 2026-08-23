@@ -182,7 +182,7 @@ func (f *executionBackstopFixture) sessionMeta(t *testing.T, key string) string 
 }
 
 func (f *executionBackstopFixture) nudgeCount() int {
-	return strings.Count(f.stdout.String(), "execution-claim-nudge: nudged")
+	return strings.Count(f.stdout.String(), "execution-claim-nudge: delivered")
 }
 
 // echoOneReArm drives exactly one nudge -> self-echo -> re-arm cycle: the tick
@@ -247,6 +247,55 @@ func TestExecutionBackstopNudgesAnIdleClaimHolderExactlyOnce(t *testing.T) {
 	f.tick(t)
 	if got := f.nudgeCount(); got != 1 {
 		t.Fatalf("nudges inside the backoff = %d, want still 1", got)
+	}
+}
+
+// The controller must submit a follow-up turn through the session boundary,
+// rather than pasting directly into the provider runtime. The submit boundary
+// owns durable queueing and provider-specific idle delivery.
+func TestExecutionBackstopUsesConfiguredSemanticContinuationDelivery(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	var delivered []string
+	f.idleFor(t, 10*time.Minute)
+
+	sessions, err := loadSessionBeads(f.store)
+	if err != nil {
+		t.Fatalf("loading session beads: %v", err)
+	}
+	work, err := f.store.List(beads.ListQuery{Status: "in_progress"})
+	if err != nil {
+		t.Fatalf("listing work: %v", err)
+	}
+	stores := []beads.Store{f.store}
+	refs := []string{""}
+	deliver := func(sessionBead beads.Bead, message string) error {
+		if sessionBead.ID != f.session.ID {
+			t.Fatalf("delivery session = %q, want %q", sessionBead.ID, f.session.ID)
+		}
+		delivered = append(delivered, message)
+		return nil
+	}
+	nudgeStalledPoolExecution(f.sp, f.cfg, f.store, sessions, work, stores, refs, false, f.now, f.rec,
+		func(beads.Bead) error { return nil }, &f.stdout, deliver)
+
+	f.now = f.now.Add(idleClaimNudgeGrace + time.Second)
+	f.idleFor(t, 10*time.Minute)
+	sessions, err = loadSessionBeads(f.store)
+	if err != nil {
+		t.Fatalf("reloading session beads: %v", err)
+	}
+	work, err = f.store.List(beads.ListQuery{Status: "in_progress"})
+	if err != nil {
+		t.Fatalf("relisting work: %v", err)
+	}
+	nudgeStalledPoolExecution(f.sp, f.cfg, f.store, sessions, work, stores, refs, false, f.now, f.rec,
+		func(beads.Bead) error { return nil }, &f.stdout, deliver)
+
+	if len(delivered) != 1 {
+		t.Fatalf("semantic deliveries = %d, want 1", len(delivered))
+	}
+	if got := f.sp.CountCalls("Nudge", f.sessName); got != 0 {
+		t.Fatalf("runtime nudges = %d, want 0", got)
 	}
 }
 

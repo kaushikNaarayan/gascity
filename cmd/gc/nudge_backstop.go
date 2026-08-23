@@ -75,6 +75,14 @@ type activityDecayingBackstop interface {
 	decay(store beads.Store, s *beads.Bead, target backstopTarget, sessName string, last, now time.Time, stdout io.Writer) bool
 }
 
+// semanticBackstopDelivery is an optional delivery seam for predicates whose
+// work must enter a typed, durable session queue instead of the legacy runtime
+// nudge transport. Predicates that do not implement it retain the established
+// direct nudge behavior.
+type semanticBackstopDelivery interface {
+	deliver(sessionBead beads.Bead, sessionName, content string) error
+}
+
 // backstopTarget is the durable identity of one outstanding delivery target.
 // ID is the human-facing work bead. RootID, StoreRef, and Generation are
 // optional persisted provenance fields: the initial pool-claim predicate needs
@@ -264,11 +272,17 @@ func runNudgeBackstop(
 			if !pred.reserve(store, s, target, attempts+1, now, stdout) {
 				continue
 			}
-			if err := sp.Nudge(sessName, runtime.TextContent(content)); err != nil {
+			var err error
+			if delivery, ok := pred.(semanticBackstopDelivery); ok {
+				err = delivery.deliver(*s, sessName, content)
+			} else {
+				err = sp.Nudge(sessName, runtime.TextContent(content))
+			}
+			if err != nil {
 				fmt.Fprintf(stdout, "%s: %s failed: %v\n", label, sessName, err) //nolint:errcheck // best-effort
 				continue
 			}
-			fmt.Fprintf(stdout, "%s: nudged %s for %s (attempt %d/%d)\n", label, sessName, target.ID, attempts+1, idleClaimNudgeMaxAttempts) //nolint:errcheck // best-effort
+			fmt.Fprintf(stdout, "%s: delivered %s for %s (attempt %d/%d)\n", label, sessName, target.ID, attempts+1, idleClaimNudgeMaxAttempts) //nolint:errcheck // best-effort
 		}
 	}
 }

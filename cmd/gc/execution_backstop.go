@@ -119,6 +119,7 @@ func nudgeStalledPoolExecution(
 	rec events.Recorder,
 	requestDrain func(sessionBead beads.Bead) error,
 	stdout io.Writer,
+	delivery ...func(sessionBead beads.Bead, message string) error,
 ) {
 	if sp == nil || cfg == nil || store == nil || snapshotPartial {
 		return // hot reconcile path: never panic on a half-built dependency
@@ -126,14 +127,18 @@ func nudgeStalledPoolExecution(
 	if sess, ok := store.(beads.SessionStore); ok && sess.Store == nil {
 		return
 	}
-	runNudgeBackstop(sp, store, sessionBeads, now, stdout, "execution-claim-nudge", poolExecutionBackstop{
+	pred := poolExecutionBackstop{
 		cfg:          cfg,
 		sp:           sp,
 		now:          now,
 		rec:          rec,
 		requestDrain: requestDrain,
 		claims:       newExecutionClaimSnapshot(work, workStores, workStoreRefs),
-	})
+	}
+	if len(delivery) > 0 {
+		pred.continueWith = delivery[0]
+	}
+	runNudgeBackstop(sp, store, sessionBeads, now, stdout, "execution-claim-nudge", pred)
 }
 
 // executionClaim is one in-progress claim from the assigned-work snapshot, kept
@@ -215,6 +220,17 @@ type poolExecutionBackstop struct {
 	rec          events.Recorder
 	requestDrain func(sessionBead beads.Bead) error
 	claims       executionClaimSnapshot
+	continueWith func(sessionBead beads.Bead, message string) error
+}
+
+// deliver routes execution recovery through the semantic session-submit path
+// when production supplies it. The fallback preserves the old direct runtime
+// behavior for isolated predicates and historical callers.
+func (p poolExecutionBackstop) deliver(sessionBead beads.Bead, sessionName, content string) error {
+	if p.continueWith != nil {
+		return p.continueWith(sessionBead, content)
+	}
+	return p.sp.Nudge(sessionName, runtime.TextContent(content))
 }
 
 // governs covers both pool slots and configured named interactive seats. The
@@ -324,7 +340,14 @@ func (p poolExecutionBackstop) state(s beads.Bead, target backstopTarget) (same 
 // nothing to send and parking on the observe marker forever would starve the
 // seat's close gate.
 func (p poolExecutionBackstop) content(s beads.Bead) string {
-	return stalledPoolClaimNudgeFor(p.cfg, s)
+	if strings.TrimSpace(s.Metadata["wait_hold"]) != "" {
+		return ""
+	}
+	claim := stalledPoolClaimNudgeFor(p.cfg, s)
+	if claim == "" {
+		return ""
+	}
+	return "Resume from durable bead state. " + claim
 }
 
 // decay implements activityDecayingBackstop. An in-progress claim is what a
@@ -404,7 +427,34 @@ func (p poolExecutionBackstop) revalidate(target backstopTarget) backstopResolut
 		strings.TrimSpace(current.Assignee) != target.Assignee {
 		return backstopResolutionClear
 	}
+	if executionContinuationSuppressed(current, live) {
+		return backstopResolutionHold
+	}
 	return backstopResolutionOutstanding
+}
+
+// executionContinuationSuppressed keeps the controller from resuming work the
+// durable ledger says is waiting on another condition. Read errors suppress:
+// absence of evidence is never permission to interrupt a seat.
+func executionContinuationSuppressed(work beads.Bead, store interface {
+	Get(string) (beads.Bead, error)
+},
+) bool {
+	for _, label := range work.Labels {
+		if strings.HasPrefix(strings.TrimSpace(label), "hold:") {
+			return true
+		}
+	}
+	for _, dep := range work.Dependencies {
+		if !beads.IsReadyBlockingDependencyType(dep.Type) {
+			continue
+		}
+		blocker, err := store.Get(dep.DependsOnID)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(blocker.Status), "closed") {
+			return true
+		}
+	}
+	return false
 }
 
 // observe starts a new assignment's window: a fresh grace clock AND a fresh

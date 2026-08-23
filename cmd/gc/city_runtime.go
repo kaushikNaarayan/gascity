@@ -33,6 +33,7 @@ import (
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -2850,6 +2851,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			cr.rec,
 			cr.requestExecutionStalledDrain,
 			cr.stdout,
+			cr.submitExecutionContinuation,
 		)
 		// The never-claimed lane (ga-evxqd). The three above key on a bead the
 		// seat was BOUND to, on one preassigned successor, or on an in_progress
@@ -2878,6 +2880,35 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		)
 	}
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_stalled_pool_claims", phaseStart, nil)
+}
+
+// submitExecutionContinuation sends recovery through the canonical worker
+// message boundary. Follow-up submission is persisted by the session queue and
+// delivered at a provider-safe boundary; this controller path never writes
+// terminal keys directly.
+func (cr *CityRuntime) submitExecutionContinuation(sessionBead beads.Bead, message string) error {
+	if cr == nil || cr.cfg == nil || cr.sp == nil {
+		return fmt.Errorf("execution continuation unavailable")
+	}
+	handle, err := workerHandleForSessionWithConfig(cr.cityPath, cr.sessionsBeadStore().Store, cr.sp, cr.cfg, sessionBead.ID)
+	if err != nil {
+		return fmt.Errorf("resolving execution continuation session: %w", err)
+	}
+	state, err := handle.State(context.Background())
+	if err != nil {
+		return fmt.Errorf("observing execution continuation session: %w", err)
+	}
+	if state.Phase != worker.PhaseReady {
+		return fmt.Errorf("execution continuation suppressed: session phase %s", state.Phase)
+	}
+	_, err = handle.Message(context.Background(), worker.MessageRequest{
+		Text:     message,
+		Delivery: worker.DeliveryIntentFollowUp,
+	})
+	if err != nil {
+		return fmt.Errorf("queueing execution continuation: %w", err)
+	}
+	return nil
 }
 
 // recordReconcileTraceInputs records the per-template baseline, the cycle input

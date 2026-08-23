@@ -61,6 +61,7 @@ func newStalledConvergenceHarness(t *testing.T) *stalledConvergenceHarness {
 	if err := env.store.SetMetadataBatch(info.ID, map[string]string{
 		"pool_managed": "true",
 		"state":        "active",
+		"provider":     "codex",
 	}); err != nil {
 		t.Fatalf("marking the session pool-managed: %v", err)
 	}
