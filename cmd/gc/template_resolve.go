@@ -314,7 +314,10 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		// scope from leaking out of the tmux server's inherited environment.
 		"GC_RIG":      "",
 		"GC_RIG_ROOT": "",
-		"BEADS_DIR":   "",
+		// Keep raw bd commands anchored to the city store even when the
+		// session's work directory is an application repository with stale
+		// .beads metadata. Rig-scoped agents replace this with their rig store.
+		"BEADS_DIR": filepath.Join(p.cityPath, ".beads"),
 		// GT_ROOT stays city-scoped by default. bd formula discovery falls back
 		// to $GT_ROOT/.beads/formulas when agents run outside the city/rig repo
 		// roots (for example under .gc/agents/... or .gc/worktrees/...).

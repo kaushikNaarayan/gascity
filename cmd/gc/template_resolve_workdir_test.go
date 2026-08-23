@@ -120,8 +120,8 @@ func TestResolveTemplateUsesWorkDirForCityScopedAgents(t *testing.T) {
 	if got, ok := tp.Env["GC_RIG_ROOT"]; !ok || got != "" {
 		t.Fatalf("GC_RIG_ROOT = %q present=%v, want explicit empty", got, ok)
 	}
-	if got, ok := tp.Env["BEADS_DIR"]; !ok || got != "" {
-		t.Fatalf("BEADS_DIR = %q present=%v, want explicit empty", got, ok)
+	if got, ok := tp.Env["BEADS_DIR"]; !ok || got != filepath.Join(cityPath, ".beads") {
+		t.Fatalf("BEADS_DIR = %q present=%v, want canonical city store %q", got, ok, filepath.Join(cityPath, ".beads"))
 	}
 	if tp.Env["GT_ROOT"] != cityPath {
 		t.Fatalf("GT_ROOT = %q, want %q", tp.Env["GT_ROOT"], cityPath)

@@ -682,6 +682,9 @@ func TestBuildThreadEnv_DropsStartupEnvelopeAndDoltliteServerEnv(t *testing.T) {
 		"GC_STARTUP_ENVELOPE":      `{"runtime":{"provider":"claudeAgent","model":"claude-sonnet-4-6"}}`,
 		"GC_BEADS_BACKEND":         "doltlite",
 		"GC_NATIVE_DOLTLITE_BEADS": "true",
+		"BEADS_BACKEND":            "doltlite",
+		"BEADS_DIR":                "/city/.beads",
+		"BEADS_DOLT_AUTO_START":    "0",
 		"GC_MODEL":                 "gpt-5.4-mini",
 		"GC_SESSION_NAME":          "gc--mayor",
 		"GC_DOLT_HOST":             "127.0.0.1",
@@ -698,6 +701,15 @@ func TestBuildThreadEnv_DropsStartupEnvelopeAndDoltliteServerEnv(t *testing.T) {
 	}
 	if env["GC_SESSION_NAME"] != "gc--mayor" {
 		t.Fatalf("GC_SESSION_NAME = %q, want gc--mayor", env["GC_SESSION_NAME"])
+	}
+	for key, want := range map[string]string{
+		"BEADS_BACKEND":         "doltlite",
+		"BEADS_DIR":             "/city/.beads",
+		"BEADS_DOLT_AUTO_START": "0",
+	} {
+		if got := env[key]; got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
 	}
 	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_SHARED_SERVER", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_SERVER_MODE"} {
 		if _, ok := env[key]; ok {

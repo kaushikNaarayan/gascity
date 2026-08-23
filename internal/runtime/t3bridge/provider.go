@@ -1637,6 +1637,27 @@ func buildThreadEnv(env map[string]string) map[string]string {
 			threadEnv[key] = value
 		}
 	}
+	// T3 runs commands inside its thread rather than inheriting the launcher
+	// environment. Preserve only the raw-bd store identity and safety switches
+	// that are independent of a Dolt endpoint. In particular, BEADS_DIR keeps
+	// a session in its canonical city/rig store instead of falling back to a
+	// stale .beads directory in the worktree. Endpoint settings remain derived
+	// below from GC_DOLT_* (or removed for DoltLite), so compatibility values
+	// cannot become an authority of their own.
+	for _, key := range []string{
+		"BEADS_BACKEND",
+		"BEADS_DIR",
+		"BEADS_DOLT_AUTO_START",
+		"BD_EXPORT_AUTO",
+		"BD_DOLT_SYNC_CLI_REMOTES",
+		"BEADS_DOLT_SYNC_CLI_REMOTES",
+		"BD_DOLT_AUTO_BACKUP",
+		"BEADS_DOLT_AUTO_BACKUP",
+	} {
+		if value := strings.TrimSpace(env[key]); value != "" {
+			threadEnv[key] = value
+		}
+	}
 	// Realign BEADS_HOLDER_TOKEN to the surviving GC_INSTANCE_TOKEN. The GC_
 	// allowlist above strips the BEADS_-prefixed holder token that RuntimeEnv
 	// wired in, which would leave the visible T3 thread carrying an instance
