@@ -86,6 +86,7 @@ Agent defines a configured agent in the city.
 | `work_dir` | string |  |  | WorkDir overrides the session working directory without changing the agent's qualified identity. Relative paths resolve against city root and may use the same template placeholders as session_setup. |
 | `tmux_alias` | string |  |  | TmuxAlias overrides the tmux session_name for pool and factory-created manual sessions of this agent. When unset, sessions fall back to the universal derivation ("s-&lt;beadID&gt;" for ad-hoc sessions, "&lt;basename&gt;-&lt;beadID&gt;" for pool sessions). When set, it is expanded as a Go text/template using the same PathContext fields as work_dir / session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName, DefaultBranch), sanitized for tmux, and validated as an explicit session name. For pool sessions, a live-name collision appends the bead ID as a deterministic suffix. For manual `gc session new` sessions, tmux_alias becomes the explicit session_name and takes precedence over --alias, which remains the command/mail alias; duplicate explicit names fail closed. Configured named sessions keep their named-session runtime name instead of using tmux_alias. When no --alias is supplied, work_dir templates that use &#123;&#123;.Agent&#125;&#125; see the resolved tmux_alias as the concrete session identity. |
 | `scope` | string |  |  | Scope defines where this agent is instantiated: "city" (one per city) or "rig" (one per rig). Omit the field for an unscoped agent instantiated in both city and rig expansion contexts. Only meaningful for pack-defined agents; inline agents in city.toml use Dir directly. Enum: `city`, `rig` |
+| `beads_scope` | string |  |  | BeadsScope selects which beads store this agent's session resolves: "city" pins GC_BEADS_SCOPE_ROOT/BEADS_DIR/GT_ROOT to the city ledger even when the agent is rig-instantiated (Scope="rig" or a rig-qualified name); "rig" (or "", the default) keeps the existing behavior of scoping to the owning rig whenever one is present. This is orthogonal to Scope, which controls WHERE the agent is instantiated, not which beads store it talks to. Use this for rig-instantiated agents (e.g. a witness) that must read/write the town-level ledger — mail, orders, cross-rig coordination — instead of the rig's own ledger. Enum: `city`, `rig` |
 | `suspended` | boolean |  |  | Suspended prevents the reconciler from spawning this agent. Toggle with gc agent suspend/resume. |
 | `pre_start` | []string |  |  | PreStart is a list of shell commands run before session creation. Commands run on the target filesystem: locally for tmux, inside the pod/container for exec providers. Template variables same as session_setup. On failure, the last 4 KiB of the command's stdout/stderr is included in the error and may appear in controller and reconciler logs; avoid set -x or echoing secrets in setup commands. |
 | `prompt_template` | string |  |  | PromptTemplate is the path to this agent's prompt template file. Relative paths resolve against the city directory. |
@@ -167,6 +168,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `work_dir` | string |  |  | WorkDir overrides the agent's working directory without changing its qualified identity or rig association. |
 | `tmux_alias` | string |  |  | TmuxAlias overrides the tmux session name template (see Agent.TmuxAlias for semantics). |
 | `scope` | string |  |  | Scope overrides the agent's scope ("city" or "rig"). |
+| `beads_scope` | string |  |  | BeadsScope overrides which beads store the agent resolves (see Agent.BeadsScope). |
 | `suspended` | boolean |  |  | Suspended sets the agent's suspended state. |
 | `pool` | PoolOverride |  |  | Pool overrides legacy [pool] fields that map to session scaling. |
 | `env` | map[string]string |  |  | Env adds or overrides environment variables. |
@@ -228,6 +230,7 @@ AgentPatch modifies existing agents identified by rig scope and Name.
 | `work_dir` | string |  |  | WorkDir overrides the agent's session working directory. |
 | `tmux_alias` | string |  |  | TmuxAlias overrides the tmux session name template (see Agent.TmuxAlias for semantics). |
 | `scope` | string |  |  | Scope overrides the agent's scope ("city" or "rig"). |
+| `beads_scope` | string |  |  | BeadsScope overrides which beads store the agent resolves (see Agent.BeadsScope). |
 | `suspended` | boolean |  |  | Suspended overrides the agent's suspended state. |
 | `pool` | PoolOverride |  |  | Pool overrides legacy [pool] fields that map to session scaling. |
 | `env` | map[string]string |  |  | Env adds or overrides environment variables. |

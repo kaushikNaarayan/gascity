@@ -187,6 +187,12 @@
               "null"
             ]
           },
+          "BeadsScope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ContextAdvisory": {
             "$ref": "#/components/schemas/ContextAdvisory"
           },
@@ -524,6 +530,7 @@
           "WorkDir",
           "TmuxAlias",
           "Scope",
+          "BeadsScope",
           "Suspended",
           "Pool",
           "Env",

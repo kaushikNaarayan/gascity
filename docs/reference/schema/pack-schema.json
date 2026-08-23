@@ -33,6 +33,14 @@
           ],
           "description": "Scope defines where this agent is instantiated: \"city\" (one per city) or\n\"rig\" (one per rig). Omit the field for an unscoped agent instantiated in\nboth city and rig expansion contexts. Only meaningful for pack-defined\nagents; inline agents in city.toml use Dir directly."
         },
+        "beads_scope": {
+          "type": "string",
+          "enum": [
+            "city",
+            "rig"
+          ],
+          "description": "BeadsScope selects which beads store this agent's session resolves:\n\"city\" pins GC_BEADS_SCOPE_ROOT/BEADS_DIR/GT_ROOT to the city ledger\neven when the agent is rig-instantiated (Scope=\"rig\" or a rig-qualified\nname); \"rig\" (or \"\", the default) keeps the existing behavior of\nscoping to the owning rig whenever one is present. This is orthogonal\nto Scope, which controls WHERE the agent is instantiated, not which\nbeads store it talks to. Use this for rig-instantiated agents (e.g. a\nwitness) that must read/write the town-level ledger — mail, orders,\ncross-rig coordination — instead of the rig's own ledger."
+        },
         "suspended": {
           "type": "boolean",
           "description": "Suspended prevents the reconciler from spawning this agent. Toggle with gc agent suspend/resume."
@@ -401,6 +409,10 @@
         "scope": {
           "type": "string",
           "description": "Scope overrides the agent's scope (\"city\" or \"rig\")."
+        },
+        "beads_scope": {
+          "type": "string",
+          "description": "BeadsScope overrides which beads store the agent resolves\n(see Agent.BeadsScope)."
         },
         "suspended": {
           "type": "boolean",

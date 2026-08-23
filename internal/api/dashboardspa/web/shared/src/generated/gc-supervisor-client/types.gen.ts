@@ -63,6 +63,7 @@ export type AgentPatch = {
     AssignedWorkDeferLimit: number | null;
     Attach: boolean | null;
     AutoReclaimStaleClaims: boolean | null;
+    BeadsScope: string | null;
     ContextAdvisory: ContextAdvisory;
     DefaultSlingFormula: string | null;
     DependsOn: Array<string> | null;

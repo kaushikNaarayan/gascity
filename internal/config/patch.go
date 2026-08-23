@@ -37,6 +37,9 @@ type AgentPatch struct {
 	TmuxAlias *string `toml:"tmux_alias,omitempty"`
 	// Scope overrides the agent's scope ("city" or "rig").
 	Scope *string `toml:"scope,omitempty"`
+	// BeadsScope overrides which beads store the agent resolves
+	// (see Agent.BeadsScope).
+	BeadsScope *string `toml:"beads_scope,omitempty"`
 	// Suspended overrides the agent's suspended state.
 	Suspended *bool `toml:"suspended,omitempty"`
 	// Pool overrides legacy [pool] fields that map to session scaling.
@@ -529,6 +532,9 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	}
 	if p.Scope != nil {
 		a.Scope = *p.Scope
+	}
+	if p.BeadsScope != nil {
+		a.BeadsScope = *p.BeadsScope
 	}
 	if p.Suspended != nil {
 		a.Suspended = *p.Suspended

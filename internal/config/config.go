@@ -676,6 +676,9 @@ type AgentOverride struct {
 	TmuxAlias *string `toml:"tmux_alias,omitempty"`
 	// Scope overrides the agent's scope ("city" or "rig").
 	Scope *string `toml:"scope,omitempty"`
+	// BeadsScope overrides which beads store the agent resolves
+	// (see Agent.BeadsScope).
+	BeadsScope *string `toml:"beads_scope,omitempty"`
 	// Suspended sets the agent's suspended state.
 	Suspended *bool `toml:"suspended,omitempty"`
 	// Pool overrides legacy [pool] fields that map to session scaling.
@@ -3223,6 +3226,16 @@ type Agent struct {
 	// both city and rig expansion contexts. Only meaningful for pack-defined
 	// agents; inline agents in city.toml use Dir directly.
 	Scope string `toml:"scope,omitempty" jsonschema:"enum=city,enum=rig"`
+	// BeadsScope selects which beads store this agent's session resolves:
+	// "city" pins GC_BEADS_SCOPE_ROOT/BEADS_DIR/GT_ROOT to the city ledger
+	// even when the agent is rig-instantiated (Scope="rig" or a rig-qualified
+	// name); "rig" (or "", the default) keeps the existing behavior of
+	// scoping to the owning rig whenever one is present. This is orthogonal
+	// to Scope, which controls WHERE the agent is instantiated, not which
+	// beads store it talks to. Use this for rig-instantiated agents (e.g. a
+	// witness) that must read/write the town-level ledger — mail, orders,
+	// cross-rig coordination — instead of the rig's own ledger.
+	BeadsScope string `toml:"beads_scope,omitempty" jsonschema:"enum=city,enum=rig"`
 	// Suspended prevents the reconciler from spawning this agent. Toggle with gc agent suspend/resume.
 	Suspended bool `toml:"suspended,omitempty"`
 	// PreStart is a list of shell commands run before session creation.
@@ -4106,6 +4119,12 @@ func ValidateAgents(agents []Agent) error {
 			// valid
 		default:
 			return fmt.Errorf("agent %q: scope must be \"city\", \"rig\", or empty, got %q", a.QualifiedName(), a.Scope)
+		}
+		switch a.BeadsScope {
+		case "", "city", "rig":
+			// valid
+		default:
+			return fmt.Errorf("agent %q: beads_scope must be \"city\", \"rig\", or empty, got %q", a.QualifiedName(), a.BeadsScope)
 		}
 		// PromptMode enum.
 		switch a.PromptMode {

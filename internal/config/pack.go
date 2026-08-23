@@ -2798,6 +2798,7 @@ func (ov *AgentOverride) toAgentPatch() *AgentPatch {
 		WorkDir:                 ov.WorkDir,
 		TmuxAlias:               ov.TmuxAlias,
 		Scope:                   ov.Scope,
+		BeadsScope:              ov.BeadsScope,
 		Suspended:               ov.Suspended,
 		Pool:                    ov.Pool,
 		Env:                     ov.Env,

@@ -350,8 +350,15 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	if rigName != "" {
 		agentEnv["GC_RIG"] = rigName
 		agentEnv["GC_RIG_ROOT"] = rigRoot
-		agentEnv["BEADS_DIR"] = filepath.Join(rigRoot, ".beads")
-		agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
+		// BeadsScope="city" opts a rig-instantiated agent (e.g. a witness)
+		// out of the rig ledger: it still runs and identifies as belonging
+		// to the rig (GC_RIG/GC_RIG_ROOT above), but its bd/mail/GT_ROOT
+		// resolution stays pinned to the town ledger set in Step 8, since
+		// its job is town-level coordination, not rig-local work.
+		if cfgAgent.BeadsScope != "city" {
+			agentEnv["BEADS_DIR"] = filepath.Join(rigRoot, ".beads")
+			agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
+		}
 	}
 
 	// configDir is the directory agent config-relative paths (pre-start
