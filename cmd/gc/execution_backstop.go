@@ -57,6 +57,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // Session-bead metadata keys for the execution backstop. Persisted for the same
@@ -246,7 +247,8 @@ func (p poolExecutionBackstop) governs(s beads.Bead) bool {
 	if isManualSessionBead(s) {
 		return false
 	}
-	return strings.TrimSpace(s.Metadata["pool_managed"]) == "true" || isNamedSessionBead(s)
+	return (strings.TrimSpace(s.Metadata["pool_managed"]) == "true" || isNamedSessionBead(s)) &&
+		sessionpkg.ProviderFamilyFromMetadata(s.Metadata, "") == "codex"
 }
 
 // resolve reports an outstanding stall only when all of it holds: the session
