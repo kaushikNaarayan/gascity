@@ -738,6 +738,68 @@ func (m *Manager) killExistingOrphans(ctx context.Context, sessionID string) err
 	return nil
 }
 
+// checkNoCWDCollision refuses to start or resume a session whose working
+// directory is already occupied by another live session. Liveness is
+// established by either of two independent signals: the runtime provider's
+// own IsRunning check (catches sessions this Manager started), or a
+// host-wide live-process cwd scan (catches sessions started by another
+// Manager instance or process entirely). Either signal alone is sufficient
+// to refuse. When the scan itself could not be completed, the guard fails
+// closed — refusing rather than risking two live sessions sharing a
+// directory (ga-ighomh.1).
+func (m *Manager) checkNoCWDCollision(ctx context.Context, id string, b beads.Bead, workDir string) error {
+	_ = ctx
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	live := m.livenessScanner()
+	if !live.Scanned {
+		m.recordCWDRefusal(id, events.SessionStartRefusedReasonLivenessUnavailable, "")
+		return fmt.Errorf("%w: %s", ErrWorkDirLivenessUnavailable, workDir)
+	}
+	normalizedWorkDir := pathutil.NormalizePathForCompare(strings.TrimSpace(workDir))
+	scannerConfirmsLive := false
+	for _, cwd := range live.CWDs {
+		if cwd == normalizedWorkDir {
+			scannerConfirmsLive = true
+			break
+		}
+	}
+	candidates, err := m.sameWorkDirSessionBeads(b, "", workDir)
+	if err != nil {
+		return fmt.Errorf("checking working directory collisions: %w", err)
+	}
+	for _, other := range candidates {
+		if other.ID == id {
+			continue
+		}
+		if scannerConfirmsLive || m.sp.IsRunning(sessionName(other.ID, other)) {
+			m.recordCWDRefusal(id, events.SessionStartRefusedReasonCollision, other.ID)
+			return fmt.Errorf("%w: %s is occupied by session %s", ErrWorkDirCollision, workDir, other.ID)
+		}
+	}
+	return nil
+}
+
+// recordCWDRefusal emits a session.start_refused_cwd event for a working
+// directory collision guard refusal. Best-effort: a marshal failure is
+// silently dropped rather than blocking the real refusal error it accompanies.
+func (m *Manager) recordCWDRefusal(id, reason, collidingSessionID string) {
+	payload, err := json.Marshal(events.SessionStartRefusedCwdPayload{
+		Reason:             reason,
+		CollidingSessionID: collidingSessionID,
+	})
+	if err != nil {
+		return
+	}
+	m.eventRecorder.Record(events.Event{
+		Type:    events.SessionStartRefusedCwd,
+		Actor:   "session",
+		Subject: id,
+		Payload: payload,
+	})
+}
+
 func (m *Manager) now() time.Time {
 	if m != nil && m.clk != nil {
 		return m.clk.Now()
@@ -1032,14 +1094,21 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 		cfg.Env = git.ApplySSHKeepaliveEnv(cfg.Env)
 		cfg = runtime.SyncWorkDirEnv(cfg)
 
-		// Start the runtime session. Refuse to start if a prior escaped process
-		// for this session could not be confirmed dead: a survivor would race
-		// the replacement for the same work bead (duplicate bd close).
-		if orphanErr := m.killExistingOrphans(ctx, b.ID); orphanErr != nil {
+		// Refuse to start if the working directory is already occupied by
+		// another live session, or if a prior escaped process for this
+		// session could not be confirmed dead: either risks two runtimes
+		// touching the same worktree (duplicate bd close).
+		refuseStart := func(stage string, err error) error {
 			if rbErr := rollbackFailedCreate(); rbErr != nil {
-				return errors.Join(fmt.Errorf("pre-start orphan cleanup: %w", orphanErr), rbErr)
+				return errors.Join(fmt.Errorf("pre-start %s: %w", stage, err), rbErr)
 			}
-			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
+			return fmt.Errorf("pre-start %s: %w", stage, err)
+		}
+		if cwdErr := m.checkNoCWDCollision(ctx, b.ID, b, cfg.WorkDir); cwdErr != nil {
+			return refuseStart("cwd collision check", cwdErr)
+		}
+		if orphanErr := m.killExistingOrphans(ctx, b.ID); orphanErr != nil {
+			return refuseStart("orphan cleanup", orphanErr)
 		}
 		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
