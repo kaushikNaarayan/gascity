@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -68,6 +69,12 @@ var collectLiveWorktreeStateFn = collectLiveWorktreeState
 // The check is at runtime rather than behind a build tag deliberately: /proc can
 // also be absent on Linux (a container without it mounted), and the same
 // fallback covers that case.
+//
+// This predates internal/pidutil (ga-ighomh.1), which now backs
+// internal/session's working-directory collision guard with the same /proc
+// walk but without this fallback. The two intentionally diverge for now
+// rather than silently dropping lsof-fallback coverage here — see
+// pidutil.LiveCWDs's doc comment.
 //
 // Per-process readlink failures are skipped, not fatal: a process may exit
 // mid-walk, and a process owned by another user may have a cwd this process
@@ -150,23 +157,14 @@ func worktreeIsLive(worktreePath string, live liveWorktreeState, sessionDirs []s
 }
 
 // pathAtOrUnder reports whether candidate equals root or is lexically contained
-// beneath it. Both arguments must already be normalized (symlink-resolved,
-// absolute, cleaned) — collectLiveWorktreeState normalizes cwds once at
-// gather-time and worktreeIsLive normalizes the worktree once, so this avoids
-// re-resolving symlinks on every pair in what can be a large process × worktree
+// beneath it, via the shared pidutil.PathAtOrUnder primitive. Both arguments
+// must already be normalized (symlink-resolved, absolute, cleaned) —
+// collectLiveWorktreeState normalizes cwds once at gather-time and
+// worktreeIsLive normalizes the worktree once, so this avoids re-resolving
+// symlinks on every pair in what can be a large process × worktree
 // cross-product each tick.
 func pathAtOrUnder(root, candidate string) bool {
-	if root == "" || candidate == "" {
-		return false
-	}
-	if root == candidate {
-		return true
-	}
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return pidutil.PathAtOrUnder(root, candidate)
 }
 
 // liveSessionWorktreeDirs collects the recorded working directories of every
