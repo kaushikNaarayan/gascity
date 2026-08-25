@@ -154,6 +154,13 @@ func TestInstallClaude(t *testing.T) {
 	if strings.Contains(s, "gc hook --inject") {
 		t.Error("fresh claude settings should not install no-op gc hook --inject")
 	}
+	preToolUse := claudeHookEntries(t, runtimeData, "PreToolUse")
+	if len(preToolUse) == 0 || preToolUse[0].Matcher != "Bash" {
+		t.Fatalf("claude PreToolUse hook = %#v, want Bash matcher", preToolUse)
+	}
+	if len(preToolUse[0].Hooks) == 0 || !strings.Contains(preToolUse[0].Hooks[0].Command, "gc hook guard-git") {
+		t.Fatalf("claude PreToolUse hook = %#v, want managed git guard command", preToolUse)
+	}
 	if !strings.Contains(s, `"skipDangerousModePermissionPrompt": true`) {
 		t.Error("claude settings should contain skipDangerousModePermissionPrompt")
 	}

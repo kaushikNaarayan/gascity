@@ -2028,6 +2028,7 @@ gc hook [agent] [flags]
 | Subcommand | Description |
 |------------|-------------|
 | [gc hook current](#gc-hook-current) | Print the work bead this session most recently claimed |
+| [gc hook guard-git](#gc-hook-guard-git) | PreToolUse guard: block destructive Git and shared-session commands |
 | [gc hook run](#gc-hook-run) | Run a managed hook command with a hard timeout |
 
 ## gc hook current
@@ -2058,6 +2059,16 @@ gc hook current [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--id-only` | bool |  | print only the bead id, with no surrounding context |
+
+## gc hook guard-git
+
+Reads a Claude Code PreToolUse payload on stdin and blocks destructive Git
+commands plus bare tmux-server and forced bead-deletion commands. Ordinary Git
+pushes and dry-run commands remain available.
+
+```
+gc hook guard-git
+```
 
 ## gc hook run
 
