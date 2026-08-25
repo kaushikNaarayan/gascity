@@ -109,6 +109,13 @@ Reference** (the contributor map lives in `engdocs/contributors/docs-organizatio
 - Concept material is unified on `how-gas-city-works`; don't reintroduce a separate
   "concepts" section.
 
+For a new or substantially rewritten capability page, use these sections in
+this order: **What it does**, **When to reach for it**, **Common questions**,
+and **It is working if**. Source each common question from a real repository
+question — a GitHub issue or `bd` mail/escalation — and cite that source in the
+page; do not invent FAQs. Omit a section only when the page's purpose makes it
+inapplicable, and record why in review.
+
 ## 5. Prose doctrine — cut words, sharpen points
 
 Most bloat is information stored in the wrong medium. Move it to a cheaper carrier,

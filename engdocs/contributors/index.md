@@ -8,6 +8,8 @@ description: The shortest path for new contributors to get productive in Gas Cit
 - [Codebase Map](codebase-map.md)
 - [Docs Organization](docs-organization.md) when adding or moving pages in
   the published `docs/` tree
+- [Authoring Agent Instructions](agent-instruction-authoring.md) before
+  merging a new or edited `SKILL.md` or `AGENTS.md`
 - [Architecture Overview](../architecture/index.md)
 - [Primitive Test](primitive-test.md)
 - [PR Review Handoff Notes](pr-review-handoff.md)
