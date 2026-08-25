@@ -53,3 +53,6 @@ description: The shortest path for new contributors to get productive in Gas Cit
   superseded.
 - Move exploratory notes, audits, and roadmaps into the archive instead of
   presenting them as current onboarding material.
+# Contributor guides
+
+- [Skill authoring](skill-authoring.md) — optional scope check and conventions for new skills.
