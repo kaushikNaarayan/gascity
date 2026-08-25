@@ -14,9 +14,10 @@ import (
 type formulaFile struct {
 	Formula string `toml:"formula"`
 	Steps   []struct {
-		ID          string `toml:"id"`
-		Title       string `toml:"title"`
-		Description string `toml:"description"`
+		ID          string            `toml:"id"`
+		Title       string            `toml:"title"`
+		Description string            `toml:"description"`
+		Metadata    map[string]string `toml:"metadata"`
 	} `toml:"steps"`
 }
 
@@ -121,6 +122,46 @@ func TestMolDoWorkDrainClaimsCurrentContinuation(t *testing.T) {
 	}
 	if updateAt < 0 || !strings.Contains(step[updateAt:drainAckAt], "|| exit 1") {
 		t.Fatal("drain must not acknowledge runtime drain after a failed bead close")
+	}
+}
+
+// TestScoutFormulaStepsCarryTaskShape ensures the read-only formula contracts
+// activate the task-shape write guard for every agent-executed step. Prompt
+// prose alone is advisory; materialized step metadata is what lets the claim
+// hook mark the live session as a scout and prevent file-write tools.
+func TestScoutFormulaStepsCarryTaskShape(t *testing.T) {
+	tests := []struct {
+		file  string
+		steps []string
+	}{
+		{
+			file:  "mol-polecat-report.toml",
+			steps: []string{"workspace-setup", "preflight-tests", "implement", "self-review", "write-report"},
+		},
+		{
+			file:  "mol-review-quorum.toml",
+			steps: []string{"review-lane-one", "review-lane-two", "synthesize-review-quorum"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			formula := readFormula(t, tt.file)
+			for _, id := range tt.steps {
+				t.Run(id, func(t *testing.T) {
+					for _, step := range formula.Steps {
+						if step.ID != id {
+							continue
+						}
+						if got := step.Metadata["gc.task_shape"]; got != "scout" {
+							t.Errorf("%s step %q gc.task_shape = %q, want scout", formula.Formula, id, got)
+						}
+						return
+					}
+					t.Fatalf("formula %s has no step %q", formula.Formula, id)
+				})
+			}
+		})
 	}
 }
 

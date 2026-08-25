@@ -1304,6 +1304,9 @@ func TestCompileReviewQuorumCoreFormula(t *testing.T) {
 		if attempt == nil {
 			t.Fatalf("%s attempt.1 missing", stepID)
 		}
+		if got := attempt.Metadata["gc.task_shape"]; got != "scout" {
+			t.Fatalf("%s attempt gc.task_shape = %q, want scout so the claim hook activates the read-only write guard", stepID, got)
+		}
 		if got := attempt.Metadata["gc.output_json"]; got != "" {
 			t.Fatalf("%s attempt gc.output_json = %q, want empty until worker writes JSON", stepID, got)
 		}
@@ -1333,6 +1336,9 @@ func TestCompileReviewQuorumCoreFormula(t *testing.T) {
 	}
 	if got := synthesis.Metadata["gc.run_target"]; got != "{{synthesis_target}}" {
 		t.Fatalf("synthesis gc.run_target = %q, want {{synthesis_target}}", got)
+	}
+	if got := synthesis.Metadata["gc.task_shape"]; got != "scout" {
+		t.Fatalf("synthesis gc.task_shape = %q, want scout so the claim hook activates the read-only write guard", got)
 	}
 	for _, dep := range []string{"mol-review-quorum.review-lane-one", "mol-review-quorum.review-lane-two"} {
 		if !hasRecipeDep(recipe.Deps, synthesis.ID, dep, "blocks") {
