@@ -1300,12 +1300,16 @@ func (m *Manager) TranscriptPathClassified(id string, searchPaths []string) (str
 // target b, restricted to the same provider family when the target's provider is
 // known. For a live target, closed historical sessions are excluded; for a
 // closed target they are kept so historical same-workdir ambiguity is preserved.
+// A beads.PartialResultError from the list is tolerated and scanned with
+// whatever rows came back: this feeds checkNoCWDCollision, whose real safety
+// gate is the independent process-liveness scan, so one corrupt bead elsewhere
+// in the store must not block every session start fleet-wide.
 func (m *Manager) sameWorkDirSessionBeads(b beads.Bead, provider, workDir string) ([]beads.Bead, error) {
 	all, err := m.store.List(beads.ListQuery{
 		Label:         LabelSession,
 		IncludeClosed: b.Status == "closed",
 	})
-	if err != nil {
+	if err != nil && !beads.IsPartialResult(err) {
 		return nil, fmt.Errorf("listing sessions: %w", err)
 	}
 	var same []beads.Bead

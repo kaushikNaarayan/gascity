@@ -12677,7 +12677,11 @@ func TestReconcileSessionBeads_FreshAlwaysNamedWithPoolDemandMaterializesNamedDe
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents: []config.Agent{
-			{Name: "mayor", StartCommand: "true", ScaleCheck: "printf 1", MaxActiveSessions: intPtr(3)},
+			// WorkDir varies per instance via {{.Agent}} (the qualified name),
+			// same as a real max_active_sessions>1 deployment must configure
+			// today so the pool instance and the canonical named session of
+			// the same template don't collide under checkNoCWDCollision.
+			{Name: "mayor", StartCommand: "true", ScaleCheck: "printf 1", MaxActiveSessions: intPtr(3), WorkDir: "{{.CityRoot}}/work/{{.Agent}}"},
 		},
 		NamedSessions: []config.NamedSession{
 			{Template: "mayor", Mode: "always"},
@@ -12716,7 +12720,11 @@ func TestReconcileSessionBeads_ExistingAlwaysNamedStillAllowsSameTemplatePoolDem
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents: []config.Agent{
-			{Name: "mayor", StartCommand: "true", ScaleCheck: "printf 1", MaxActiveSessions: intPtr(3)},
+			// WorkDir varies per instance via {{.Agent}} (the qualified name),
+			// same as a real max_active_sessions>1 deployment must configure
+			// today so the pool instance and the canonical named session of
+			// the same template don't collide under checkNoCWDCollision.
+			{Name: "mayor", StartCommand: "true", ScaleCheck: "printf 1", MaxActiveSessions: intPtr(3), WorkDir: "{{.CityRoot}}/work/{{.Agent}}"},
 		},
 		NamedSessions: []config.NamedSession{
 			{Template: "mayor", Mode: "always"},
