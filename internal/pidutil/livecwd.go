@@ -23,6 +23,14 @@ type LiveState struct {
 	// CWDs is the set of canonicalized (symlink-resolved, absolute) working
 	// directories of live processes. Deduplicated.
 	CWDs []string
+	// PIDCWDs maps each live process's PID to its canonicalized working
+	// directory, gathered by the same /proc walk as CWDs. Unlike CWDs (which
+	// only answers "is some process live at this path"), PIDCWDs lets a
+	// caller attribute a live cwd to a *specific* PID — e.g. cross-referenced
+	// against a known session's own PID — rather than blaming an arbitrary
+	// known session for a coincidental cwd match elsewhere on the host
+	// (ga-9x4z1g.1 FR3).
+	PIDCWDs map[int]string
 	// Scanned reports whether the process table was enumerated at all. False
 	// means liveness is indeterminate — the host has no /proc, or the
 	// top-level walk failed — and the caller must fail closed.
@@ -45,11 +53,13 @@ func LiveCWDs() LiveState {
 	}
 	seen := make(map[string]struct{})
 	var cwds []string
+	pidCWDs := make(map[int]string)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
 			continue // not a PID directory
 		}
 		link, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
@@ -66,13 +76,14 @@ func LiveCWDs() LiveState {
 		if canon == "" {
 			continue
 		}
+		pidCWDs[pid] = canon
 		if _, ok := seen[canon]; ok {
 			continue
 		}
 		seen[canon] = struct{}{}
 		cwds = append(cwds, canon)
 	}
-	return LiveState{CWDs: cwds, Scanned: true}
+	return LiveState{CWDs: cwds, PIDCWDs: pidCWDs, Scanned: true}
 }
 
 // PathAtOrUnder reports whether candidate equals root or is lexically

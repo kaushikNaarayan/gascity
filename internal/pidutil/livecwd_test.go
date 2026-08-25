@@ -7,6 +7,46 @@ import (
 	"testing"
 )
 
+// TestLiveCWDs_PIDCWDsIncludesOwnPID proves LiveCWDs attributes its own cwd
+// to its own PID, not just to the deduplicated CWDs set. This is the
+// primitive the cwd-collision guard's PID-attributed refusal (ga-9x4z1g.1
+// FR3) needs to tell "some live process has this cwd" (CWDs, directory-scoped)
+// apart from "this specific known session's PID has this cwd" (PIDCWDs,
+// attributable).
+func TestLiveCWDs_PIDCWDsIncludesOwnPID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("LiveCWDs relies on /proc; GOOS=%s has none", runtime.GOOS)
+	}
+	live := LiveCWDs()
+	if !live.Scanned {
+		t.Fatal("LiveCWDs().Scanned = false on linux, want true")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	want := filepath.Clean(cwd)
+	pid := os.Getpid()
+	got, ok := live.PIDCWDs[pid]
+	if !ok {
+		t.Fatalf("LiveCWDs().PIDCWDs[%d] missing; want this test process's own cwd %q among %d entries", pid, want, len(live.PIDCWDs))
+	}
+	if filepath.Clean(got) != want {
+		t.Fatalf("LiveCWDs().PIDCWDs[%d] = %q, want %q", pid, got, want)
+	}
+}
+
+// TestLiveCWDs_UnscannedZeroValuePIDCWDsIsFailClosed mirrors
+// TestLiveCWDs_UnscannedZeroValueIsFailClosed for the PID-attributed field:
+// a caller-injected fail-closed stub must report an empty PIDCWDs, never a
+// populated one implying attribution succeeded.
+func TestLiveCWDs_UnscannedZeroValuePIDCWDsIsFailClosed(t *testing.T) {
+	var zero LiveState
+	if len(zero.PIDCWDs) != 0 {
+		t.Fatalf("zero-value LiveState.PIDCWDs = %v, want empty", zero.PIDCWDs)
+	}
+}
+
 // TestLiveCWDs_IncludesOwnCWD proves LiveCWDs (the primitive
 // internal/session's cwd-collision guard shares with
 // cmd/gc/bead_worktree_liveness.go's collectLiveWorktreeState, per ga-ighomh.1

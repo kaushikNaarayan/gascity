@@ -740,13 +740,20 @@ func (m *Manager) killExistingOrphans(ctx context.Context, sessionID string) err
 
 // checkNoCWDCollision refuses to start or resume a session whose working
 // directory is already occupied by another live session. Liveness is
-// established by either of two independent signals: the runtime provider's
-// own IsRunning check (catches sessions this Manager started), or a
-// host-wide live-process cwd scan (catches sessions started by another
-// Manager instance or process entirely). Either signal alone is sufficient
-// to refuse. When the scan itself could not be completed, the guard fails
-// closed — refusing rather than risking two live sessions sharing a
-// directory (ga-ighomh.1).
+// established by any of three independent signals: the runtime provider's
+// own IsRunning check (catches sessions this Manager started), a PID cross-
+// reference between the host-wide live-process scan and each candidate's own
+// known runtime PID (catches sessions started by another Manager instance or
+// process entirely, attributed to the correct candidate — ga-9x4z1g.1 FR3),
+// or — only once every candidate has been checked and none could be
+// positively attributed — the scan confirming some live process occupies the
+// directory at all. That last, unattributed signal still refuses (fail
+// closed: never assume two live sessions can safely share a directory) but
+// is recorded without naming a specific candidate, since the scan alone
+// cannot say which bead (if any) it actually belongs to. When the scan
+// itself could not be completed, the guard fails closed before even
+// reaching candidates — refusing rather than risking two live sessions
+// sharing a directory (ga-ighomh.1).
 func (m *Manager) checkNoCWDCollision(ctx context.Context, id string, b beads.Bead, workDir string) error {
 	_ = ctx
 	if strings.TrimSpace(workDir) == "" {
@@ -769,16 +776,51 @@ func (m *Manager) checkNoCWDCollision(ctx context.Context, id string, b beads.Be
 	if err != nil {
 		return fmt.Errorf("checking working directory collisions: %w", err)
 	}
+	hasOtherCandidate := false
 	for _, other := range candidates {
 		if other.ID == id {
 			continue
 		}
-		if scannerConfirmsLive || m.sp.IsRunning(sessionName(other.ID, other)) {
+		hasOtherCandidate = true
+		if m.sp.IsRunning(sessionName(other.ID, other)) || m.candidateConfirmedLiveByPID(other, live, normalizedWorkDir) {
 			m.recordCWDRefusal(id, events.SessionStartRefusedReasonCollision, other.ID)
 			return fmt.Errorf("%w: %s is occupied by session %s", ErrWorkDirCollision, workDir, other.ID)
 		}
 	}
+	if hasOtherCandidate && scannerConfirmsLive {
+		m.recordCWDRefusal(id, events.SessionStartRefusedReasonCollision, "")
+		return fmt.Errorf("%w: %s is occupied by an unattributed live process", ErrWorkDirCollision, workDir)
+	}
 	return nil
+}
+
+// candidateConfirmedLiveByPID reports whether other's own known runtime PID
+// (from the runtime provider's process-table scan, when it supports one) is
+// among the live PIDs the scan found at normalizedWorkDir. This is the
+// positive-attribution signal that lets checkNoCWDCollision name a specific
+// candidate instead of guessing among several sharing the same historical
+// work_dir (ga-9x4z1g.1 FR3). A scan error is logged and treated as
+// fail-closed for attribution purposes: this candidate simply cannot be
+// confirmed by PID, so the caller falls back to its other signals rather
+// than blocking on the error here.
+func (m *Manager) candidateConfirmedLiveByPID(other beads.Bead, live pidutil.LiveState, normalizedWorkDir string) bool {
+	scanner, ok := m.sp.(runtime.ProcessTableScanner)
+	if !ok {
+		return false
+	}
+	runtimes, err := scanner.FindRuntimesBySessionID(other.ID)
+	if err != nil {
+		log.Printf("session: finding runtimes for candidate %s (failing closed on attribution): %v", other.ID, err)
+	}
+	for _, rt := range runtimes {
+		if rt.PID == 0 {
+			continue
+		}
+		if cwd, ok := live.PIDCWDs[rt.PID]; ok && cwd == normalizedWorkDir {
+			return true
+		}
+	}
+	return false
 }
 
 // recordCWDRefusal emits a session.start_refused_cwd event for a working

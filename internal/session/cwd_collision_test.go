@@ -11,6 +11,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
@@ -31,6 +32,15 @@ func (r *recordingRecorder) Record(e events.Event) {
 func fixedLiveness(scanned bool, cwds ...string) LivenessScanner {
 	return func() pidutil.LiveState {
 		return pidutil.LiveState{CWDs: cwds, Scanned: scanned}
+	}
+}
+
+// fixedLivenessWithPIDs extends fixedLiveness with PID-attributed cwd data,
+// for tests proving the PID cross-reference in candidateConfirmedLiveByPID
+// (ga-9x4z1g.1 FR3) rather than just the directory-wide CWDs signal.
+func fixedLivenessWithPIDs(scanned bool, pidCWDs map[int]string, cwds ...string) LivenessScanner {
+	return func() pidutil.LiveState {
+		return pidutil.LiveState{CWDs: cwds, PIDCWDs: pidCWDs, Scanned: scanned}
 	}
 }
 
@@ -159,6 +169,143 @@ func TestCreateSessionRefusesWhenScannerReportsKnownSessionDirLive(t *testing.T)
 	}
 	if !errors.Is(err, ErrWorkDirCollision) {
 		t.Fatalf("error = %v, want wrapping ErrWorkDirCollision", err)
+	}
+}
+
+// TestCandidateConfirmedLiveByPID exercises the PID-attribution helper in
+// isolation from the store/scanner integration, pinning edge cases a
+// CreateSession-level test would only hit nondeterministically (multiple
+// candidates iterate in the store's unordered map order): a PID the scan
+// found at the target directory, a zero PID (Fake's shape for its own
+// tracked, never-orphaned sessions), and a PID that is live but at a
+// different directory (ga-9x4z1g.1 FR3).
+func TestCandidateConfirmedLiveByPID(t *testing.T) {
+	dir := t.TempDir()
+	normalizedDir := pathutil.NormalizePathForCompare(dir)
+	elsewhere := pathutil.NormalizePathForCompare(t.TempDir())
+
+	tests := []struct {
+		name string
+		rt   runtime.LiveRuntime
+		want bool
+	}{
+		{name: "pid live at the target work dir attributes", rt: runtime.LiveRuntime{SessionID: "candidate", PID: 4242}, want: true},
+		{name: "zero pid never attributes", rt: runtime.LiveRuntime{SessionID: "candidate", PID: 0}, want: false},
+		{name: "pid live at an unrelated dir does not attribute", rt: runtime.LiveRuntime{SessionID: "candidate", PID: 4343}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			live := pidutil.LiveState{Scanned: true, PIDCWDs: map[int]string{4242: normalizedDir, 4343: elsewhere}}
+			if tt.rt.PID != 0 {
+				sp.OrphanedRuntimes = map[string]runtime.LiveRuntime{"candidate": tt.rt}
+			}
+			mgr := NewManagerWithOptions(store, sp)
+			other := beads.Bead{ID: "candidate"}
+			if got := mgr.candidateConfirmedLiveByPID(other, live, normalizedDir); got != tt.want {
+				t.Fatalf("candidateConfirmedLiveByPID(%+v) = %v, want %v", tt.rt, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCandidateConfirmedLiveByPID_NoRuntimeFound proves a candidate with no
+// runtime reported at all (never started, or started by a since-terminated
+// process) is never attributed — Fake's FindRuntimesBySessionID returns an
+// empty slice, not an error, for an unknown session ID.
+func TestCandidateConfirmedLiveByPID_NoRuntimeFound(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	dir := t.TempDir()
+	normalizedDir := pathutil.NormalizePathForCompare(dir)
+	live := pidutil.LiveState{Scanned: true, PIDCWDs: map[int]string{4242: normalizedDir}}
+	mgr := NewManagerWithOptions(store, sp)
+	other := beads.Bead{ID: "never-started"}
+	if mgr.candidateConfirmedLiveByPID(other, live, normalizedDir) {
+		t.Fatal("candidateConfirmedLiveByPID with no matching runtime = true, want false")
+	}
+}
+
+// TestCreateSessionRefusesWithoutFalseAttributionWhenUnattributable proves
+// the FR3 "honesty" property: when the scanner confirms some live process
+// occupies a directory but the sole candidate session bead cannot be
+// positively attributed to it (not IsRunning, no matching live PID), the
+// guard still refuses fail-closed but must not name that candidate as the
+// occupant — the prior implementation blamed whichever bead was the only (or
+// first-iterated) candidate on the scanner signal alone, without evidence it
+// was actually the live one (ga-9x4z1g.1 FR3).
+func TestCreateSessionRefusesWithoutFalseAttributionWhenUnattributable(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	rec := &recordingRecorder{}
+	dir := t.TempDir()
+	mgr := NewManagerWithOptions(store, sp, WithLivenessScanner(fixedLiveness(true, dir)), WithEventRecorder(rec))
+
+	known, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "known", Command: "claude", WorkDir: dir, Provider: "claude"})
+	if err != nil {
+		t.Fatalf("create bead-only known session: %v", err)
+	}
+
+	_, err = mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "challenger", Command: "claude", WorkDir: dir, Provider: "claude"})
+	if err == nil {
+		t.Fatal("CreateSession at a dir the scanner reports live succeeded, want refusal")
+	}
+	if !errors.Is(err, ErrWorkDirCollision) {
+		t.Fatalf("error = %v, want wrapping ErrWorkDirCollision", err)
+	}
+
+	payload := refusedCwdPayload(t, rec)
+	if payload.CollidingSessionID != "" {
+		t.Fatalf("payload.CollidingSessionID = %q, want empty: %s has no evidence (not IsRunning, no matching live PID) of being the live occupant", payload.CollidingSessionID, known.ID)
+	}
+}
+
+// TestCreateSessionRefusesAttributingCorrectCandidateAmongMultiple proves
+// the FR3 precision property with two known candidate beads sharing a
+// directory: only the one whose PID the scan actually found at that
+// directory may be named as the collision. The prior implementation blamed
+// the first candidate iterated from the store regardless of which one (if
+// either) the scan actually confirmed, so a wrong bead could be blamed while
+// the true live occupant went unmentioned (ga-9x4z1g.1 FR3).
+func TestCreateSessionRefusesAttributingCorrectCandidateAmongMultiple(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	rec := &recordingRecorder{}
+	dir := t.TempDir()
+	normalizedDir := pathutil.NormalizePathForCompare(dir)
+	const rightPID = 4242
+	mgr := NewManagerWithOptions(store, sp, WithLivenessScanner(fixedLivenessWithPIDs(true, map[int]string{rightPID: normalizedDir}, dir)), WithEventRecorder(rec))
+
+	wrong, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "wrong", Command: "claude", WorkDir: dir, Provider: "claude"})
+	if err != nil {
+		t.Fatalf("create bead-only wrong candidate: %v", err)
+	}
+	right, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "right", Command: "claude", WorkDir: dir, Provider: "claude"})
+	if err != nil {
+		t.Fatalf("create bead-only right candidate: %v", err)
+	}
+	sp.OrphanedRuntimes = map[string]runtime.LiveRuntime{
+		right.ID: {SessionID: right.ID, PID: rightPID},
+	}
+
+	_, err = mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "challenger", Command: "claude", WorkDir: dir, Provider: "claude"})
+	if err == nil {
+		t.Fatal("CreateSession at a dir with a PID-confirmed live candidate succeeded, want refusal")
+	}
+	if !errors.Is(err, ErrWorkDirCollision) {
+		t.Fatalf("error = %v, want wrapping ErrWorkDirCollision", err)
+	}
+	if !strings.Contains(err.Error(), right.ID) {
+		t.Fatalf("collision error %q does not name the PID-attributed candidate %q", err.Error(), right.ID)
+	}
+	if strings.Contains(err.Error(), wrong.ID) {
+		t.Fatalf("collision error %q names the unattributed candidate %q instead of the PID-confirmed one %q", err.Error(), wrong.ID, right.ID)
+	}
+
+	payload := refusedCwdPayload(t, rec)
+	if payload.CollidingSessionID != right.ID {
+		t.Fatalf("payload.CollidingSessionID = %q, want %q (the PID-confirmed candidate, not an arbitrary one)", payload.CollidingSessionID, right.ID)
 	}
 }
 
