@@ -70,11 +70,11 @@ func doltliteTableSetsForMode(mode TierMode) []doltliteTableSet {
 	}
 }
 
-func (s *DoltliteReadStore) doltliteReadyIssueWhere(tables doltliteTableSet) (string, []any) {
-	return doltliteReadyIssueWhere(tables, s.tableExists(doltliteWispTables.issues))
+func (s *DoltliteReadStore) doltliteReadyIssueWhere(tables doltliteTableSet) (string, []any, error) {
+	return s.doltliteReadyIssueWhereForTargets(tables, s.tableExists(doltliteWispTables.issues))
 }
 
-func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (string, []any) {
+func (s *DoltliteReadStore) doltliteReadyIssueWhereForTargets(tables doltliteTableSet, includeWispTargets bool) (string, []any, error) {
 	typePredicate, args := doltliteIssueTypeNotInPredicate("i")
 	blockingTypes := make([]string, 0, len(readyBlockingDependencyTypes))
 	for typ := range readyBlockingDependencyTypes {
@@ -86,8 +86,14 @@ func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (
 		args = append(args, typ)
 	}
 
-	issueTarget := "COALESCE(NULLIF(d.depends_on_issue_id, ''), NULLIF(d.depends_on_id, ''), NULLIF(d.depends_on_external, ''), '')"
-	wispTarget := "NULLIF(d.depends_on_wisp_id, '')"
+	issueTarget, err := s.doltliteDependencyTargetExpr(tables.deps, "d", "depends_on_issue_id", "depends_on_id", "depends_on_external")
+	if err != nil {
+		return "", nil, err
+	}
+	wispTarget, err := s.doltliteDependencyTargetExpr(tables.deps, "d", "depends_on_wisp_id")
+	if err != nil {
+		return "", nil, err
+	}
 	depType := "COALESCE(NULLIF(d.type, ''), 'blocks')"
 	blockerJoins := "LEFT JOIN " + tables.issues + " blocker_issue ON blocker_issue.id = " + issueTarget
 	blockerStatus := "COALESCE(blocker_issue.status, '')"
@@ -103,7 +109,7 @@ func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (
 				` + blockerJoins + `
 				WHERE d.issue_id = i.id AND ` + depType + ` IN (` + blockingPlaceholders + `) AND ` + blockerStatus + ` != 'closed'
 			)`,
-	}, " AND "), args
+	}, " AND "), args, nil
 }
 
 func doltliteIssueTypeNotInPredicate(alias string) (string, []any) {
@@ -356,7 +362,10 @@ func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	if rq.Limit > 0 {
 		q.Limit = rq.Limit
 	}
-	readyWhere, readyArgs := s.doltliteReadyIssueWhere(doltliteIssueTables)
+	readyWhere, readyArgs, err := s.doltliteReadyIssueWhere(doltliteIssueTables)
+	if err != nil {
+		return nil, err
+	}
 	// The id tiebreaker keeps a LIMIT deterministic when rows share
 	// (priority, created_at) — same bug class as queryIssueTable (#3208).
 	//
@@ -746,9 +755,9 @@ func cloneBeads(values []Bead) []Bead {
 
 func (s *DoltliteReadStore) DepList(id, direction string) ([]Dep, error) {
 	if direction == "up" {
-		return s.queryDeps(doltliteDependsOnExpr()+" = ?", id)
+		return s.queryDepsByTarget(id)
 	}
-	return s.queryDeps("issue_id = ?", id)
+	return s.queryDepsByIssue(id)
 }
 
 func (s *DoltliteReadStore) DepListBatch(ids []string) (map[string][]Dep, error) {
@@ -770,7 +779,11 @@ func (s *DoltliteReadStore) DepListBatch(ids []string) (map[string][]Dep, error)
 			if table == "wisp_dependencies" && !s.tableExists(table) {
 				continue
 			}
-			rows, err := s.db.Query(`SELECT issue_id, `+doltliteDependsOnExpr()+`, type FROM `+table+` WHERE issue_id IN (`+placeholders+`)`, args...)
+			targetExpr, err := s.doltliteDependencyTargetExpr(table, "", doltliteDependencyTargetColumns...)
+			if err != nil {
+				return result, err
+			}
+			rows, err := s.db.Query(`SELECT issue_id, `+targetExpr+`, type FROM `+table+` WHERE issue_id IN (`+placeholders+`)`, args...)
 			if err != nil {
 				return result, err
 			}
@@ -808,13 +821,31 @@ func (s *DoltliteReadStore) enrichReadyProjectionForCache(items []Bead) ([]Bead,
 	return items, nil
 }
 
-func (s *DoltliteReadStore) queryDeps(where, value string) ([]Dep, error) {
+func (s *DoltliteReadStore) queryDepsByTarget(id string) ([]Dep, error) {
+	return s.queryDepsWithTarget("", nil, id)
+}
+
+func (s *DoltliteReadStore) queryDepsByIssue(id string) ([]Dep, error) {
+	return s.queryDepsWithTarget("issue_id = ?", []any{id}, "")
+}
+
+func (s *DoltliteReadStore) queryDepsWithTarget(where string, args []any, targetID string) ([]Dep, error) {
 	var deps []Dep
 	for _, table := range []string{"dependencies", "wisp_dependencies"} {
 		if table == "wisp_dependencies" && !s.tableExists(table) {
 			continue
 		}
-		rows, err := s.db.Query(`SELECT issue_id, `+doltliteDependsOnExpr()+`, type FROM `+table+` WHERE `+where, value)
+		targetExpr, err := s.doltliteDependencyTargetExpr(table, "", doltliteDependencyTargetColumns...)
+		if err != nil {
+			return nil, err
+		}
+		query := `SELECT issue_id, ` + targetExpr + `, type FROM ` + table + ` WHERE ` + where
+		queryArgs := args
+		if targetID != "" {
+			query = `SELECT issue_id, ` + targetExpr + `, type FROM ` + table + ` WHERE ` + targetExpr + ` = ?`
+			queryArgs = []any{targetID}
+		}
+		rows, err := s.db.Query(query, queryArgs...)
 		if err != nil {
 			return nil, err
 		}
@@ -837,16 +868,36 @@ func (s *DoltliteReadStore) queryDeps(where, value string) ([]Dep, error) {
 	return deps, nil
 }
 
-func doltliteDependsOnExpr() string {
-	return "COALESCE(NULLIF(depends_on_id, ''), NULLIF(depends_on_issue_id, ''), NULLIF(depends_on_wisp_id, ''), NULLIF(depends_on_external, ''), '')"
+var doltliteDependencyTargetColumns = []string{
+	"depends_on_id",
+	"depends_on_issue_id",
+	"depends_on_wisp_id",
+	"depends_on_external",
 }
 
-func doltliteQualifiedDependsOnExpr(alias string) string {
+// doltliteDependencyTargetExpr returns a target expression compatible with
+// both dependency layouts upstream Beads has shipped. Migration 0043 removes
+// depends_on_id after the split target columns have been populated, whereas
+// older DoltLite snapshots retain it.
+func (s *DoltliteReadStore) doltliteDependencyTargetExpr(table, alias string, columns ...string) (string, error) {
 	prefix := ""
 	if strings.TrimSpace(alias) != "" {
 		prefix = alias + "."
 	}
-	return "COALESCE(NULLIF(" + prefix + "depends_on_id, ''), NULLIF(" + prefix + "depends_on_issue_id, ''), NULLIF(" + prefix + "depends_on_wisp_id, ''), NULLIF(" + prefix + "depends_on_external, ''), '')"
+	parts := make([]string, 0, len(columns))
+	for _, column := range columns {
+		hasColumn, err := s.tableHasColumn(table, column)
+		if err != nil {
+			return "", err
+		}
+		if hasColumn {
+			parts = append(parts, "NULLIF("+prefix+column+", '')")
+		}
+	}
+	if len(parts) == 0 {
+		return "''", nil
+	}
+	return "COALESCE(" + strings.Join(parts, ", ") + ", '')", nil
 }
 
 func scanDep(rows interface{ Scan(...any) error }) (Dep, error) {
@@ -1299,8 +1350,12 @@ func (s *DoltliteReadStore) buildDoltliteTableQuery(query ListQuery, tables dolt
 			args = append(args, assignee)
 		}
 	}
+	parentColumn, err := s.doltliteDependencyTargetExpr(tables.deps, "pc", doltliteDependencyTargetColumns...)
+	if err != nil {
+		return doltliteTableQuery{}, err
+	}
 	if query.ParentID != "" {
-		where = append(where, doltliteQualifiedDependsOnExpr("pc")+" = ?")
+		where = append(where, parentColumn+" = ?")
 		args = append(args, query.ParentID)
 	}
 	if query.Label != "" {
@@ -1346,7 +1401,10 @@ func (s *DoltliteReadStore) queryIssueTable(query ListQuery, tables doltliteTabl
 	if tq.skipTable {
 		return nil, nil
 	}
-	parentColumn := doltliteQualifiedDependsOnExpr("pc")
+	parentColumn, err := s.doltliteDependencyTargetExpr(tables.deps, "pc", doltliteDependencyTargetColumns...)
+	if err != nil {
+		return nil, err
+	}
 	sqlText := `SELECT i.id, COALESCE(i.title, ''), COALESCE(i.status, ''), COALESCE(i.issue_type, ''), i.priority, i.created_at,
 		COALESCE(i.updated_at, ''), COALESCE(i.assignee, ''), COALESCE(i.description, ''), COALESCE(i.metadata, '{}'),
 		` + parentColumn + `, ` + tq.flags.ephemeral + `, ` + tq.flags.noHistory + `

@@ -30,7 +30,10 @@ func (s *DoltliteReadStore) ReadyGraphOnly(query ...ReadyQuery) ([]Bead, error) 
 	if rq.Limit > 0 {
 		q.Limit = rq.Limit
 	}
-	depWhere, depArgs := doltliteWispDepGate()
+	depWhere, depArgs, err := s.doltliteWispDepGate()
+	if err != nil {
+		return nil, err
+	}
 	return s.queryIssuesOrderedInTables(q, []doltliteTableSet{doltliteWispTables}, depWhere, depArgs, q.Limit, "ORDER BY COALESCE(i.priority, 2) ASC, i.created_at ASC, i.id ASC")
 }
 
@@ -44,7 +47,7 @@ func (s *DoltliteReadStore) ReadyGraphOnly(query ...ReadyQuery) ([]Bead, error) 
 // Both arms must resolve — mirroring doltliteReadyIssueWhere's two-arm CASE —
 // or a durable-issue-shaped dependency never matches its blocker join and the
 // wisp is excluded permanently, even after the blocker closes (ga-rh2mgk).
-func doltliteWispDepGate() (string, []any) {
+func (s *DoltliteReadStore) doltliteWispDepGate() (string, []any, error) {
 	blockingTypes := make([]string, 0, len(readyBlockingDependencyTypes))
 	for typ := range readyBlockingDependencyTypes {
 		blockingTypes = append(blockingTypes, typ)
@@ -55,8 +58,14 @@ func doltliteWispDepGate() (string, []any) {
 	for _, typ := range blockingTypes {
 		args = append(args, typ)
 	}
-	issueTarget := "COALESCE(NULLIF(d.depends_on_issue_id, ''), NULLIF(d.depends_on_id, ''), NULLIF(d.depends_on_external, ''), '')"
-	wispTarget := "NULLIF(d.depends_on_wisp_id, '')"
+	issueTarget, err := s.doltliteDependencyTargetExpr(doltliteWispTables.deps, "d", "depends_on_issue_id", "depends_on_id", "depends_on_external")
+	if err != nil {
+		return "", nil, err
+	}
+	wispTarget, err := s.doltliteDependencyTargetExpr(doltliteWispTables.deps, "d", "depends_on_wisp_id")
+	if err != nil {
+		return "", nil, err
+	}
 	depType := "COALESCE(NULLIF(d.type, ''), 'blocks')"
 	blockerJoins := "LEFT JOIN " + doltliteIssueTables.issues + " blocker_issue ON blocker_issue.id = " + issueTarget +
 		"\n\t\tLEFT JOIN " + doltliteWispTables.issues + " blocker_wisp ON blocker_wisp.id = " + wispTarget
@@ -65,5 +74,5 @@ func doltliteWispDepGate() (string, []any) {
 		SELECT 1 FROM ` + doltliteWispTables.deps + ` d
 		` + blockerJoins + `
 		WHERE d.issue_id = i.id AND ` + depType + ` IN (` + blockingPlaceholders + `) AND ` + blockerStatus + ` != 'closed'
-	)`, args
+	)`, args, nil
 }

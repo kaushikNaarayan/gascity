@@ -117,6 +117,65 @@ func TestDoltliteReadStoreReadyUsesDoltlite(t *testing.T) {
 	}
 }
 
+// TestDoltliteReadStoreSupportsPostMigrationDependencySchema reproduces the
+// upstream Beads v59 dependency migration, which removes the legacy
+// depends_on_id column after copying targets to the typed columns. The
+// DoltLite reader must keep hook-ready, parent, and dependency reads working
+// against that schema.
+func TestDoltliteReadStoreSupportsPostMigrationDependencySchema(t *testing.T) {
+	store, closeStore := newPostMigrationTestDoltliteReadStore(t)
+	defer closeStore()
+	writer := openTestDoltliteWriter(t, store.db)
+	defer writer.Close() //nolint:errcheck // test cleanup
+
+	insertTestDoltliteIssue(t, writer, "wisps", "wisp_labels", "wisp_dependencies", testDoltliteIssue{
+		ID:        "gc-post-migration-wisp",
+		Title:     "blocked graph wisp",
+		Status:    "open",
+		IssueType: "molecule",
+		CreatedAt: time.Now().UTC().Add(time.Minute),
+		Dependencies: []testDoltliteDependency{{
+			DependsOnWispID: "gc-tier-wisp",
+			Type:            "blocks",
+		}},
+	})
+	child, err := store.Get("gc-child")
+	if err != nil {
+		t.Fatalf("Get child after dependency migration: %v", err)
+	}
+	if child.ParentID != "gc-parent" {
+		t.Fatalf("child ParentID = %q, want gc-parent", child.ParentID)
+	}
+	deps, err := store.DepList("gc-child", "down")
+	if err != nil {
+		t.Fatalf("DepList after dependency migration: %v", err)
+	}
+	if len(deps) != 1 || deps[0].DependsOnID != "gc-parent" {
+		t.Fatalf("child dependencies = %#v, want gc-parent", deps)
+	}
+	batched, err := store.DepListBatch([]string{"gc-child"})
+	if err != nil {
+		t.Fatalf("DepListBatch after dependency migration: %v", err)
+	}
+	if len(batched["gc-child"]) != 1 || batched["gc-child"][0].DependsOnID != "gc-parent" {
+		t.Fatalf("batched child dependencies = %#v, want gc-parent", batched)
+	}
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready after dependency migration: %v", err)
+	}
+	if hasTestBead(ready, "gc-blocked") {
+		t.Fatalf("Ready included blocked bead after dependency migration: %#v", ready)
+	}
+	graphReady, err := store.ReadyGraphOnly()
+	if err != nil {
+		t.Fatalf("ReadyGraphOnly after dependency migration: %v", err)
+	}
+	if hasTestBead(graphReady, "gc-post-migration-wisp") {
+		t.Fatalf("ReadyGraphOnly included blocked wisp after dependency migration: %#v", graphReady)
+	}
+}
+
 func TestDoltliteReadStoreReadyBlocksWorkflowDependencyTypes(t *testing.T) {
 	store, closeStore := newTestDoltliteReadStore(t)
 	defer closeStore()
@@ -1453,6 +1512,14 @@ func TestDoltliteCachingStoreLiveFastReadDoesNotEraseDependencyCache(t *testing.
 }
 
 func newTestDoltliteReadStore(t *testing.T) (*DoltliteReadStore, func()) {
+	return newTestDoltliteReadStoreWithDependencySchema(t, false)
+}
+
+func newPostMigrationTestDoltliteReadStore(t *testing.T) (*DoltliteReadStore, func()) {
+	return newTestDoltliteReadStoreWithDependencySchema(t, true)
+}
+
+func newTestDoltliteReadStoreWithDependencySchema(t *testing.T, withoutLegacyDependencyID bool) (*DoltliteReadStore, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
@@ -1475,6 +1542,13 @@ func newTestDoltliteReadStore(t *testing.T) (*DoltliteReadStore, func()) {
 	}
 	defer db.Close() //nolint:errcheck // test cleanup
 	createTestDoltliteSchema(t, db)
+	if withoutLegacyDependencyID {
+		for _, table := range []string{"dependencies", "wisp_dependencies"} {
+			if _, err := db.Exec("ALTER TABLE " + table + " DROP COLUMN depends_on_id"); err != nil {
+				t.Fatalf("drop legacy %s.depends_on_id: %v", table, err)
+			}
+		}
+	}
 
 	now := time.Now().UTC()
 	created := []testDoltliteIssue{
@@ -1813,12 +1887,32 @@ func insertTestDoltliteIssue(t testing.TB, db *sql.DB, issueTable, labelTable, d
 		if dependsOnIssueID == "" && dep.DependsOnWispID == "" && dep.DependsOnExternal == "" {
 			dependsOnIssueID = dep.DependsOnID
 		}
-		if _, err := db.Exec(`INSERT INTO `+depTable+` (
-			issue_id, depends_on_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type
-		) VALUES (?, ?, ?, ?, ?, ?)`, issue.ID, dep.DependsOnID, dependsOnIssueID, dep.DependsOnWispID, dep.DependsOnExternal, dep.Type); err != nil {
+		columns := "issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type"
+		placeholders := "?, ?, ?, ?, ?"
+		args := []any{issue.ID, dependsOnIssueID, dep.DependsOnWispID, dep.DependsOnExternal, dep.Type}
+		if testDoltliteTableHasColumn(t, db, depTable, "depends_on_id") {
+			columns = "issue_id, depends_on_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type"
+			placeholders = "?, ?, ?, ?, ?, ?"
+			args = []any{issue.ID, dep.DependsOnID, dependsOnIssueID, dep.DependsOnWispID, dep.DependsOnExternal, dep.Type}
+		}
+		if _, err := db.Exec(`INSERT INTO `+depTable+` (`+columns+`) VALUES (`+placeholders+`)`, args...); err != nil {
 			t.Fatalf("insert dep %s -> %s: %v", issue.ID, dep.DependsOnID, err)
 		}
 	}
+}
+
+func testDoltliteTableHasColumn(t testing.TB, db *sql.DB, table, column string) bool {
+	t.Helper()
+	var found string
+	err := db.QueryRow(`SELECT name FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&found)
+	if err == nil {
+		return true
+	}
+	if err == sql.ErrNoRows {
+		return false
+	}
+	t.Fatalf("probe %s.%s: %v", table, column, err)
+	return false
 }
 
 func boolToTestInt(v bool) int {
