@@ -439,9 +439,17 @@ unconditionally with a `trap`, and redirect `TMPDIR` to the same dir so the
 linker's own scratch also stays off tmpfs:
 
 ```bash
-tmp=$(mktemp -d -p /var/tmp) && trap 'rm -rf "$tmp"' EXIT
-GOCACHE="$tmp" TMPDIR="$tmp" go build ./cmd/gc/
+scripts/task-cache-run \
+  --owner "$GC_AGENT" --bead "$BEAD_ID" --session "$GC_SESSION_NAME" -- \
+  go build ./cmd/gc/
 ```
+
+`task-cache-run` creates a disk-backed, task-owned cache root with owner,
+bead, session, PID, and PID-start metadata, then removes it on normal exit or
+signal. It defaults to `/var/tmp`; set `GC_TASK_CACHE_PARENT` only to another
+disk-backed directory. `scripts/task-cache-reap --root <parent>` is report-only
+by default and requires explicit `--delete`; it only reaps metadata-owned
+roots after proving the recorded process identity is dead.
 
 **Exception:** `go clean -testcache` is explicitly allowed. It clears only the
 test-result cache, not the compiled-object cache, and does not corrupt

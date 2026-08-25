@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 --owner <owner> --bead <bead> --session <session> -- command [args...]" >&2
+  exit 2
+}
+
+owner="" bead="" session=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owner) owner="${2:-}"; shift 2 ;;
+    --bead) bead="${2:-}"; shift 2 ;;
+    --session) session="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    *) usage ;;
+  esac
+done
+[[ -n "$owner" && -n "$bead" && -n "$session" && $# -gt 0 ]] || usage
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/task-cache.sh
+source "$repo_root/scripts/lib/task-cache.sh"
+gc_task_cache_init "$owner" "$bead" "$session"
+trap gc_task_cache_cleanup EXIT
+trap 'gc_task_cache_cleanup; exit 129' HUP
+trap 'gc_task_cache_cleanup; exit 130' INT
+trap 'gc_task_cache_cleanup; exit 143' TERM
+"$@"
