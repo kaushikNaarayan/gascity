@@ -3,12 +3,34 @@ package main
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/internal/builtinpacks"
 	"github.com/gastownhall/gascity/internal/packman"
 )
+
+// TestEnsureBuiltinRuntimeAssetsDoesNotStampWithoutAUsableRuntimeRoot proves
+// that readiness which cannot establish its cache root does not manufacture a
+// durable success record. Callers may continue best-effort, but the next
+// process must not trust a stamp from this incomplete pass.
+func TestEnsureBuiltinRuntimeAssetsDoesNotStampWithoutAUsableRuntimeRoot(t *testing.T) {
+	clearGCEnv(t)
+	city := t.TempDir()
+	blockedHome := filepath.Join(t.TempDir(), "gc-home-file")
+	if err := os.WriteFile(blockedHome, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocked GC_HOME: %v", err)
+	}
+	t.Setenv("GC_HOME", blockedHome)
+
+	if err := EnsureBuiltinRuntimeAssets(city, io.Discard); err == nil {
+		t.Fatal("EnsureBuiltinRuntimeAssets succeeded with an unusable runtime root")
+	}
+	if _, err := os.Stat(builtinRuntimeStampPath(city)); !os.IsNotExist(err) {
+		t.Fatalf("incomplete readiness stamp stat error = %v, want not exist", err)
+	}
+}
 
 // resetBuiltinRuntimeReadyStateForTest drops the in-process readiness cache
 // entry for cityPath, simulating the fresh-process condition every real gc

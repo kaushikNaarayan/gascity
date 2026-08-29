@@ -66,6 +66,11 @@ func EnsureBuiltinRuntimeAssets(cityPath string, warningWriter io.Writer) error 
 		return nil
 	}
 	if state.ready && requiredBuiltinSourcesUsable(cityPath) && lockedBundledImportsUsable(cityPath) {
+		// A successful readiness pass may have preceded a provisioning change
+		// that updates packs.lock. Refresh the durable fingerprint even though
+		// the caches remain ready, so the next process evaluates the same
+		// city configuration this process just accepted.
+		writeBuiltinRuntimeStamp(cityPath, warningWriter)
 		return nil
 	}
 	// The in-process cache above never fires for the CLI hot path: gc forks a

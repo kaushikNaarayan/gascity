@@ -2370,6 +2370,12 @@ func (cs *controllerState) provisionRigWrite(r config.Rig, depOnStep func(rig.Pr
 	if err != nil {
 		return config.Rig{}, err
 	}
+	// Provision can update packs.lock after the controller's initial city
+	// readiness pass. Refresh its durable fingerprint only once the new rig is
+	// committed, matching the CLI path and preserving strict artifact parity.
+	if readinessErr := EnsureBuiltinRuntimeAssets(cs.cityPath, log.Writer()); readinessErr != nil {
+		log.Printf("api: rig create: materializing builtin runtime assets: %v", readinessErr)
+	}
 	if res.PostProvisionErr != nil {
 		log.Printf("api: rig create: post-provision: %v", res.PostProvisionErr)
 	}

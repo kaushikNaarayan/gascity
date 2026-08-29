@@ -118,6 +118,9 @@ func assertRigAddArtifactsIdentical(t *testing.T, cityToml string, wantPacksLock
 	manifestA := cityArtifactManifest(t, cityA)
 	manifestB := cityArtifactManifest(t, cityB)
 	assertManifestsEqual(t, manifestA, manifestB)
+	if !manifestContains(manifestA, filepath.Join(".gc", "runtime", "builtin-runtime-ready.toml")) {
+		t.Fatalf("CLI provisioning omitted the successful builtin-runtime readiness stamp; manifest: %v", manifestA)
+	}
 
 	if wantPacksLock && !manifestContains(manifestA, "packs.lock") {
 		t.Fatalf("packs.lock absent from provisioned tree; ComposePacks leg did not run\nmanifest: %v", manifestA)

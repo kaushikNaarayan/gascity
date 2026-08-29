@@ -383,6 +383,15 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 		fmt.Fprintf(stderr, "gc rig add: %v\n", err) //nolint:errcheck // best-effort stderr
 		return config.Rig{}, 1
 	}
+	// Keep the CLI provisioning artifact set aligned with controller-backed rig
+	// creation. The readiness routine writes its durable stamp only after a full
+	// successful pass; a failed or degraded pass deliberately leaves no new
+	// stamp behind. Provision has already committed at this point, so preserve
+	// the CLI's best-effort runtime-asset policy and report a warning instead of
+	// turning a completed rig add into a false failure.
+	if err := EnsureBuiltinRuntimeAssets(cityPath, stderr); err != nil {
+		fmt.Fprintf(stderr, "gc rig add: materializing builtin runtime assets: %v\n", err) //nolint:errcheck // best-effort stderr
+	}
 	return r, 0
 }
 
