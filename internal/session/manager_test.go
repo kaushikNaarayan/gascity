@@ -4633,7 +4633,11 @@ func TestTranscriptPathClassifiedDistinguishesAbsentFromAmbiguous(t *testing.T) 
 		mgr := NewManagerWithOptions(store, runtime.NewFake())
 		infos := make([]Info, 0, len(titles))
 		for _, title := range titles {
-			info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: title, Command: "claude", WorkDir: workDir, Provider: "claude", Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+			// This test models transcript lookup over historical session records;
+			// it does not need live runtimes. Bead-only records keep the deliberate
+			// same-workdir ambiguity representable without violating the live-CWD
+			// ownership invariant enforced at runtime start.
+			info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: title, Command: "claude", WorkDir: workDir, Provider: "claude", Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 			if err != nil {
 				t.Fatalf("Create %s: %v", title, err)
 			}
