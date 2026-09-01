@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -35,10 +37,9 @@ type poolSessionRef struct {
 // Implementations MUST be safe to invoke concurrently from multiple
 // goroutines. Both evaluatePendingPools and computeWorkSet dispatch
 // runner calls in parallel, bounded by bdProbeConcurrency. The
-// production implementation shellScaleCheck satisfies this trivially
-// because it only reads its arguments and spawns an independent
-// subprocess; test doubles should avoid shared mutable state or
-// protect it explicitly.
+// production implementation shellScaleCheck single-flights identical
+// targets while allowing different targets to run concurrently; test
+// doubles should avoid shared mutable state or protect it explicitly.
 type ScaleCheckRunner func(command, dir string, env map[string]string) (string, error)
 
 // Default bd probe concurrency is config.DefaultProbeConcurrency (8).
@@ -62,15 +63,27 @@ const bdProbeTimeoutFloor = 5 * time.Second
 // synchronously in the reconciler loop and should not stall a tick.
 const hookTimeout = 30 * time.Second
 
-// shellCommand runs a command via sh -c with the given timeout and
-// returns stdout. dir sets the command's working directory. When env is
-// non-nil, it is merged into the subprocess environment after sanitizing
-// inherited GC_DOLT_* and BEADS_* keys.
+const probeTargetEnv = "GC_INTERNAL_PROBE_TARGET"
+
+var (
+	errProbeAlreadyInFlight = errors.New("probe already in flight")
+	probeFlights            = struct {
+		sync.Mutex
+		active map[string]struct{}
+	}{active: make(map[string]struct{})}
+)
+
+// shellCommand runs a command via sh -c with the given timeout and returns
+// stdout. On Unix the command owns a process group so cancellation reaps the
+// whole nested shell/bd tree, not only the immediate sh process. dir sets the
+// command's working directory. When env is non-nil, it is merged into the
+// subprocess environment after sanitizing inherited GC_DOLT_* and BEADS_* keys.
 func shellCommand(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -106,7 +119,42 @@ func parseBDProbeTimeout(stderr io.Writer) time.Duration {
 // dir sets the command's working directory. Uses bdProbeTimeoutDefault (180s)
 // unless GC_BD_PROBE_TIMEOUT overrides it.
 func shellScaleCheck(command, dir string, env map[string]string) (string, error) {
-	return shellCommand(command, dir, parseBDProbeTimeout(os.Stderr), env)
+	return shellScaleCheckWithTimeout(command, dir, parseBDProbeTimeout(os.Stderr), env)
+}
+
+func shellScaleCheckWithTimeout(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
+	key := probeFlightKey(command, dir, env)
+	probeFlights.Lock()
+	if _, ok := probeFlights.active[key]; ok {
+		probeFlights.Unlock()
+		return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, probeFlightTarget(command, env))
+	}
+	probeFlights.active[key] = struct{}{}
+	probeFlights.Unlock()
+	defer func() {
+		probeFlights.Lock()
+		delete(probeFlights.active, key)
+		probeFlights.Unlock()
+	}()
+
+	commandEnv := cloneStringMap(env)
+	delete(commandEnv, probeTargetEnv)
+	return shellCommand(command, dir, timeout, commandEnv)
+}
+
+func probeFlightKey(command, dir string, env map[string]string) string {
+	scope := strings.TrimSpace(env["GC_STORE_ROOT"])
+	if scope == "" {
+		scope = dir
+	}
+	return scope + "\x00" + probeFlightTarget(command, env)
+}
+
+func probeFlightTarget(command string, env map[string]string) string {
+	if target := strings.TrimSpace(env[probeTargetEnv]); target != "" {
+		return target
+	}
+	return command
 }
 
 // shellRunHook runs a lifecycle hook command (on_death, on_boot) via

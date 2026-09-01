@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -865,6 +866,30 @@ func TestComputeWorkSet_RunsWorkQuery(t *testing.T) {
 	}
 	if work["idle"] {
 		t.Error("expected idle to have no work")
+	}
+}
+
+func TestComputeWorkSetTagsProbeTargetAndReportsSingleFlightSkip(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "myrig", WorkQuery: "printf work"},
+		},
+	}
+	var stderr bytes.Buffer
+	runner := func(_ string, _ string, env map[string]string) (string, error) {
+		if got := env[probeTargetEnv]; got != "myrig/worker" {
+			t.Fatalf("probe target env = %q, want qualified target myrig/worker", got)
+		}
+		return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, env[probeTargetEnv])
+	}
+
+	work := computeWorkSet(cfg, runner, "test-city", t.TempDir(), nil, nil, &stderr)
+	if work["myrig/worker"] {
+		t.Fatal("single-flight skip must not report ready work")
+	}
+	if got := stderr.String(); !strings.Contains(got, "work query probe myrig/worker skipped: probe already in flight") {
+		t.Fatalf("single-flight skip diagnostic = %q", got)
 	}
 }
 

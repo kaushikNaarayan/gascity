@@ -209,6 +209,11 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
 }
 
+func bdQueryEphemeralAssignedStatusQuietShell(status, shellVar string, limit int) string {
+	query := "ephemeral=true AND status=" + status + " AND assignee="
+	return `bd query --json ` + shellquote.Quote(query) + `"$` + shellVar + `" --limit=` + strconv.Itoa(limit) + ` 2>/dev/null`
+}
+
 func legacyEphemeralReadyFilterJQ(selector string, limit int, excludeHoldLabels bool) string {
 	body := selector +
 		` | select(((.issue_type // .type // "") != "epic"))` +
@@ -483,7 +488,7 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology) string {
 	_ = topo
 	filter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `] | .[:1]`
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
+	return `r=$(` + bdQueryEphemeralAssignedStatusQuietShell("in_progress", shellVar, 20) + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
@@ -500,7 +505,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) stri
 		return ""
 	}
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
+	return `r=$(` + bdQueryEphemeralAssignedStatusQuietShell("open", shellVar, 20) + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }

@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -352,6 +353,11 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 		if wq == "" {
 			continue
 		}
+		probeEnv = cloneStringMap(probeEnv)
+		if probeEnv == nil {
+			probeEnv = map[string]string{}
+		}
+		probeEnv[probeTargetEnv] = qn
 		probes = append(probes, probeWork{qn: qn, wq: wq, dir: agentCommandDir(cityDir, a, cfg.Rigs), env: probeEnv})
 	}
 
@@ -366,6 +372,9 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 			defer func() { <-sem }()
 			out, err := runner(probes[idx].wq, probes[idx].dir, probes[idx].env)
 			if err != nil {
+				if errors.Is(err, errProbeAlreadyInFlight) {
+					fmt.Fprintf(stderr, "session reconcile: work query probe %s skipped: %v\n", probes[idx].qn, err) //nolint:errcheck
+				}
 				return // command failed — treat as no work
 			}
 			if workQueryHasReadyWork(strings.TrimSpace(out)) {

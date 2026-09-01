@@ -246,13 +246,17 @@ func evaluatePendingPools(
 	for j, pw := range pendingPools {
 		wg.Add(1)
 		sp := pw.sp
-		probeEnv := pw.env
+		probeEnv := cloneStringMap(pw.env)
+		if probeEnv == nil {
+			probeEnv = map[string]string{}
+		}
 		sp.Check = prefixShellEnv(controllerQueryPrefixEnv(probeEnv), sp.Check)
 		template := cfg.Agents[pw.agentIdx].QualifiedName()
+		probeEnv[probeTargetEnv] = template
 		agentName := cfg.Agents[pw.agentIdx].Name
 		agentIndex := pw.agentIdx
 		newDemand := pw.newDemand
-		go func(idx int, template, agentName string, agentIndex int, sp scaleParams, dir string, newDemand bool) {
+		go func(idx int, template, agentName string, agentIndex int, sp scaleParams, dir string, env map[string]string, newDemand bool) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -260,9 +264,9 @@ func evaluatePendingPools(
 			var d int
 			var err error
 			if newDemand {
-				d, err = evaluatePoolNewDemand(agentName, sp, dir, probeEnv, shellScaleCheck)
+				d, err = evaluatePoolNewDemand(agentName, sp, dir, env, shellScaleCheck)
 			} else {
-				d, err = evaluatePool(agentName, sp, dir, probeEnv, shellScaleCheck)
+				d, err = evaluatePool(agentName, sp, dir, env, shellScaleCheck)
 			}
 			evalResults[idx] = poolEvalResult{desired: d, err: err}
 			if trace != nil {
@@ -280,7 +284,7 @@ func evaluatePendingPools(
 					"agent_index":    agentIndex,
 				})
 			}
-		}(j, template, agentName, agentIndex, sp, pw.poolDir, newDemand)
+		}(j, template, agentName, agentIndex, sp, pw.poolDir, probeEnv, newDemand)
 	}
 	wg.Wait()
 
