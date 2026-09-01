@@ -2167,6 +2167,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// snapshot Info unchanged, so this assignment is a no-op exactly when the raw
 		// bead was left untouched.
 		if running && !alive {
+			// A terminal-provider marker is the durable identity of the runtime
+			// whose scrollback we captured. A zombie tmux session can remain
+			// visible across later ticks after that process exits; preserve the
+			// first complete crash event, but do not report the same runtime again.
+			alreadyRecordedTerminalRuntime := sessionHasProviderTerminalErrorInfo(infoByID[id])
 			if output, err := peek(rateLimitPeekLines); err == nil && output != "" {
 				if reason := runtime.ProviderTerminalErrorReason(output); reason != "" {
 					markInfo, markErr := markProviderTerminalError(infoByID[id], sessFront, clk, reason)
@@ -2185,7 +2190,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						})
 					}
 				}
-				if !runtime.ContainsProviderRateLimitScreen(output) {
+				if !alreadyRecordedTerminalRuntime && !runtime.ContainsProviderRateLimitScreen(output) {
 					rec.Record(events.Event{
 						Type:    events.SessionCrashed,
 						Actor:   "gc",

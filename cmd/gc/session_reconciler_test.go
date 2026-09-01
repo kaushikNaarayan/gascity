@@ -10626,6 +10626,55 @@ func TestReconcileSessionBeads_ZombieTerminalProviderErrorMarkedUnhealthy(t *tes
 	}
 }
 
+// A zombie tmux server can remain visible across multiple reconciliation ticks
+// after its provider process has exited. The first tick must preserve the full
+// scrollback as a crash event, but the persisted terminal-error marker is the
+// durable identity of that exited runtime: later ticks must not report the same
+// crash again.
+func TestReconcileSessionBeads_ZombieTerminalProviderErrorRecordsCrashOnceAcrossTicks(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	tp := TemplateParams{
+		Command:      "test-cmd",
+		SessionName:  "worker",
+		TemplateName: "worker",
+		Hints:        agent.StartupHints{ProcessNames: []string{"test-cmd"}},
+	}
+	env.desiredState["worker"] = tp
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	env.sp.Zombies["worker"] = true
+	const exitOutput = "model_not_found: terminal provider exit"
+	env.sp.SetPeekOutput("worker", exitOutput)
+
+	env.reconcile([]beads.Bead{session})
+	current, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("get session after first zombie tick: %v", err)
+	}
+	env.reconcile([]beads.Bead{current})
+
+	var crashes []events.Event
+	for _, event := range rec.Events {
+		if event.Type == events.SessionCrashed {
+			crashes = append(crashes, event)
+		}
+	}
+	if len(crashes) != 1 {
+		t.Fatalf("SessionCrashed events = %d, want 1 for one unchanged zombie runtime; events=%+v", len(crashes), crashes)
+	}
+	if crashes[0].Message != exitOutput {
+		t.Fatalf("first crash output = %q, want full terminal output %q", crashes[0].Message, exitOutput)
+	}
+}
+
 // TestReconcileSessionBeads_BeadMetadataRestartRequestedWhenSessionDead
 // verifies that the reconciler detects restart_requested from bead metadata
 // even when the tmux session is already dead (dops is nil or session not
