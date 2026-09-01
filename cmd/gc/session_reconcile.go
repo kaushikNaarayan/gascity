@@ -45,6 +45,7 @@ const (
 	sessionDrainableMetadataKey             = "session_drainable"
 	sessionProviderTerminalErrorMetadataKey = "provider_terminal_error"
 	sessionProviderTerminalErrorAtKey       = "provider_terminal_error_at"
+	sessionZombieCrashAccountedIdentityKey  = "zombie_crash_accounted_identity"
 )
 
 // wakeReasonsInfo and evaluateWakeReasonsInfo are the CLI `gc session`
@@ -68,6 +69,32 @@ func wakeReasonsInfo(
 	clk clock.Clock,
 ) []WakeReason {
 	return evaluateWakeReasonsInfo(info, cfg, sp, poolDesired, workSet, readyWaitSet, clk).Reasons
+}
+
+// zombieCrashIdentityInfo returns the durable runtime fence for crash
+// accounting. instance_token is authoritative; generation protects legacy
+// sessions that predate it, and the session ID is the final stable fallback.
+func zombieCrashIdentityInfo(info sessionpkg.Info) string {
+	if token := strings.TrimSpace(info.InstanceToken); token != "" {
+		return "instance:" + token
+	}
+	if generation := strings.TrimSpace(info.Generation); generation != "" {
+		return "generation:" + generation
+	}
+	return "session:" + info.ID
+}
+
+func zombieCrashAlreadyAccountedInfo(info sessionpkg.Info) bool {
+	return strings.TrimSpace(info.ZombieCrashAccountedIdentity) == zombieCrashIdentityInfo(info)
+}
+
+func markZombieCrashAccounted(info sessionpkg.Info, sessFront *sessionpkg.Store) (sessionpkg.Info, error) {
+	if sessFront == nil {
+		return info, nil
+	}
+	return sessFront.ApplyPatchInfo(info, map[string]string{
+		sessionZombieCrashAccountedIdentityKey: zombieCrashIdentityInfo(info),
+	})
 }
 
 func evaluateWakeReasonsInfo(

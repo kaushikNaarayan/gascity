@@ -10627,11 +10627,10 @@ func TestReconcileSessionBeads_ZombieTerminalProviderErrorMarkedUnhealthy(t *tes
 }
 
 // A zombie tmux server can remain visible across multiple reconciliation ticks
-// after its provider process has exited. The first tick must preserve the full
-// scrollback as a crash event, but the persisted terminal-error marker is the
-// durable identity of that exited runtime: later ticks must not report the same
-// crash again.
-func TestReconcileSessionBeads_ZombieTerminalProviderErrorRecordsCrashOnceAcrossTicks(t *testing.T) {
+// after an ordinary (not provider-classified) process exit. The first tick must
+// preserve the full scrollback as a crash event, but later ticks for the same
+// instance_token must not report that runtime again.
+func TestReconcileSessionBeads_ZombieOrdinaryOutputRecordsCrashOncePerInstanceToken(t *testing.T) {
 	env := newReconcilerTestEnv()
 	rec := events.NewFake()
 	env.rec = rec
@@ -10650,8 +10649,9 @@ func TestReconcileSessionBeads_ZombieTerminalProviderErrorRecordsCrashOnceAcross
 
 	session := env.createSessionBead("worker", "worker")
 	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{"instance_token": "zombie-token-1"})
 	env.sp.Zombies["worker"] = true
-	const exitOutput = "model_not_found: terminal provider exit"
+	const exitOutput = "warning: worker exited without a classified provider error"
 	env.sp.SetPeekOutput("worker", exitOutput)
 
 	env.reconcile([]beads.Bead{session})
@@ -10671,7 +10671,52 @@ func TestReconcileSessionBeads_ZombieTerminalProviderErrorRecordsCrashOnceAcross
 		t.Fatalf("SessionCrashed events = %d, want 1 for one unchanged zombie runtime; events=%+v", len(crashes), crashes)
 	}
 	if crashes[0].Message != exitOutput {
-		t.Fatalf("first crash output = %q, want full terminal output %q", crashes[0].Message, exitOutput)
+		t.Fatalf("first crash output = %q, want full ordinary output %q", crashes[0].Message, exitOutput)
+	}
+	if got := current.Metadata[sessionZombieCrashAccountedIdentityKey]; got != "instance:zombie-token-1" {
+		t.Fatalf("crash-accounted identity = %q, want instance:zombie-token-1", got)
+	}
+}
+
+// The dedupe fence is runtime-scoped, not bead-scoped. A replacement process
+// with a new instance_token must report its own crash even if the previous
+// runtime left a terminal-provider marker on the same session bead.
+func TestReconcileSessionBeads_ZombieReplacementInstanceReportsOwnCrash(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	tp := TemplateParams{Command: "test-cmd", SessionName: "worker", TemplateName: "worker", Hints: agent.StartupHints{ProcessNames: []string{"test-cmd"}}}
+	env.desiredState["worker"] = tp
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{"instance_token": "zombie-token-1"})
+	env.sp.Zombies["worker"] = true
+	env.sp.SetPeekOutput("worker", "model_not_found: first runtime")
+	env.reconcile([]beads.Bead{session})
+
+	current, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("get first runtime: %v", err)
+	}
+	env.setSessionMetadata(&current, map[string]string{"instance_token": "zombie-token-2"})
+	env.sp.SetPeekOutput("worker", "warning: replacement runtime exited")
+	env.reconcile([]beads.Bead{current})
+
+	var crashes []events.Event
+	for _, event := range rec.Events {
+		if event.Type == events.SessionCrashed {
+			crashes = append(crashes, event)
+		}
+	}
+	if len(crashes) != 2 {
+		t.Fatalf("SessionCrashed events = %d, want 2 for two instance tokens; events=%+v", len(crashes), crashes)
+	}
+	if crashes[1].Message != "warning: replacement runtime exited" {
+		t.Fatalf("replacement crash output = %q, want full replacement output", crashes[1].Message)
 	}
 }
 

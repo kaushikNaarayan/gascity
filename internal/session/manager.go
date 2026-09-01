@@ -200,6 +200,11 @@ type Info struct {
 	HealthState           string // session_health (raw)
 	HealthReason          string // session_health_reason (raw)
 	Drainable             bool   // session_drainable == "true"
+	// ZombieCrashAccountedIdentity records the instance identity whose zombie
+	// crash event was already emitted. It is deliberately distinct from the
+	// provider-terminal health marker: ordinary scrollback can be a real dead
+	// runtime even when it has no classified provider error.
+	ZombieCrashAccountedIdentity string // zombie_crash_accounted_identity (raw)
 
 	// --- trigger / brain-parent cluster (controller read surface) ---
 	//
