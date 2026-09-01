@@ -10744,6 +10744,10 @@ func TestReconcileSessionBeads_ZombieIdentitylessReplacementIsNotDeduplicated(t 
 	}
 	env.sp.SetPeekOutput("worker", "warning: replacement identityless runtime exited")
 	env.reconcile([]beads.Bead{current})
+	current, err = env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("get second identityless runtime: %v", err)
+	}
 
 	var crashes []events.Event
 	for _, event := range rec.Events {
