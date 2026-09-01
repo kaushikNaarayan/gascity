@@ -10720,6 +10720,48 @@ func TestReconcileSessionBeads_ZombieReplacementInstanceReportsOwnCrash(t *testi
 	}
 }
 
+// A legacy session without an instance_token has no proven per-runtime fence.
+// It must not persist a bead-wide crash marker: a later replacement observation
+// needs its own crash event rather than being silently suppressed.
+func TestReconcileSessionBeads_ZombieIdentitylessReplacementIsNotDeduplicated(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.desiredState["worker"] = TemplateParams{Command: "test-cmd", SessionName: "worker", TemplateName: "worker", Hints: agent.StartupHints{ProcessNames: []string{"test-cmd"}}}
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{"instance_token": "", "generation": "legacy-generation"})
+	env.sp.Zombies["worker"] = true
+	env.sp.SetPeekOutput("worker", "warning: first identityless runtime exited")
+	env.reconcile([]beads.Bead{session})
+	current, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("get first identityless runtime: %v", err)
+	}
+	env.sp.SetPeekOutput("worker", "warning: replacement identityless runtime exited")
+	env.reconcile([]beads.Bead{current})
+
+	var crashes []events.Event
+	for _, event := range rec.Events {
+		if event.Type == events.SessionCrashed {
+			crashes = append(crashes, event)
+		}
+	}
+	if len(crashes) != 2 {
+		t.Fatalf("SessionCrashed events = %d, want 2 without a proven per-runtime identity; events=%+v", len(crashes), crashes)
+	}
+	if crashes[1].Message != "warning: replacement identityless runtime exited" {
+		t.Fatalf("identityless replacement output = %q, want complete replacement output", crashes[1].Message)
+	}
+	if got := current.Metadata[sessionZombieCrashAccountedIdentityKey]; got != "" {
+		t.Fatalf("identityless crash marker = %q, want empty (no bead-wide dedupe)", got)
+	}
+}
+
 // TestReconcileSessionBeads_BeadMetadataRestartRequestedWhenSessionDead
 // verifies that the reconciler detects restart_requested from bead metadata
 // even when the tmux session is already dead (dops is nil or session not

@@ -72,28 +72,31 @@ func wakeReasonsInfo(
 }
 
 // zombieCrashIdentityInfo returns the durable runtime fence for crash
-// accounting. instance_token is authoritative; generation protects legacy
-// sessions that predate it, and the session ID is the final stable fallback.
-func zombieCrashIdentityInfo(info sessionpkg.Info) string {
+// accounting. Only instance_token is proven to change per runtime. Legacy
+// sessions without one are intentionally not deduplicated: a generation or
+// session-bead-ID fallback could suppress a distinct replacement runtime.
+func zombieCrashIdentityInfo(info sessionpkg.Info) (string, bool) {
 	if token := strings.TrimSpace(info.InstanceToken); token != "" {
-		return "instance:" + token
+		return "instance:" + token, true
 	}
-	if generation := strings.TrimSpace(info.Generation); generation != "" {
-		return "generation:" + generation
-	}
-	return "session:" + info.ID
+	return "", false
 }
 
 func zombieCrashAlreadyAccountedInfo(info sessionpkg.Info) bool {
-	return strings.TrimSpace(info.ZombieCrashAccountedIdentity) == zombieCrashIdentityInfo(info)
+	identity, ok := zombieCrashIdentityInfo(info)
+	return ok && strings.TrimSpace(info.ZombieCrashAccountedIdentity) == identity
 }
 
 func markZombieCrashAccounted(info sessionpkg.Info, sessFront *sessionpkg.Store) (sessionpkg.Info, error) {
+	identity, ok := zombieCrashIdentityInfo(info)
+	if !ok {
+		return info, nil
+	}
 	if sessFront == nil {
 		return info, nil
 	}
 	return sessFront.ApplyPatchInfo(info, map[string]string{
-		sessionZombieCrashAccountedIdentityKey: zombieCrashIdentityInfo(info),
+		sessionZombieCrashAccountedIdentityKey: identity,
 	})
 }
 
