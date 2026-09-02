@@ -102,6 +102,16 @@ func TestSQLiteFenceHelperProcess(t *testing.T) {
 	}
 }
 
+func TestSQLiteFenceChildReadinessFailureClassifiesSetupOutput(t *testing.T) {
+	message := sqliteFenceChildReadinessFailure(sqliteFenceChildBoundaryHolder, "--- FAIL: TestSQLiteFenceHelperProcess")
+	if !strings.Contains(message, "setup failed before readiness") {
+		t.Fatalf("readiness failure = %q, want setup classification", message)
+	}
+	if strings.Contains(message, "fence behavior") {
+		t.Fatalf("readiness failure = %q, must not classify setup as fence behavior", message)
+	}
+}
+
 func TestSQLiteLegacySnapshotSIGKILLAtBoundaries(t *testing.T) {
 	for _, boundary := range []string{
 		"legacy-snapshot-root-created",
@@ -1122,10 +1132,17 @@ func startSQLiteFenceChild(t *testing.T, cmd *exec.Cmd, mode, path string, waitR
 	t.Cleanup(func() { child.kill(t) })
 	if waitReady {
 		if line := child.line(t); line != "ready" {
-			t.Fatalf("SQLite child %q readiness = %q, want ready", mode, line)
+			t.Fatal(sqliteFenceChildReadinessFailure(mode, line))
 		}
 	}
 	return child
+}
+
+func sqliteFenceChildReadinessFailure(mode, line string) string {
+	if strings.HasPrefix(line, "--- FAIL:") {
+		return fmt.Sprintf("SQLite child %q setup failed before readiness: %s", mode, line)
+	}
+	return fmt.Sprintf("SQLite child %q readiness = %q, want ready", mode, line)
 }
 
 func runSQLiteFenceChild(t *testing.T, cmd *exec.Cmd, mode, path string) string {
