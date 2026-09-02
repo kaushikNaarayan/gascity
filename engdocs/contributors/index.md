@@ -23,6 +23,8 @@ description: The shortest path for new contributors to get productive in Gas Cit
 - [Hold and Blocked Label Conventions](hold-label-conventions.md) when a bead
   needs to pause on a specific actor or condition — only `hold:mayor` and
   `hold:external` are canonical
+- [Ralph Pack Reference](ralph-pack-reference.md) for the bead-backed,
+  budget-bounded shape of a Ralph-style pack
 - [Release Gate Criteria Conventions](release-gate-criteria-conventions.md)
   when signing off the "Tests pass" criterion on a `release-gates/*.md`
   deploy gate — it must cite the CI jobs `ci-required` actually gates on
