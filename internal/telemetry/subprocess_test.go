@@ -121,11 +121,10 @@ func TestOTELEnvMap_StandardEndpointOnly(t *testing.T) {
 	if m == nil {
 		t.Fatal("expected non-nil map when OTEL_EXPORTER_OTLP_ENDPOINT is set")
 	}
-	if want := "http://collector:4318/v1/metrics"; m["BD_OTEL_METRICS_URL"] != want {
-		t.Errorf("BD_OTEL_METRICS_URL = %q, want %q", m["BD_OTEL_METRICS_URL"], want)
-	}
-	if want := "http://collector:4318/v1/logs"; m["BD_OTEL_LOGS_URL"] != want {
-		t.Errorf("BD_OTEL_LOGS_URL = %q, want %q", m["BD_OTEL_LOGS_URL"], want)
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if got := m[key]; got != "" {
+			t.Errorf("%s = %q, want cleared", key, got)
+		}
 	}
 	if m["CLAUDE_CODE_ENABLE_TELEMETRY"] != "1" {
 		t.Errorf("CLAUDE_CODE_ENABLE_TELEMETRY = %q", m["CLAUDE_CODE_ENABLE_TELEMETRY"])
@@ -144,11 +143,10 @@ func TestOTELEnvMap_Enabled(t *testing.T) {
 	if m == nil {
 		t.Fatal("expected non-nil map")
 	}
-	if m["BD_OTEL_METRICS_URL"] != "http://localhost:8428/opentelemetry/api/v1/push" {
-		t.Errorf("BD_OTEL_METRICS_URL = %q", m["BD_OTEL_METRICS_URL"])
-	}
-	if m["BD_OTEL_LOGS_URL"] != "http://localhost:9428/insert/opentelemetry/v1/logs" {
-		t.Errorf("BD_OTEL_LOGS_URL = %q", m["BD_OTEL_LOGS_URL"])
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if got := m[key]; got != "" {
+			t.Errorf("%s = %q, want cleared", key, got)
+		}
 	}
 	if m["CLAUDE_CODE_ENABLE_TELEMETRY"] != "1" {
 		t.Errorf("CLAUDE_CODE_ENABLE_TELEMETRY = %q", m["CLAUDE_CODE_ENABLE_TELEMETRY"])
@@ -156,8 +154,7 @@ func TestOTELEnvMap_Enabled(t *testing.T) {
 }
 
 func TestOTELEnvMap_NoLogsURL_FallsBackToDefault(t *testing.T) {
-	// The resolved logs endpoint mirrors what the main provider uses, so bd
-	// emits to the same collector as gc when GC_OTEL_LOGS_URL is unset.
+	// bd telemetry remains disabled even when GC resolves a default logs URL.
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "")
 	t.Setenv("GC_ALIAS", "")
@@ -166,8 +163,8 @@ func TestOTELEnvMap_NoLogsURL_FallsBackToDefault(t *testing.T) {
 	t.Setenv("GC_CITY", "")
 
 	m := OTELEnvMap()
-	if got := m["BD_OTEL_LOGS_URL"]; got != DefaultLogsURL {
-		t.Errorf("BD_OTEL_LOGS_URL = %q, want DefaultLogsURL %q", got, DefaultLogsURL)
+	if got := m["BD_OTEL_LOGS_URL"]; got != "" {
+		t.Errorf("BD_OTEL_LOGS_URL = %q, want cleared", got)
 	}
 }
 
@@ -242,8 +239,8 @@ func TestOTELEnvForSubprocess_StandardEndpointOnly(t *testing.T) {
 		t.Fatal("expected non-nil env when OTEL_EXPORTER_OTLP_ENDPOINT is set")
 	}
 	want := map[string]bool{
-		"BD_OTEL_METRICS_URL=http://collector:4318/v1/metrics":  false,
-		"BD_OTEL_LOGS_URL=http://collector:4318/v1/logs":        false,
+		"BD_OTEL_METRICS_URL=": false,
+		"BD_OTEL_LOGS_URL=":    false,
 		"OTEL_RESOURCE_ATTRIBUTES=team=platform,gc.agent=mayor": false,
 		"CLAUDE_CODE_ENABLE_TELEMETRY=1":                        false,
 	}
@@ -274,18 +271,18 @@ func TestOTELEnvForSubprocess_BothURLs(t *testing.T) {
 
 	hasMetrics, hasLogs := false, false
 	for _, e := range env {
-		if strings.HasPrefix(e, "BD_OTEL_METRICS_URL=") {
+		if e == "BD_OTEL_METRICS_URL=" {
 			hasMetrics = true
 		}
-		if strings.HasPrefix(e, "BD_OTEL_LOGS_URL=") {
+		if e == "BD_OTEL_LOGS_URL=" {
 			hasLogs = true
 		}
 	}
 	if !hasMetrics {
-		t.Error("expected BD_OTEL_METRICS_URL in subprocess env")
+		t.Error("expected cleared BD_OTEL_METRICS_URL in subprocess env")
 	}
 	if !hasLogs {
-		t.Error("expected BD_OTEL_LOGS_URL in subprocess env")
+		t.Error("expected cleared BD_OTEL_LOGS_URL in subprocess env")
 	}
 }
 
@@ -317,11 +314,10 @@ func TestSetProcessOTELAttrs_StandardEndpointOnly(t *testing.T) {
 
 	SetProcessOTELAttrs()
 
-	if got, want := os.Getenv("BD_OTEL_METRICS_URL"), "http://collector:4318/v1/metrics"; got != want {
-		t.Errorf("BD_OTEL_METRICS_URL = %q, want %q", got, want)
-	}
-	if got, want := os.Getenv("BD_OTEL_LOGS_URL"), "http://collector:4318/v1/logs"; got != want {
-		t.Errorf("BD_OTEL_LOGS_URL = %q, want %q", got, want)
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if got := os.Getenv(key); got != "" {
+			t.Errorf("%s = %q, want cleared", key, got)
+		}
 	}
 	if got := os.Getenv("CLAUDE_CODE_ENABLE_TELEMETRY"); got != "1" {
 		t.Errorf("CLAUDE_CODE_ENABLE_TELEMETRY = %q, want %q", got, "1")
@@ -340,11 +336,10 @@ func TestSetProcessOTELAttrs_Enabled(t *testing.T) {
 
 	SetProcessOTELAttrs()
 
-	if got := os.Getenv("BD_OTEL_METRICS_URL"); got != metricsURL {
-		t.Errorf("BD_OTEL_METRICS_URL = %q, want %q", got, metricsURL)
-	}
-	if got := os.Getenv("BD_OTEL_LOGS_URL"); got != logsURL {
-		t.Errorf("BD_OTEL_LOGS_URL = %q, want %q", got, logsURL)
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if got := os.Getenv(key); got != "" {
+			t.Errorf("%s = %q, want cleared", key, got)
+		}
 	}
 	if got := os.Getenv("CLAUDE_CODE_ENABLE_TELEMETRY"); got != "1" {
 		t.Errorf("CLAUDE_CODE_ENABLE_TELEMETRY = %q, want %q", got, "1")

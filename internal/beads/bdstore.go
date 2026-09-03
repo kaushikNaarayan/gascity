@@ -758,6 +758,13 @@ func truncateRawOutput(data []byte, maxBytes int) string {
 // store bridge, t3bridge, libstore, provider lifecycle — current and future.
 const bdAutoBackupOptOutEnvKey = "BD_BACKUP_ENABLED"
 
+// bdTelemetryEnvKeys are exporter settings understood by bd. gc records the
+// useful command-level telemetry itself, while allowing every short-lived bd
+// child to export its own storage histograms creates unbounded series churn.
+// Keep bd telemetry disabled at the execution choke point, including when a
+// caller inherited these variables from its parent process.
+var bdTelemetryEnvKeys = []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"}
+
 // execEnvFor assembles the child environment for a runner exec. For bd
 // commands the auto-backup opt-out is injected as a baseline, replacing any
 // value inherited from the parent process (matching the unconditional
@@ -767,6 +774,18 @@ const bdAutoBackupOptOutEnvKey = "BD_BACKUP_ENABLED"
 func execEnvFor(name string, baseEnv []string, overrides map[string]string) []string {
 	if name == "bd" {
 		baseEnv = append(envWithout(baseEnv, bdAutoBackupOptOutEnvKey), bdAutoBackupOptOutEnvKey+"=false")
+		for _, key := range bdTelemetryEnvKeys {
+			baseEnv = envWithout(baseEnv, key)
+		}
+		// The telemetry policy is intentionally non-overridable per invocation:
+		// bd is a short-lived subprocess, whereas gc's long-lived controller
+		// exports the store-health signal.
+		if overrides != nil {
+			overrides = maps.Clone(overrides)
+			for _, key := range bdTelemetryEnvKeys {
+				delete(overrides, key)
+			}
+		}
 	}
 	return mergeEnv(baseEnv, overrides)
 }

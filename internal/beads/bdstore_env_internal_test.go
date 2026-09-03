@@ -45,6 +45,32 @@ func TestExecEnvForBd_OverridesInheritedEnable(t *testing.T) {
 	}
 }
 
+func TestExecEnvForBd_StripsTelemetryExportEndpoints(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"BD_OTEL_METRICS_URL=http://collector:4318/v1/metrics",
+		"BD_OTEL_LOGS_URL=http://collector:4318/v1/logs",
+	}
+	got := execEnvFor("bd", base, nil)
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if vals := envValues(got, key); len(vals) != 0 {
+			t.Errorf("%s values = %v, want none", key, vals)
+		}
+	}
+}
+
+func TestExecEnvForBd_RejectsTelemetryEndpointOverride(t *testing.T) {
+	got := execEnvFor("bd", []string{"PATH=/usr/bin"}, map[string]string{
+		"BD_OTEL_METRICS_URL": "http://collector:4318/v1/metrics",
+		"BD_OTEL_LOGS_URL":    "http://collector:4318/v1/logs",
+	})
+	for _, key := range []string{"BD_OTEL_METRICS_URL", "BD_OTEL_LOGS_URL"} {
+		if vals := envValues(got, key); len(vals) != 0 {
+			t.Errorf("%s values = %v, want none", key, vals)
+		}
+	}
+}
+
 func TestExecEnvForBd_ExplicitCallerOverrideWins(t *testing.T) {
 	// An explicit per-call override is a deliberate caller decision (e.g. a
 	// backup-focused test fixture) and must beat the injected baseline.
