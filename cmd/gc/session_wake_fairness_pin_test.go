@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
@@ -151,6 +152,95 @@ func TestWakeFairnessInfoTwinCharacterization(t *testing.T) {
 		if gotOrder[i] != wantOrder[i] {
 			t.Fatalf("fairness sort order = %v, want %v", gotOrder, wantOrder)
 		}
+	}
+}
+
+// TestWakeBudgetFairnessEpochBoundsFreshCycleStarvation models the production
+// starvation shape across two supervisor ticks. Five older always/fresh
+// candidates spend every slot in tick one; one start fails and four later sleep,
+// so all five clear last_woke_at. A newer control dispatcher must receive a slot
+// on tick two without raising max_wakes. The separate epoch is durable in the
+// store and intentionally survives both lifecycle cleanup paths.
+func TestWakeBudgetFairnessEpochBoundsFreshCycleStarvation(t *testing.T) {
+	const maxWakes = 5
+	// MemStore owns CreatedAt. Put tick one in the future of fixture creation so
+	// the unattempted dispatcher's CreatedAt is strictly older than the old
+	// sessions' tick-one fairness epochs on tick two.
+	base := time.Now().UTC().Add(time.Hour)
+	clk := &clock.Fake{Time: base}
+	store := beads.NewMemStore()
+
+	create := func(id string, created time.Time) beads.Bead {
+		t.Helper()
+		b, err := store.Create(beads.Bead{
+			ID: id, Title: id, Type: session.BeadType, Labels: []string{session.LabelSession}, CreatedAt: created,
+			Metadata: map[string]string{"session_name": id, "template": id, "state": "start-pending", "wake_mode": "fresh"},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
+		return b
+	}
+	var old []beads.Bead
+	for i := 0; i < maxWakes; i++ {
+		old = append(old, create("old-"+string(rune('a'+i)), base.Add(-2*time.Hour)))
+	}
+	dispatcher := create("control-dispatcher", base.Add(-time.Hour))
+
+	candidates := func() []startCandidate {
+		out := make([]startCandidate, 0, maxWakes+1)
+		for _, initial := range append(append([]beads.Bead{}, old...), dispatcher) {
+			current, err := store.Get(initial.ID)
+			if err != nil {
+				t.Fatalf("Get(%s): %v", initial.ID, err)
+			}
+			out = append(out, startCandidate{info: sessiontest.SeedBead(t, current)})
+		}
+		sortCandidatesByWakeFairness(out)
+		return out
+	}
+
+	// Tick one consumes exactly the configured budget on the five old sessions.
+	first := candidates()
+	for i := 0; i < maxWakes; i++ {
+		if got := first[i].info.ID; got == dispatcher.ID {
+			t.Fatalf("tick one slot %d = dispatcher; setup must reproduce old-first starvation", i)
+		}
+		if err := markWakeBudgetSpent(&first[i], sessionFrontDoor(store), clk); err != nil {
+			t.Fatalf("markWakeBudgetSpent(%s): %v", first[i].info.ID, err)
+		}
+	}
+
+	// One provider failure and four normal start->sleep paths clear only the
+	// lifecycle lease. The fairness epoch must remain durable across both.
+	if err := store.SetMetadata(old[0].ID, "last_woke_at", ""); err != nil {
+		t.Fatalf("clear failed-start lease: %v", err)
+	}
+	for _, b := range old[1:] {
+		if err := store.SetMetadataBatch(b.ID, session.SleepPatch(base, "idle")); err != nil {
+			t.Fatalf("sleep %s: %v", b.ID, err)
+		}
+	}
+	for _, b := range old {
+		current, err := store.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Metadata["wake_budget_spent_at"] == "" {
+			t.Fatalf("%s lost durable fairness epoch during lifecycle cleanup", b.ID)
+		}
+		if current.Metadata["last_woke_at"] != "" {
+			t.Fatalf("%s last_woke_at = %q, want lifecycle-cleared", b.ID, current.Metadata["last_woke_at"])
+		}
+	}
+
+	clk.Time = clk.Time.Add(time.Minute)
+	second := candidates()
+	if got := second[0].info.ID; got != dispatcher.ID {
+		t.Fatalf("tick two first candidate = %q, want %q; dispatcher must receive a bounded slot", got, dispatcher.ID)
+	}
+	if len(second[:maxWakes]) != maxWakes {
+		t.Fatalf("selected wake count = %d, want budget %d", len(second[:maxWakes]), maxWakes)
 	}
 }
 
