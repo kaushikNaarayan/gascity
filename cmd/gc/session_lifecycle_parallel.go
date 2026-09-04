@@ -192,11 +192,11 @@ func wakeFairnessTime(c startCandidate) time.Time {
 	return time.Time{}
 }
 
-// markWakeBudgetSpent records the fairness epoch only after preparation has
-// succeeded and the reconciler is about to invoke/enqueue a provider start. It
-// deliberately is not part of preWakeCommit: failed preparation never reaches a
-// budget slot and must remain immediately retryable. The returned fold keeps the
-// typed candidate coherent with the durable store without another read.
+// markWakeBudgetSpent records the fairness epoch only after a provider start has
+// been attempted. It deliberately is not part of preWakeCommit: failed
+// preparation never reaches a budget slot and must remain immediately retryable.
+// The returned fold keeps the typed candidate coherent with the durable store
+// without another read.
 func markWakeBudgetSpent(candidate *startCandidate, sessFront *sessionpkg.Store, clk clock.Clock) error {
 	if candidate == nil || strings.TrimSpace(candidate.info.ID) == "" {
 		return nil
@@ -2090,6 +2090,16 @@ func commitStartResultTraced(
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, nil, result.phases)
 		return false
 	}
+	// A provider Start call has now completed (successfully or with an error), so
+	// this attempt consumed a wake slot. Persist its separate fairness epoch only
+	// here: metadata failure before the provider call must not age a candidate.
+	if err := markWakeBudgetSpent(&result.prepared.candidate, sessFront, clk); err != nil {
+		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
+		fmt.Fprintf(stderr, "session reconciler: wake fairness epoch %s: %s\n", name, formatLifecycleError(err)) //nolint:errcheck
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "fairness_metadata_failed", result.started, result.finished, err, result.phases)
+		return false
+	}
+	info = result.prepared.candidate.info
 	if result.err != nil {
 		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace)
 		return false
@@ -2841,19 +2851,6 @@ func executePlannedStartsTraced(
 					}
 					fmt.Fprintf(stderr, "session reconciler: pre-wake %s: %s\n", candidate.name(), formatLifecycleError(err)) //nolint:errcheck
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "failed", time.Time{}, time.Time{}, err)
-					continue
-				}
-				startFront := sessionFrontDoor(store)
-				if err := markWakeBudgetSpent(&item.candidate, startFront, clk); err != nil {
-					clearPendingStartInFlightLease(candidate.info.ID, startFront, stderr)
-					if release != nil {
-						release()
-					}
-					if done != nil {
-						done()
-					}
-					fmt.Fprintf(stderr, "session reconciler: wake fairness epoch %s: %s\n", candidate.name(), formatLifecycleError(err)) //nolint:errcheck
-					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "fairness_metadata_failed", time.Time{}, time.Time{}, err)
 					continue
 				}
 				if startOpts.async {
