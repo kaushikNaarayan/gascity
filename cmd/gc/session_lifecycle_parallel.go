@@ -2094,12 +2094,11 @@ func commitStartResultTraced(
 	// this attempt consumed a wake slot. Persist its separate fairness epoch only
 	// here: metadata failure before the provider call must not age a candidate.
 	if err := markWakeBudgetSpent(&result.prepared.candidate, sessFront, clk); err != nil {
-		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: wake fairness epoch %s: %s\n", name, formatLifecycleError(err)) //nolint:errcheck
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "fairness_metadata_failed", result.started, result.finished, err, result.phases)
-		return false
+	} else {
+		info = result.prepared.candidate.info
 	}
-	info = result.prepared.candidate.info
 	if result.err != nil {
 		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace)
 		return false

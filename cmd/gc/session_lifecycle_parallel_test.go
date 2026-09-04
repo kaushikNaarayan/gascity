@@ -4480,8 +4480,8 @@ func TestExecutePlannedStartsClearsLegacyDrainAckAfterProviderStartBeforeMetadat
 		ioDiscard{},
 		ioDiscard{},
 	)
-	if woken != 0 {
-		t.Fatalf("woken = %d, want 0 after metadata batch retry", woken)
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1 after fairness-sidecar metadata retry", woken)
 	}
 	if !sp.IsRunning("sky") {
 		t.Fatal("provider start should have succeeded before metadata retry")
