@@ -137,6 +137,32 @@ func TestBuildResolvedProviderCache_AllowsValidLegacyBuiltinOptionDefaults(t *te
 	}
 }
 
+func TestBuildResolvedProviderCache_AllowsCodexAstraModelDefault(t *testing.T) {
+	base := "builtin:codex"
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"codex-astra": {
+				Base: &base,
+				OptionDefaults: map[string]string{
+					"model": "gpt-6-astra",
+				},
+			},
+		},
+	}
+
+	if err := BuildResolvedProviderCache(cfg); err != nil {
+		t.Fatalf("BuildResolvedProviderCache() error = %v, want nil", err)
+	}
+
+	resolved, ok := ResolvedProviderCached(cfg, "codex-astra")
+	if !ok {
+		t.Fatal("ResolvedProviderCached() did not contain codex-astra")
+	}
+	if got := resolved.ResolveDefaultArgs(); !containsArgPair(got, []string{"--model", "gpt-6-astra"}) {
+		t.Errorf("ResolveDefaultArgs() = %v, want --model gpt-6-astra", got)
+	}
+}
+
 func TestResolvedProviderCached_DeepCopyIsolatesMutations(t *testing.T) {
 	base := "builtin:codex"
 	cfg := &City{

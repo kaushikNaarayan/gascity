@@ -342,6 +342,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				},
 			},
 			modelOption(
+				modelChoice("gpt-6-astra", "GPT-6 Astra"),
 				modelChoice("gpt-5.6-sol", "GPT-5.6 Sol"),
 				modelChoice("gpt-5.6-terra", "GPT-5.6 Terra"),
 				modelChoice("gpt-5.6-luna", "GPT-5.6 Luna"),
