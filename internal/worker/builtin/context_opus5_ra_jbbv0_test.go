@@ -45,17 +45,15 @@ func TestBuiltinClaudeModelChoicesIncludeOpus5(t *testing.T) {
 		t.Errorf("opus-5 FlagAliases = %v, want [[-m claude-opus-5]]", choice.FlagAliases)
 	}
 
-	// Unlike the sonnet/fable-5 precedent (#3867, #3284), bare "opus" is NOT
-	// repointed at the new latest here: internal/config/provider_test.go
-	// (TestBuiltinProvidersClaudeModelChoices) pins "opus" to claude-opus-4-8
-	// as a deliberate stability guarantee, and opus-5 is added as a new
-	// explicit alias alongside it rather than replacing the default.
+	// Bare "opus" follows the current Opus generation, matching the current
+	// sonnet/fable alias convention. The prior Opus 4.8 target remained
+	// silently selected after Opus 5 was available.
 	bare, ok := byValue["opus"]
 	if !ok {
 		t.Fatal("claude model choices missing \"opus\"")
 	}
-	if len(bare.FlagArgs) != 2 || bare.FlagArgs[1] != "claude-opus-4-8" {
-		t.Errorf("opus (bare) FlagArgs = %v, want [--model claude-opus-4-8] (unchanged)", bare.FlagArgs)
+	if len(bare.FlagArgs) != 2 || bare.FlagArgs[1] != "claude-opus-5" {
+		t.Errorf("opus (bare) FlagArgs = %v, want [--model claude-opus-5]", bare.FlagArgs)
 	}
 }
 
@@ -86,7 +84,7 @@ func TestBuiltinClaudeModelChoicesAcceptCanonicalIDsVerbatim(t *testing.T) {
 		byValue[choice.Value] = choice
 	}
 
-	for _, canonical := range []string{"claude-opus-5", "claude-opus-5[1m]", "claude-sonnet-5", "claude-fable-5"} {
+	for _, canonical := range []string{"claude-opus-5", "claude-opus-5[1m]", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5-20251001"} {
 		choice, ok := byValue[canonical]
 		if !ok {
 			t.Errorf("claude model choices missing canonical id %q as a directly-accepted value", canonical)

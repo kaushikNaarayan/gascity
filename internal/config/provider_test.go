@@ -87,8 +87,8 @@ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
 			}
 		}
 	}
-	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
-		t.Fatalf("opus FlagArgs = %v, want Opus 4.8", model.FlagArgs)
+	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-5"}) {
+		t.Fatalf("opus FlagArgs = %v, want Opus 5", model.FlagArgs)
 	}
 	if !reflect.DeepEqual(oldOpus.FlagArgs, []string{"--model", "claude-opus-4-7"}) {
 		t.Fatalf("opus-4-7 FlagArgs = %v, want Opus 4.7 preserved", oldOpus.FlagArgs)
