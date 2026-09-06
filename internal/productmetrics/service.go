@@ -192,6 +192,7 @@ type serviceDependencies struct {
 	storageHooks                storageTestHooks
 	disableUploaderWait         time.Duration
 	disableStateWait            time.Duration
+	postUploaderStateWait       time.Duration
 	disableCleanupBudget        spoolWorkBudget
 	beforeDisableUploaderLock   func()
 	controlCloseError           func(controlCloseTarget) error
