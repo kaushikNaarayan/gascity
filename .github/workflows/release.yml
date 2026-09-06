@@ -1,11 +1,8 @@
 name: Release
 
-# material-lab-io/gascity runs this on our own self-hosted [self-hosted, gt2]
-# runners (see fork-verify.yml, gcf-kt2): this fork's included Actions minutes
-# are exhausted, so every hosted job dies in seconds. gastownhall/gascity keeps
-# ubuntu-latest. GoReleaser cross-compiles linux/darwin from a single Linux
-# runner (CGO_ENABLED=0, see .goreleaser.yml), so gt2 is sufficient to build
-# all four release platform/arch combinations.
+# Release jobs run exclusively on our self-hosted [self-hosted, gt2] runners.
+# GoReleaser cross-compiles linux/darwin from one Linux runner (CGO_ENABLED=0,
+# see .goreleaser.yml), so gt2 is sufficient for all four platform/arch builds.
 
 on:
   push:
@@ -25,7 +22,7 @@ jobs:
   release:
     name: Release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
+    runs-on: [self-hosted, gt2]
     permissions:
       contents: write
     steps:
@@ -74,9 +71,14 @@ jobs:
 
   attest-release:
     name: Attest release
+    # Temporary founder decision (gcf-uyut, 2026-08-30): material-lab-io's
+    # private-org plan cannot persist GitHub attestations. Keep generating and
+    # uploading the SBOM, but do not let this unavailable service block binary
+    # releases. Permanent policy is tracked by gcf-69bt.
+    continue-on-error: true
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     needs: release
-    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
+    runs-on: [self-hosted, gt2]
     permissions:
       attestations: write
       contents: write
@@ -131,8 +133,8 @@ jobs:
   update-homebrew-formula:
     name: Update Homebrew formula
     if: ${{ github.repository == 'gastownhall/gascity' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-    needs: [release, attest-release]
-    runs-on: ubuntu-latest
+    needs: release
+    runs-on: [self-hosted, gt2]
     permissions:
       contents: read
     steps:

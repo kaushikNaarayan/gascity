@@ -1,9 +1,8 @@
 name: RC Release
 
-# material-lab-io/gascity runs this on our own self-hosted [self-hosted, gt2]
-# runners (see fork-verify.yml, gcf-kt2; release.yml). The job condition below
-# is widened from gastownhall-only to include material-lab-io/gascity — this
-# fork needs to be able to draft its own RC releases, same as gastownhall.
+# RC release jobs run exclusively on our self-hosted [self-hosted, gt2]
+# runners. The job condition includes material-lab-io/gascity so this fork can
+# draft its own RC releases.
 
 on:
   push:
@@ -31,7 +30,7 @@ jobs:
   rc-release:
     name: Draft RC release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) }}
-    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
+    runs-on: [self-hosted, gt2]
     permissions:
       contents: write
     steps:

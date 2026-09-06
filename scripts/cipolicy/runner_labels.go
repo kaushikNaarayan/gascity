@@ -33,7 +33,6 @@ type approvedHostedException struct {
 
 var approvedHostedExceptions = []approvedHostedException{
 	{"ci.yml", "credential-provider-windows", "no self-hosted Windows runner; gated on internal/credentialprovider/** changes; Job Object assertions have no Linux/macOS equivalent"},
-	{"release.yml", "update-homebrew-formula", "gated `if: github.repository == 'gastownhall/gascity'`; never runs for our fork"},
 	{"gc-edge-publish.yml", "publish-gc-edge", "gated `if: github.repository == 'gastownhall/gascity'`; never runs for our fork"},
 
 	// Everything below is disabled_manually as of the gcf-ye0 audit
@@ -122,24 +121,9 @@ func isApprovedSelfHosted(labels []string) bool {
 	return true
 }
 
-// isConditionalSelfHostedForUs is true for the
-// `github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest'`
-// ternary used by release.yml / rc-release.yml: it resolves to our fleet
-// for our fork and to a hosted fallback only for other repos/forks.
-func isConditionalSelfHostedForUs(labels []string) bool {
-	if len(labels) != 1 {
-		return false
-	}
-	text := labels[0]
-	return strings.Contains(text, "material-lab-io/gascity") &&
-		strings.Contains(text, `"self-hosted"`) &&
-		strings.Contains(text, `"gt2"`)
-}
-
 // checkRunnerLabels scans every job in every .github/workflows/*.yml file
 // under root for a runs-on value that is neither derived from
-// runner_policy.py, a bare self-hosted label, the release.yml/rc-release.yml
-// conditional, nor an approved exception. It returns one violation string
+// runner_policy.py, a bare self-hosted label, nor an approved exception. It returns one violation string
 // per offending job, sorted for deterministic output.
 func checkRunnerLabels(root string) ([]string, error) {
 	pattern := filepath.Join(root, ".github", "workflows", "*.yml")
@@ -182,7 +166,6 @@ func checkRunnerLabels(root string) ([]string, error) {
 			labels := runnerLabels(runsOn)
 			if isPolicyDerived(labels) ||
 				isApprovedSelfHosted(labels) ||
-				isConditionalSelfHostedForUs(labels) ||
 				isApprovedHostedException(file, jobName) {
 				continue
 			}

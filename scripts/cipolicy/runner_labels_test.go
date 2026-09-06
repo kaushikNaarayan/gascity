@@ -27,8 +27,6 @@ jobs:
     runs-on: [self-hosted, gt2]
   bare-macos:
     runs-on: [self-hosted, macos]
-  conditional-for-us:
-    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
 `)
 
 	violations, err := checkRunnerLabels(dir)
@@ -37,6 +35,23 @@ jobs:
 	}
 	if len(violations) != 0 {
 		t.Fatalf("want no violations, got %v", violations)
+	}
+}
+
+func TestCheckRunnerLabelsRejectsHostedFallbackInReleaseWorkflow(t *testing.T) {
+	dir := t.TempDir()
+	writeWorkflow(t, dir, "release.yml", `
+jobs:
+  release:
+    runs-on: ${{ github.repository == 'material-lab-io/gascity' && fromJSON('["self-hosted","gt2"]') || 'ubuntu-latest' }}
+`)
+
+	violations, err := checkRunnerLabels(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) != 1 {
+		t.Fatalf("hosted release fallback must be rejected, got %v", violations)
 	}
 }
 
