@@ -15,8 +15,17 @@ import (
 // and is no longer reachable by the parent session's teardown (gcf-54l: a
 // forked `gc supervisor run` that keeps the launching shell's session ID
 // dies when that session is torn down, even with its own process group).
+//
+// Setsid alone is correct and sufficient: setsid(2) makes the child both a
+// new session leader AND the leader of a new process group, which is exactly
+// what detaching needs. Setpgid must NOT be combined with it (gcf-qoro):
+// Go's forkAndExecInChild runs setsid() first and then setpgid(0, 0), and
+// setpgid(2) returns EPERM when the calling process is already a session
+// leader. The child dies before execve and Go reports the failure as
+// "fork/exec <path>: operation not permitted" -- naming execve, which sends
+// every investigation after a phantom exec restriction.
 func backgroundSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setpgid: true, Setsid: true}
+	return &syscall.SysProcAttr{Setsid: true}
 }
 
 // logSessionLeaderInvariant asserts and logs that this process leads its
