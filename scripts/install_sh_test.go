@@ -50,6 +50,159 @@ func TestInstallScriptPlatformsAndTransactionalFailure(t *testing.T) {
 	}
 }
 
+// TestInstallScriptTargetsLiveGCOnPath guards against a default-path install
+// that "succeeds" while leaving the machine's actual live gc untouched: when
+// GC_INSTALL_DIR is not set, the installer must update whatever gc already
+// resolves on PATH, not silently write to ~/.local/bin instead.
+func TestInstallScriptTargetsLiveGCOnPath(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, live, home := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "live"), filepath.Join(tmp, "home")
+	for _, p := range []string{fixtures, fake, live, home} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeShim(t, filepath.Join(live, "gc"), "#!/bin/sh\necho old-gc\n")
+
+	osname, arch := "linux", "amd64"
+	gcAsset := "gascity_1.3.7_" + osname + "_" + arch + ".tar.gz"
+	doltVersion, bdVersion := "2.1.10", "v1.2.3"
+	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
+	bdAsset := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
+	writeArchive(t, fixtures, gcAsset, "gc", "gc")
+	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt")
+	writeArchive(t, fixtures, bdAsset, "bd", "bd")
+	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "gascity_1.3.7_checksums.txt"), []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(gcData), gcAsset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doltData, err := os.ReadFile(filepath.Join(fixtures, doltAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdData, err := os.ReadFile(filepath.Join(fixtures, bdAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
+
+	// live goes on PATH ahead of a minimal system PATH so `command -v gc`
+	// finds it, same as an interactive shell would. GC_INSTALL_DIR is
+	// deliberately unset.
+	path := fake + string(os.PathListSeparator) + live + string(os.PathListSeparator) + "/usr/bin:/bin"
+	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd.Env = append(os.Environ(),
+		"PATH="+path,
+		"HOME="+home,
+		"FIXTURES="+fixtures,
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_DOLT_VERSION="+doltVersion,
+		fmt.Sprintf("GC_DOLT_SHA256=%x", sha256.Sum256(doltData)),
+		"GC_BD_VERSION="+bdVersion,
+		fmt.Sprintf("GC_BD_SHA256=%x", sha256.Sum256(bdData)),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(filepath.Join(live, "gc"))
+	if err != nil || !strings.Contains(string(got), "gc") {
+		t.Fatalf("live gc at %s was not updated: %q, %v", filepath.Join(live, "gc"), got, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "gc")); err == nil {
+		t.Fatalf("installer silently wrote to the default ~/.local/bin instead of updating the live gc found on PATH")
+	}
+}
+
+// TestInstallScriptDefaultsWhenNoLiveGC covers the legitimate fresh-machine
+// case: no gc exists on PATH yet, so there is nothing to silently miss, and
+// the documented `curl | bash` flow must keep working without requiring
+// GC_INSTALL_DIR.
+func TestInstallScriptDefaultsWhenNoLiveGC(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, home := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "home")
+	for _, p := range []string{fixtures, fake, home} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	osname, arch := "linux", "amd64"
+	gcAsset := "gascity_1.3.7_" + osname + "_" + arch + ".tar.gz"
+	doltVersion, bdVersion := "2.1.10", "v1.2.3"
+	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
+	bdAsset := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
+	writeArchive(t, fixtures, gcAsset, "gc", "gc")
+	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt")
+	writeArchive(t, fixtures, bdAsset, "bd", "bd")
+	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "gascity_1.3.7_checksums.txt"), []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(gcData), gcAsset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doltData, err := os.ReadFile(filepath.Join(fixtures, doltAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdData, err := os.ReadFile(filepath.Join(fixtures, bdAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
+
+	// Deliberately no "live" dir on PATH and no GC_INSTALL_DIR: `command -v
+	// gc` must fail to resolve anything. Use a minimal system PATH rather
+	// than the inherited one — the test-runner's own PATH may well contain
+	// a real gc (e.g. ~/.local/bin), which would falsify "no live gc".
+	path := fake + string(os.PathListSeparator) + "/usr/bin:/bin"
+	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd.Env = append(os.Environ(),
+		"PATH="+path,
+		"HOME="+home,
+		"FIXTURES="+fixtures,
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_DOLT_VERSION="+doltVersion,
+		fmt.Sprintf("GC_DOLT_SHA256=%x", sha256.Sum256(doltData)),
+		"GC_BD_VERSION="+bdVersion,
+		fmt.Sprintf("GC_BD_SHA256=%x", sha256.Sum256(bdData)),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "gc")); err != nil {
+		t.Fatalf("installer did not fall back to ~/.local/bin when no live gc was found on PATH: %v", err)
+	}
+}
+
+// TestInstallScriptKeepsPrevBinaryOnSuccess guards the post-success revert
+// path: a regression found after a successful install must be a five-second
+// manual revert, not a founder-gated incident because the only backup was
+// deleted the moment the install committed.
+func TestInstallScriptKeepsPrevBinaryOnSuccess(t *testing.T) {
+	dir := runInstallFixture(t, "Linux", "x86_64", "")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, e := range entries {
+		if name, _, found := strings.Cut(e.Name(), ".prev-"); found {
+			kept[name] = true
+		}
+	}
+	for _, name := range []string{"gc", "dolt", "bd"} {
+		if !kept[name] {
+			t.Fatalf("no %s.prev-* backup kept after a successful install; dir: %v", name, entries)
+		}
+	}
+}
+
 func runInstallFixture(t *testing.T, goos, machine, failure string) string {
 	t.Helper()
 	root, tmp := repoRoot(t), t.TempDir()

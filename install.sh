@@ -7,7 +7,16 @@ set -euo pipefail
 
 repo="${GC_INSTALL_REPO:-material-lab-io/gascity}"
 version="${1:-${GC_VERSION:-}}"
-install_dir="${GC_INSTALL_DIR:-$HOME/.local/bin}"
+if [[ -n "${GC_INSTALL_DIR:-}" ]]; then
+  install_dir="$GC_INSTALL_DIR"
+elif live_gc="$(command -v gc 2>/dev/null)"; then
+  # A gc already resolves on PATH: that is the live install this machine
+  # actually runs. Target it, or a default-path install silently misses it
+  # and reports success having changed nothing.
+  install_dir="$(cd "$(dirname "$live_gc")" && pwd)"
+else
+  install_dir="$HOME/.local/bin"
+fi
 dolt_version="${GC_DOLT_VERSION:-}"
 dolt_sha="${GC_DOLT_SHA256:-}"
 bd_version="${GC_BD_VERSION:-}"
@@ -26,7 +35,13 @@ GC_BD_SHA256. Supply the checksum for the selected OS/architecture asset from
 the release manifest. This installer deliberately has no dependency defaults:
 the release manager owns the published gc/Dolt/bd compatibility tuple.
 
-Optional environment: GC_INSTALL_DIR (default: ~/.local/bin), GC_INSTALL_REPO.
+Optional environment: GC_INSTALL_DIR, GC_INSTALL_REPO. Without GC_INSTALL_DIR,
+the installer targets the directory of whatever gc already resolves on PATH
+(so an existing install is updated in place, not silently shadowed); only
+when no gc is found on PATH does it fall back to ~/.local/bin.
+
+On success, the previous gc/dolt/bd binaries are kept beside the new ones as
+<binary>.prev-<old-version> for a manual revert.
 EOF
 }
 
@@ -116,5 +131,29 @@ for binary in gc dolt bd; do
   mv -f "$temp_target" "$target"
 done
 committed=true
+
+# The rollback trap only restores backups for a failed attempt; once
+# committed those backups are about to be discarded with $tmp. Keep one
+# labeled copy of each replaced binary so a regression found after a
+# successful install has something to revert to.
+version_label() {
+  local backup="$1" line=""
+  line="$("$backup" version 2>/dev/null | head -n1 || true)"
+  line="$(printf '%s' "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -n1 || true)"
+  if [[ -z "$line" ]]; then
+    line="unknown-$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  printf '%s' "$line"
+}
+if [[ -d "$tmp/backups" ]]; then
+  for binary in gc dolt bd; do
+    backup="$tmp/backups/$binary"
+    [[ -e "$backup" ]] || continue
+    label="$(version_label "$backup")"
+    rm -f "$install_dir/${binary}.prev-"* 2>/dev/null || true
+    cp -p "$backup" "$install_dir/${binary}.prev-${label}"
+  done
+fi
+
 echo "Installed gc v${version}, Dolt ${dolt_version}, and bd ${bd_version} to ${install_dir}"
 case ":$PATH:" in *":$install_dir:"*) ;; *) echo "Add ${install_dir} to PATH to use gc." >&2 ;; esac
