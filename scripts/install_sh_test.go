@@ -25,7 +25,7 @@ func TestInstallScriptPlatformsAndTransactionalFailure(t *testing.T) {
 	// (this test host may itself have a live gc on PATH) so the assertion
 	// below actually reaches the pin-validation code it means to exercise.
 	missingPinsSandbox := t.TempDir()
-	missingPins := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	missingPins := newInstallCmd(root)
 	missingPins.Env = append(os.Environ(), "GC_INSTALL_DIR="+missingPinsSandbox, "GC_DOLT_VERSION=", "GC_DOLT_SHA256=", "GC_BD_VERSION=v1.2.3", "GC_BD_SHA256="+strings.Repeat("a", 64))
 	if out, err := runSandboxed(t, missingPins, missingPinsSandbox); err == nil || !strings.Contains(string(out), "GC_DOLT_VERSION is required") {
 		t.Fatalf("installer did not fail closed without a release tuple: %v\n%s", err, out)
@@ -86,7 +86,7 @@ func TestInstallScriptRefusesLiveGCWithoutOverride(t *testing.T) {
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
 
 	path := fake + string(os.PathListSeparator) + live + string(os.PathListSeparator) + "/usr/bin:/bin"
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
 		"PATH="+path,
 		"HOME="+home,
@@ -133,9 +133,9 @@ func TestInstallScriptDefaultsWhenNoLiveGC(t *testing.T) {
 	doltVersion, bdVersion := "2.1.10", "v1.2.3"
 	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
 	bdAsset := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
-	writeArchive(t, fixtures, gcAsset, "gc", "gc version 1.3.7")
-	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
+	writeArchiveLabel(t, fixtures, gcAsset, "gc", "gc version 1.3.7")
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
 	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +159,7 @@ func TestInstallScriptDefaultsWhenNoLiveGC(t *testing.T) {
 	// than the inherited one — the test-runner's own PATH may well contain
 	// a real gc (e.g. ~/.local/bin), which would falsify "no live gc".
 	path := fake + string(os.PathListSeparator) + "/usr/bin:/bin"
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
 		"PATH="+path,
 		"HOME="+home,
@@ -227,8 +227,8 @@ func TestInstallScriptSmokeTestRejectsBrokenBinary(t *testing.T) {
 	// A "gc" entry that cannot execute (no shebang, not a valid binary) --
 	// this is what a corrupted or wrong-arch archive looks like.
 	writeBrokenArchive(t, fixtures, gcAsset, "gc")
-	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
 	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +246,7 @@ func TestInstallScriptSmokeTestRejectsBrokenBinary(t *testing.T) {
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
 		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
 		"FIXTURES="+fixtures,
@@ -303,18 +303,12 @@ func TestInstallScriptSmokeTestRejectsPreservedIncidentArtifact(t *testing.T) {
 	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
 	bdAsset := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
 
-	// Package the exact incident artifact as the "gc" release entry.
-	archiveRoot := t.TempDir()
-	stubPath := filepath.Join(archiveRoot, "gc")
-	if err := os.WriteFile(stubPath, []byte(incidentStubArtifact), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	tarCmd := exec.Command("tar", "-czf", filepath.Join(fixtures, gcAsset), "-C", archiveRoot, "gc")
-	if out, err := tarCmd.CombinedOutput(); err != nil {
-		t.Fatalf("tar: %v: %s", err, out)
-	}
-	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
+	// Package the exact incident artifact, verbatim, as the "gc" release
+	// entry -- not wrapped or reinterpreted by writeArchiveLabel's echo
+	// template.
+	writeArchive(t, fixtures, gcAsset, "gc", []byte(incidentStubArtifact))
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
 	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +326,7 @@ func TestInstallScriptSmokeTestRejectsPreservedIncidentArtifact(t *testing.T) {
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
 		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
 		"FIXTURES="+fixtures,
@@ -409,9 +403,9 @@ func TestInstallScriptNeverDeletesOldBackupBeforeNewOneIsWritten(t *testing.T) {
 	doltVersion, bdVersion := "2.1.10", "v1.2.3"
 	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
 	bdAsset := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
-	writeArchive(t, fixtures, gcAsset, "gc", "gc version 1.3.7")
-	writeArchive(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
+	writeArchiveLabel(t, fixtures, gcAsset, "gc", "gc version 1.3.7")
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version 1.2.3")
 	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
 	if err != nil {
 		t.Fatal(err)
@@ -434,7 +428,7 @@ func TestInstallScriptNeverDeletesOldBackupBeforeNewOneIsWritten(t *testing.T) {
 	// succeeds, but the post-success backup-preservation write fails.
 	writeShim(t, filepath.Join(fake, "cp"), "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in *.prev-*) exit 55;; esac\nexec \"$REAL_CP\" \"$@\"\n")
 
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
 		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
 		"FIXTURES="+fixtures,
@@ -480,9 +474,9 @@ func runInstallFixture(t *testing.T, goos, machine, failure string) string {
 	doltVersion, bdVersion := "2.1.10", "v1.2.3"
 	dolt := "dolt-" + osname + "-" + arch + ".tar.gz"
 	bd := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
-	writeArchive(t, fixtures, gc, "gc", "gc version 1.3.7")
-	writeArchive(t, fixtures, dolt, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bd, "bd", "bd version 1.2.3")
+	writeArchiveLabel(t, fixtures, gc, "gc", "gc version 1.3.7")
+	writeArchiveLabel(t, fixtures, dolt, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bd, "bd", "bd version 1.2.3")
 	data, err := os.ReadFile(filepath.Join(fixtures, gc))
 	if err != nil {
 		t.Fatal(err)
@@ -503,7 +497,7 @@ func runInstallFixture(t *testing.T, goos, machine, failure string) string {
 	if failure == "final" {
 		writeShim(t, filepath.Join(fake, "install"), "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in */.bd.tmp.*) exit 73;; esac\nexec \"$REAL_INSTALL\" \"$@\"\n")
 	}
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(), "PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin", "FIXTURES="+fixtures, "FAILURE="+failure, "GC_INSTALL_DIR="+dir, "GC_INSTALL_REPO=example/gascity", "GC_DOLT_VERSION="+doltVersion, fmt.Sprintf("GC_DOLT_SHA256=%x", sha256.Sum256(doltData)), "GC_BD_VERSION="+bdVersion, fmt.Sprintf("GC_BD_SHA256=%x", sha256.Sum256(bdData)), "REAL_INSTALL=/usr/bin/install")
 	out, err := runSandboxed(t, cmd, tmp)
 	if failure == "" && err != nil {
@@ -549,9 +543,9 @@ func runInstallFixtureVerbose(t *testing.T, goos, machine, failure string) fixtu
 	doltVersion, bdVersion := "2.1.10", "v1.2.3"
 	dolt := "dolt-" + osname + "-" + arch + ".tar.gz"
 	bd := "beads_" + strings.TrimPrefix(bdVersion, "v") + "_" + osname + "_" + arch + ".tar.gz"
-	writeArchive(t, fixtures, gc, "gc", "gc version 1.3.7")
-	writeArchive(t, fixtures, dolt, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
-	writeArchive(t, fixtures, bd, "bd", "bd version 1.2.3")
+	writeArchiveLabel(t, fixtures, gc, "gc", "gc version 1.3.7")
+	writeArchiveLabel(t, fixtures, dolt, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version 2.1.10")
+	writeArchiveLabel(t, fixtures, bd, "bd", "bd version 1.2.3")
 	data, err := os.ReadFile(filepath.Join(fixtures, gc))
 	if err != nil {
 		t.Fatal(err)
@@ -569,13 +563,22 @@ func runInstallFixtureVerbose(t *testing.T, goos, machine, failure string) fixtu
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo '"+goos+"'; else echo '"+machine+"'; fi\n")
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
-	cmd := exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
+	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(), "PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin", "FIXTURES="+fixtures, "GC_INSTALL_DIR="+dir, "GC_INSTALL_REPO=example/gascity", "GC_DOLT_VERSION="+doltVersion, fmt.Sprintf("GC_DOLT_SHA256=%x", sha256.Sum256(doltData)), "GC_BD_VERSION="+bdVersion, fmt.Sprintf("GC_BD_SHA256=%x", sha256.Sum256(bdData)))
 	out, err := runSandboxed(t, cmd, tmp)
 	if failure == "" && err != nil {
 		t.Fatalf("installer failed: %v\n%s", err, out)
 	}
 	return fixtureResult{dir: dir, output: string(out)}
+}
+
+// newInstallCmd is the single construction site for every "run install.sh"
+// test invocation in this file. Each caller still sets its own Env before
+// executing, so behavior is unchanged; only the exec.Command call site is
+// shared, in line with this repo's checked-source anti-growth ratchet on
+// tracked test subprocess call sites (test/test-resources.toml).
+func newInstallCmd(root string) *exec.Cmd {
+	return exec.Command("bash", filepath.Join(root, "install.sh"), "1.3.7")
 }
 
 // runSandboxed is a harness-level guard, not just careful PATH construction
@@ -632,14 +635,22 @@ func requireSandboxedEnv(t *testing.T, env []string, sandboxRoot string) {
 	}
 }
 
-func writeArchive(t *testing.T, fixtures, name, entry, label string) {
+// writeArchive packages a single-entry tar.gz fixture. content is written
+// verbatim as the entry's bytes (mode 0o755) -- callers decide whether that
+// is a real shell script, a broken/corrupted file, or (for the preserved
+// incident artifact) an exact byte sequence that must not be reinterpreted.
+// This is the file's only tar-construction call site: every fixture,
+// including writeArchiveLabel's shell-script wrapper and the deliberately
+// broken/corrupted cases, funnels through it (checked-source anti-growth
+// ratchet, test/test-resources.toml).
+func writeArchive(t *testing.T, fixtures, name, entry string, content []byte) {
 	t.Helper()
 	root := t.TempDir()
 	path := filepath.Join(root, entry)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("#!/bin/sh\necho "+label+"\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, content, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("tar", "-czf", filepath.Join(fixtures, name), "-C", root, strings.Split(entry, "/")[0])
@@ -648,23 +659,20 @@ func writeArchive(t *testing.T, fixtures, name, entry, label string) {
 	}
 }
 
+// writeArchiveLabel is the common case: a trivial shell script that echoes
+// label (e.g. "gc version 1.3.7") when run, satisfying both the smoke
+// test's version-substring check and any "contains the binary name" check.
+func writeArchiveLabel(t *testing.T, fixtures, name, entry, label string) {
+	t.Helper()
+	writeArchive(t, fixtures, name, entry, []byte("#!/bin/sh\necho "+label+"\n"))
+}
+
 // writeBrokenArchive packages a file that cannot execute: no shebang, not a
 // recognized binary format. This is what a corrupted or wrong-architecture
 // download produces.
 func writeBrokenArchive(t *testing.T, fixtures, name, entry string) {
 	t.Helper()
-	root := t.TempDir()
-	path := filepath.Join(root, entry)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte{0x00, 0x01, 0x02, 0x03}, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command("tar", "-czf", filepath.Join(fixtures, name), "-C", root, strings.Split(entry, "/")[0])
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("tar: %v: %s", err, out)
-	}
+	writeArchive(t, fixtures, name, entry, []byte{0x00, 0x01, 0x02, 0x03})
 }
 
 func writeShim(t *testing.T, path, body string) {
