@@ -7198,7 +7198,8 @@ func TestOrderTrackingRetentionWatchdog_LogsPrunedCount(t *testing.T) {
 	}
 }
 
-func TestOrderTrackingRetentionWatchdog_NilCfgSkipsWithoutPanic(_ *testing.T) {
+func TestOrderTrackingRetentionWatchdog_NilCfgSkipsWithoutPanic(t *testing.T) {
+	stubManagedDoltStoreOpeners(t)
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 	cr := &CityRuntime{
 		cityName:  "test-city",
