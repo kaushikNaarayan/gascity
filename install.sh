@@ -168,16 +168,24 @@ install -m 0755 "$bd_source" "$stage/bd"
 # gcf-vxqx (2026-09-08): the incident swapped in a binary that could not run
 # and still reported success. Prove every staged binary actually executes
 # BEFORE it ever touches install_dir, not after.
+#
+# pm correction 2026-09-08 (gp-wisp-4rblst): the first version of this check
+# only asked for non-empty output. The preserved incident artifact
+# (`echo gc`) PASSES that: it exits 0 and prints "gc", non-empty. A
+# digit-dot-digit shape check would also miss it (and would wrongly accept a
+# correct-looking binary of the WRONG version -- a stale archive, an
+# interrupted download). Require the output to contain the exact version we
+# just asked to install, not merely look plausible.
 smoke_test() {
-  local bin="$1" name="$2" out
-  if out="$("$bin" version 2>&1)" && [[ -n "$out" ]]; then return 0; fi
-  if out="$("$bin" --version 2>&1)" && [[ -n "$out" ]]; then return 0; fi
-  echo "Smoke test failed for $name ($bin): it does not run a version command." >&2
+  local bin="$1" name="$2" want="$3" out
+  if out="$("$bin" version 2>&1)" && [[ -n "$out" && "$out" == *"$want"* ]]; then return 0; fi
+  if out="$("$bin" --version 2>&1)" && [[ -n "$out" && "$out" == *"$want"* ]]; then return 0; fi
+  echo "Smoke test failed for $name ($bin): expected output containing '$want', got: ${out:-<empty>}" >&2
   return 1
 }
-for binary in "${binaries[@]}"; do
-  smoke_test "$stage/$binary" "$binary" || { echo "Refusing to install: $binary failed its smoke test after download and extraction." >&2; exit 1; }
-done
+smoke_test "$stage/gc" gc "$version" || { echo "Refusing to install: gc failed its smoke test after download and extraction." >&2; exit 1; }
+"$install_dolt" && { smoke_test "$stage/dolt" dolt "$dolt_version" || { echo "Refusing to install: dolt failed its smoke test after download and extraction." >&2; exit 1; }; }
+smoke_test "$stage/bd" bd "${bd_version#v}" || { echo "Refusing to install: bd failed its smoke test after download and extraction." >&2; exit 1; }
 
 mkdir -p "$install_dir"
 mkdir -p "$tmp/backups" "$tmp/created"
