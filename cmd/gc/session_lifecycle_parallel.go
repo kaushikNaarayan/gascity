@@ -174,15 +174,15 @@ func (c startCandidate) name() string {
 	return c.info.SessionNameMetadata
 }
 
-// wakeFairnessTime is the ordering key for the per-tick wake budget: the time the
-// session was last woken (last_woke_at), falling back to its creation time so a
-// brand-new session does not jump ahead of one that has been waiting for a slot.
-// Oldest sorts first so the longest-waiting candidates spend the budget first.
-// It reads the typed twin (Info.LastWokeAt / Info.CreatedAt); the #2574-class
-// same-tick sleep->re-wake fairness (a SleepPatch clears last_woke_at before the
-// append, so the fallback to CreatedAt kicks in) is pinned by
-// TestWakeFairnessInfoTwinCharacterization.
+// wakeFairnessTime is the ordering key for the per-tick wake budget. A durable
+// wake_budget_spent_at wins when present: lifecycle sleep/drain and failed-start
+// rollback clear last_woke_at, but must not let the same old candidate reclaim a
+// slot forever. Legacy candidates fall back to last_woke_at then CreatedAt. Oldest
+// sorts first so the longest-waiting candidates spend the budget first.
 func wakeFairnessTime(c startCandidate) time.Time {
+	if t, err := time.Parse(time.RFC3339, c.info.WakeBudgetSpentAt); err == nil {
+		return t
+	}
 	if t, err := time.Parse(time.RFC3339, c.info.LastWokeAt); err == nil {
 		return t
 	}
@@ -190,6 +190,23 @@ func wakeFairnessTime(c startCandidate) time.Time {
 		return c.info.CreatedAt
 	}
 	return time.Time{}
+}
+
+// markWakeBudgetSpent records the fairness epoch only after a provider start has
+// been attempted. It deliberately is not part of preWakeCommit: failed
+// preparation never reaches a budget slot and must remain immediately retryable.
+// The returned fold keeps the typed candidate coherent with the durable store
+// without another read.
+func markWakeBudgetSpent(candidate *startCandidate, sessFront *sessionpkg.Store, clk clock.Clock) error {
+	if candidate == nil || strings.TrimSpace(candidate.info.ID) == "" {
+		return nil
+	}
+	patch := sessionpkg.MetadataPatch{"wake_budget_spent_at": clk.Now().UTC().Format(time.RFC3339Nano)}
+	if err := sessFront.ApplyPatch(candidate.info.ID, patch); err != nil {
+		return fmt.Errorf("recording wake-budget fairness epoch: %w", err)
+	}
+	candidate.info = candidate.info.ApplyPatch(patch)
+	return nil
 }
 
 // sortCandidatesByWakeFairness orders candidates least-recently-woken first so a
@@ -2072,6 +2089,15 @@ func commitStartResultTraced(
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, nil, result.phases)
 		return false
+	}
+	// A provider Start call has now completed (successfully or with an error), so
+	// this attempt consumed a wake slot. Persist its separate fairness epoch only
+	// here: metadata failure before the provider call must not age a candidate.
+	if err := markWakeBudgetSpent(&result.prepared.candidate, sessFront, clk); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: wake fairness epoch %s: %s\n", name, formatLifecycleError(err)) //nolint:errcheck
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "fairness_metadata_failed", result.started, result.finished, err, result.phases)
+	} else {
+		info = result.prepared.candidate.info
 	}
 	if result.err != nil {
 		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace)

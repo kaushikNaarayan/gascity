@@ -45,6 +45,7 @@ const (
 	sessionDrainableMetadataKey             = "session_drainable"
 	sessionProviderTerminalErrorMetadataKey = "provider_terminal_error"
 	sessionProviderTerminalErrorAtKey       = "provider_terminal_error_at"
+	sessionZombieCrashAccountedIdentityKey  = "zombie_crash_accounted_identity"
 )
 
 // wakeReasonsInfo and evaluateWakeReasonsInfo are the CLI `gc session`
@@ -68,6 +69,35 @@ func wakeReasonsInfo(
 	clk clock.Clock,
 ) []WakeReason {
 	return evaluateWakeReasonsInfo(info, cfg, sp, poolDesired, workSet, readyWaitSet, clk).Reasons
+}
+
+// zombieCrashIdentityInfo returns the durable runtime fence for crash
+// accounting. Only instance_token is proven to change per runtime. Legacy
+// sessions without one are intentionally not deduplicated: a generation or
+// session-bead-ID fallback could suppress a distinct replacement runtime.
+func zombieCrashIdentityInfo(info sessionpkg.Info) (string, bool) {
+	if token := strings.TrimSpace(info.InstanceToken); token != "" {
+		return "instance:" + token, true
+	}
+	return "", false
+}
+
+func zombieCrashAlreadyAccountedInfo(info sessionpkg.Info) bool {
+	identity, ok := zombieCrashIdentityInfo(info)
+	return ok && strings.TrimSpace(info.ZombieCrashAccountedIdentity) == identity
+}
+
+func markZombieCrashAccounted(info sessionpkg.Info, sessFront *sessionpkg.Store) (sessionpkg.Info, error) {
+	identity, ok := zombieCrashIdentityInfo(info)
+	if !ok {
+		return info, nil
+	}
+	if sessFront == nil {
+		return info, nil
+	}
+	return sessFront.ApplyPatchInfo(info, map[string]string{
+		sessionZombieCrashAccountedIdentityKey: identity,
+	})
 }
 
 func evaluateWakeReasonsInfo(

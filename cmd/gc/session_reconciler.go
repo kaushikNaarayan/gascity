@@ -2185,7 +2185,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						})
 					}
 				}
-				if !runtime.ContainsProviderRateLimitScreen(output) {
+				if !zombieCrashAlreadyAccountedInfo(infoByID[id]) && !runtime.ContainsProviderRateLimitScreen(output) {
+					if _, hasRuntimeIdentity := zombieCrashIdentityInfo(infoByID[id]); hasRuntimeIdentity {
+						markedInfo, markErr := markZombieCrashAccounted(infoByID[id], sessFront)
+						if markErr != nil {
+							fmt.Fprintf(stderr, "session reconciler: recording zombie crash identity for %s: %v\n", name, markErr) //nolint:errcheck
+							continue
+						}
+						tick.set(id, markedInfo)
+					}
 					rec.Record(events.Event{
 						Type:    events.SessionCrashed,
 						Actor:   "gc",

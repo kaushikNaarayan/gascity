@@ -200,6 +200,11 @@ type Info struct {
 	HealthState           string // session_health (raw)
 	HealthReason          string // session_health_reason (raw)
 	Drainable             bool   // session_drainable == "true"
+	// ZombieCrashAccountedIdentity records the instance identity whose zombie
+	// crash event was already emitted. It is deliberately distinct from the
+	// provider-terminal health marker: ordinary scrollback can be a real dead
+	// runtime even when it has no classified provider error.
+	ZombieCrashAccountedIdentity string // zombie_crash_accounted_identity (raw)
 
 	// --- trigger / brain-parent cluster (controller read surface) ---
 	//
@@ -276,6 +281,12 @@ type Info struct {
 	// start-in-flight) and parse it for the in-flight deadline, so the Info
 	// mirror keeps the raw value.
 	LastWokeAt string // last_woke_at (raw)
+	// WakeBudgetSpentAt is the RAW wake_budget_spent_at metadata (RFC3339 or
+	// empty). It is the durable fairness epoch written once a reconciler slot is
+	// committed to a provider start. Unlike LastWokeAt, lifecycle cleanup may
+	// clear the latter without making this candidate look as though it never
+	// consumed a wake slot.
+	WakeBudgetSpentAt string // wake_budget_spent_at (raw)
 	// AwakeStartedAt is the RAW awake_started_at metadata (RFC3339 or empty):
 	// the immutable start-of-awake-interval epoch that survives sleep/drain
 	// teardowns (unlike last_woke_at / pending_create_started_at, which are

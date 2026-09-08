@@ -83,10 +83,11 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		MCPIdentity:                b.Metadata[MCPIdentityMetadataKey],
 		MCPServersSnapshot:         b.Metadata[MCPServersSnapshotMetadataKey],
 
-		ProviderTerminalError: b.Metadata["provider_terminal_error"],
-		HealthState:           b.Metadata["session_health"],
-		HealthReason:          b.Metadata["session_health_reason"],
-		Drainable:             strings.TrimSpace(b.Metadata["session_drainable"]) == "true",
+		ProviderTerminalError:        b.Metadata["provider_terminal_error"],
+		HealthState:                  b.Metadata["session_health"],
+		HealthReason:                 b.Metadata["session_health_reason"],
+		Drainable:                    strings.TrimSpace(b.Metadata["session_drainable"]) == "true",
+		ZombieCrashAccountedIdentity: b.Metadata["zombie_crash_accounted_identity"],
 
 		TriggerBeadID:       b.Metadata[beadmeta.TriggerBeadIDMetadataKey],
 		TriggerBeadStoreRef: b.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey],
@@ -106,6 +107,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		ContinuityEligible:         b.Metadata["continuity_eligible"],
 		TransportMetadata:          b.Metadata["transport"],
 		LastWokeAt:                 b.Metadata["last_woke_at"],
+		WakeBudgetSpentAt:          b.Metadata["wake_budget_spent_at"],
 		AwakeStartedAt:             b.Metadata["awake_started_at"],
 		UsageComputeEmittedAt:      b.Metadata["usage_compute_emitted_at"],
 		StateReason:                b.Metadata["state_reason"],
