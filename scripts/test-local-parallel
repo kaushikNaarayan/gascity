@@ -75,7 +75,21 @@ cmd_gc_total="${CMD_GC_PROCESS_TOTAL:-6}"
 # in the per-job `env -i` allowlist below and is not prefixed onto their
 # jobspecs, so scripts/test-integration-shard keeps its own 30m default.
 # Adding it there would silently cut that budget from 30m to 20m.
-go_test_timeout="${GO_TEST_TIMEOUT:-20m}"
+# 2026-09-07 (gcf-uyo): raised 20m -> 40m. This is the SAME failure as ga-9au
+# described just above, recurring one level up.
+# MEASURED, not guessed: internal/productmetrics run ALONE on this box passes in
+# 660.9s (11.0 min) with ZERO failures. There is no flaky test and no code bug in
+# that package -- every test in it passes. Against a 20m budget that is only
+# 1.82x headroom, and the comment above already records that a package's fan-out
+# wall time runs "far above its runtime in isolation". 1.82x was never enough.
+# Under the gate it duly blew the budget (observed FAIL: 1200.129s -- exactly the
+# constant, i.e. a timeout, not a flake) and took the entire fork's push path down
+# with it: every push blocked for days, including the fixes for the outage itself.
+# Reducing fan-out was not available as a lever -- LOCAL_TEST_JOBS was already 2.
+# 40m gives ~3.6x over the measured isolation time.
+# This treats the SYMPTOM. The real defect is that a unit package takes 11
+# minutes at all; that is tracked separately and is not fixed here.
+go_test_timeout="${GO_TEST_TIMEOUT:-40m}"
 
 if ! [[ "$local_jobs" =~ ^[0-9]+$ && "$local_jobs" -gt 0 ]]; then
   echo "LOCAL_TEST_JOBS must be a positive integer" >&2

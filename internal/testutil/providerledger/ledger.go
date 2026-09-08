@@ -325,23 +325,28 @@ func provedRuntimeScoped(constructor SymbolRef, file, test, scope string, allowe
 }
 
 // runtimeWaiverExpiry dates every remaining runtime.Provider waiver owned by
-// runtimeContractWaiverOwner. The prior 2026-08-12 date lapsed and turned the
-// whole ledger check red, so this is a renewal, not a first grant.
+// runtimeContractWaiverOwner. This is the THIRD lapse-and-renewal, not the
+// second: 2026-08-12, then 2026-08-26, and now this one. Each gap was
+// re-checked against cmd/gc/runtime_registry.go: all eight constructors are
+// still live registrations (exec and ssh register via
+// RegisterPrefix("exec:"/"ssh:", ...) rather than by bare name — a plain name
+// grep will read them as dead) and none has gained a runnable full contract,
+// so none is retired as stale.
 //
-// Each gap was re-checked against cmd/gc/runtime_registry.go at renewal: all
-// eight constructors are still live registrations, and none has gained a
-// runnable full contract, so none was retired as stale. The subprocess
-// default-directory composition is the one that could be contracted instead of
-// renewed, and it was.
+// 30 days, deliberately, not the 90-day maxWaiverHorizon the validator
+// permits — for the same reason the previous author chose two weeks: a long
+// horizon hides a stalled track behind a green run. It keeps being too short
+// anyway, because the real problem isn't the horizon, it's that
+// runtimeContractWaiverOwner (ga-80po0c.3) does not resolve to anything on
+// this board — there is no bead to route the lapse to, so the mechanism's own
+// forcing function never fires, and it lapses again while the clock, not the
+// owner, does the deciding.
 //
-// Two weeks, deliberately, and not the 90-day maxWaiverHorizon the validator
-// permits. ga-80po0c.3's only open child has not moved since 2026-07-18, and
-// the same nine waivers already lapsed once and were extended — not
-// re-decided — to this date to unblock an unrelated PR. A long horizon would
-// hide a stalled track behind a green run; a short one puts the question back
-// in front of the owner while the context is still fresh. Renewing again
-// without contracts landing is debt, and the next renewal should say so.
-var runtimeWaiverExpiry = time.Date(2026, time.August, 26, 0, 0, 0, 0, time.UTC)
+// The actual fix is landing the eight contracts (gcf-mngr) so these waivers
+// can be retired instead of renewed a fourth time, and making the owner
+// routable with a pre-expiry warning (gcf-a4o8) so the next lapse reaches
+// someone before it reds main. Escalate to those, not to another renewal.
+var runtimeWaiverExpiry = time.Date(2026, time.October, 6, 0, 0, 0, 0, time.UTC)
 
 func waivedRuntime(constructor SymbolRef, reason string) ContractClaim {
 	return ContractClaim{
