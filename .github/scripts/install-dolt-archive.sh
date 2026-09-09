@@ -56,6 +56,10 @@ esac
 platform_tuple="${os}-${arch}"
 expected_sha=""
 case "${version}:${platform_tuple}" in
+  2.1.10:linux-amd64) expected_sha="bf6528c10db5b304eef3ee0107762ab4a93baa4c42be36b9f37eb67b35bb422c" ;;
+  2.1.10:linux-arm64) expected_sha="e816feb7294192e6292a0756e836248f63fb19bf0f18416bb66909c9e77d1b73" ;;
+  2.1.10:darwin-amd64) expected_sha="f2e548e89839a014f2f2b8caed0552110695699077f7e837596ff2ce6038852d" ;;
+  2.1.10:darwin-arm64) expected_sha="f2f784ee5905cdc573330d4c2813825633b72281408cb6cca3af948689d5284b" ;;
   2.1.7:linux-amd64) expected_sha="15983e811341ed94e5d47fbfc41d2f57d8c7aa65eee511d25a3c3fd5477e28e7" ;;
   2.1.7:linux-arm64) expected_sha="3edb3e5d05889f654dca548a8b6eb367551d4418ee0be5a79d94ea1c0f40ae8d" ;;
   2.1.7:darwin-amd64) expected_sha="67a551f6280ca0006844e1876d550dd4c750c5457d2c661dd7853b23cc5451a9" ;;
