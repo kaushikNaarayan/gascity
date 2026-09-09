@@ -46,6 +46,12 @@ const (
 	sqliteFenceChildRollbackCrash  = "rollback-crash"
 )
 
+// sqliteFenceHangBudget bounds the helper-process protocol waits. These are
+// hang detectors, not latency assertions: a child can re-exec the test binary,
+// initialize SQLite, and create a WAL before it signals readiness. A loaded
+// host must not turn that setup time into a false fence failure.
+const sqliteFenceHangBudget = 6 * testutil.ExecRaceTimeout
+
 // TestSQLiteFenceHelperProcess is entered only by the real-process fence
 // composition test below. The parent and source never share SQLite descriptors.
 func TestSQLiteFenceHelperProcess(t *testing.T) {
@@ -84,6 +90,16 @@ func TestSQLiteFenceHelperProcess(t *testing.T) {
 		runSQLiteFenceRollbackCrashChild(t, path)
 	default:
 		t.Fatalf("unknown SQLite fence child mode %q", mode)
+	}
+}
+
+func TestSQLiteFenceChildReadinessFailureClassifiesSetupOutput(t *testing.T) {
+	message := sqliteFenceChildReadinessFailure(sqliteFenceChildBoundaryHolder, "--- FAIL: TestSQLiteFenceHelperProcess")
+	if !strings.Contains(message, "setup failed before readiness") {
+		t.Fatalf("readiness failure = %q, want setup classification", message)
+	}
+	if strings.Contains(message, "fence behavior") {
+		t.Fatalf("readiness failure = %q, must not classify setup as fence behavior", message)
 	}
 }
 
@@ -1107,10 +1123,17 @@ func startSQLiteFenceChild(t *testing.T, cmd *exec.Cmd, mode, path string, waitR
 	t.Cleanup(func() { child.kill(t) })
 	if waitReady {
 		if line := child.line(t); line != "ready" {
-			t.Fatalf("SQLite child %q readiness = %q, want ready", mode, line)
+			t.Fatal(sqliteFenceChildReadinessFailure(mode, line))
 		}
 	}
 	return child
+}
+
+func sqliteFenceChildReadinessFailure(mode, line string) string {
+	if strings.HasPrefix(line, "--- FAIL:") {
+		return fmt.Sprintf("SQLite child %q setup failed before readiness: %s", mode, line)
+	}
+	return fmt.Sprintf("SQLite child %q readiness = %q, want ready", mode, line)
 }
 
 func runSQLiteFenceChild(t *testing.T, cmd *exec.Cmd, mode, path string) string {
@@ -1139,7 +1162,7 @@ func (c *sqliteFenceChild) line(t *testing.T) string {
 			ok   bool
 		}{line: c.stdout.Text(), ok: ok}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteFenceHangBudget)
 	defer cancel()
 	select {
 	case result := <-lines:
@@ -1148,7 +1171,7 @@ func (c *sqliteFenceChild) line(t *testing.T) string {
 		}
 		return result.line
 	case <-ctx.Done():
-		t.Fatalf("timed out waiting for SQLite child protocol line after %s", testutil.ExecRaceTimeout)
+		t.Fatalf("timed out waiting for SQLite child protocol line after %s", sqliteFenceHangBudget)
 		return ""
 	}
 }
@@ -1191,14 +1214,14 @@ func (c *sqliteFenceChild) wait(t *testing.T) error {
 	}
 	waited := make(chan error, 1)
 	go func() { waited <- c.cmd.Wait() }()
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteFenceHangBudget)
 	defer cancel()
 	select {
 	case err := <-waited:
 		c.finished = true
 		return err
 	case <-ctx.Done():
-		return fmt.Errorf("timed out after %s", testutil.ExecRaceTimeout)
+		return fmt.Errorf("timed out after %s", sqliteFenceHangBudget)
 	}
 }
 
