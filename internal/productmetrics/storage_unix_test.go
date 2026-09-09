@@ -26,13 +26,7 @@ import (
 
 func inspectStorageTestHome(t *testing.T, createRoot bool) gchome.ProductUsageHome {
 	t.Helper()
-	// The shared workspace lives below a deliberately group-writable /data.
-	// Put this trust-boundary fixture below the supported root-owned sticky
-	// ancestor instead.
-	trustedTempRoot := "/tmp"
-	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
-	}
+	trustedTempRoot := trustedMetricsTestTempRoot()
 	// Go 1.26's testing.T.TempDir prefers GOTMPDIR over TMPDIR. Set both so
 	// repository test runners may keep their build scratch space below /data
 	// without moving this trust-boundary fixture below that unsafe ancestor.
@@ -57,6 +51,16 @@ func inspectStorageTestHome(t *testing.T, createRoot bool) gchome.ProductUsageHo
 		t.Fatalf("InspectProductUsageHome: %v", err)
 	}
 	return inspection
+}
+
+// trustedMetricsTestTempRoot keeps durability-heavy productmetrics fixtures
+// below a root-owned sticky ancestor without competing for the shared /tmp
+// tmpfs used by concurrent test jobs.
+func trustedMetricsTestTempRoot() string {
+	if runtime.GOOS == "darwin" {
+		return "/private/var/tmp"
+	}
+	return "/var/tmp"
 }
 
 func TestStorageAtomicWriteUsesPrivateModesAndDurabilitySteps(t *testing.T) {
@@ -1002,10 +1006,7 @@ func TestStorageReadOnlyExistingDescendantOpenDoesNotRepair(t *testing.T) {
 }
 
 func TestStorageRootCreationRetryRecoversMissingIntermediateParentSync(t *testing.T) {
-	trustedTempRoot := "/tmp"
-	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
-	}
+	trustedTempRoot := trustedMetricsTestTempRoot()
 	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)
 	privateAncestor := t.TempDir()

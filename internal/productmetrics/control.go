@@ -161,6 +161,10 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 	if stateWait <= 0 {
 		stateWait = stateLockTimeout
 	}
+	postUploaderStateWait := service.deps.postUploaderStateWait
+	if postUploaderStateWait <= 0 {
+		postUploaderStateWait = stateLockTimeout
+	}
 	disableContext, cancelDisable := context.WithTimeout(ctx, stateWait)
 	token, disableErr := service.beginDisableAtRoot(disableContext, expected, root)
 	cancelDisable()
@@ -225,7 +229,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 		}
 	}()
 	incompletePhase = PurgeIncompleteLocalCleanup
-	stateContext, cancelState := context.WithTimeout(ctx, stateWait)
+	stateContext, cancelState := context.WithTimeout(ctx, postUploaderStateWait)
 	state, err := uploader.lockState(stateContext, service)
 	cancelState()
 	if err != nil {
