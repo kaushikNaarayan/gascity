@@ -12,10 +12,10 @@ func TestContainerCLIToolsRebuildWithPatchedGRPC(t *testing.T) {
 	const (
 		ghVersion                 = "2.96.0"
 		ghSourceRef               = "b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0"
-		doltSourceRef             = "781cbb730221ea7df4fc7995255bb336df9c3864"
+		doltSourceRef             = "45335d44ad79630377574c356c6617c2b248688b"
 		grpcVersion               = "1.82.1"
 		ghSourceSHA256            = "a0c18c98c73f7333f73e19b3a0bf5bd18673f3dc226193ab6478b3ea1ea18f03"
-		doltSourceSHA256          = "0b0c9bce8baef26baa7e0e5825cd2d7d6101daf6fc9673f38dac9670afb66847"
+		doltSourceSHA256          = "38c4f0589e96e03e134b4001392ad7babe2c2af854edbcd8d9450ceece9d7ef6"
 		doltToolchainRelease      = "20260611_0.0.5_trixie"
 		doltOptcrossX8664SHA256   = "caf703fb1cbc0c9ff9a5b506f73da6c6f5233c04a455e638cdc50267a4d0c0c0"
 		doltOptcrossAarch64SHA256 = "5635d0b38343fefb0c2b600d61c49ad9ceeaa1107bccdec8a60b1789100dc0ce"

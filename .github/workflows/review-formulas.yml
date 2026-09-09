@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  DOLT_VERSION: "2.1.7"
+  DOLT_VERSION: "2.1.10"
   BD_VERSION: "v1.1.0"
 
 jobs:
