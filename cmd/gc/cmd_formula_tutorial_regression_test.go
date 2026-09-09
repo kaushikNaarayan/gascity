@@ -9,10 +9,31 @@ import (
 	"testing"
 )
 
+// stubHermeticRemoteImportInstall replaces the package-level remote-import
+// installer with a hermetic fake for the duration of the test, restoring the
+// real installInitRemoteImports on cleanup. gc init's default (gascity)
+// template pins its [imports.gc] source at the canonical bundled commit
+// (config.PublicGascityPackVersion), which the production resolver is
+// supposed to serve from the binary's embedded pack content — but the
+// resolve-then-fetch path it runs through (packman.syncImports discovering
+// the transitive closure) reaches out to
+// https://github.com/gastownhall/gascity-packs.git for real before it ever
+// reaches the bundled-pin short-circuit, so any init test on this path
+// depends on ambient GitHub reachability/credentials. That's the seam this
+// helper substitutes; it does not change what gc init writes to city.toml,
+// which the caller can still assert on unmodified.
+func stubHermeticRemoteImportInstall(t *testing.T, fn func(string) error) {
+	t.Helper()
+	prev := ensureInitRemoteImportsInstalled
+	ensureInitRemoteImportsInstalled = fn
+	t.Cleanup(func() { ensureInitRemoteImportsInstalled = prev })
+}
+
 func TestInitMinimalProviderWritesWorkspaceProvider(t *testing.T) {
 	configureSupervisorHooksForTests()
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("PATH", os.Getenv("PATH"))
+	stubHermeticRemoteImportInstall(t, func(string) error { return nil })
 
 	cityDir := filepath.Join(t.TempDir(), "my-city")
 	var stdout, stderr bytes.Buffer
@@ -26,6 +47,30 @@ func TestInitMinimalProviderWritesWorkspaceProvider(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `provider = "claude"`) {
 		t.Fatalf("minimal init contract: city.toml should record workspace provider claude, got:\n%s", string(data))
+	}
+}
+
+// TestInitFailsClearlyWhenRemoteImportInstallUnavailable is the negative
+// control for the hermetic stub above: it proves the stub seam is load-
+// bearing (an import-install failure is still observable through the full
+// `gc init` CLI path) rather than a stub that would pass unconditionally
+// regardless of what ensureInitRemoteImportsInstalled reports.
+func TestInitFailsClearlyWhenRemoteImportInstallUnavailable(t *testing.T) {
+	configureSupervisorHooksForTests()
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("PATH", os.Getenv("PATH"))
+	stubHermeticRemoteImportInstall(t, func(string) error {
+		return errors.New("simulated unavailable import source")
+	})
+
+	cityDir := filepath.Join(t.TempDir(), "my-city")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"init", "--skip-provider-readiness", "--provider", "claude", cityDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("run(init) = 0, want non-zero when the import install is unavailable\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "simulated unavailable import source") {
+		t.Fatalf("stderr = %q, want it to surface the import install failure", stderr.String())
 	}
 }
 
