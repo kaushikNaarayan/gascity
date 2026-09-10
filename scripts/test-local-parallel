@@ -325,7 +325,24 @@ set +e
     echo "[$label] ok"
   else
     status=$?
-    echo "[$label] failed with exit ${status}; log: ${log}" >&2
+    # A shell reports a foreground child killed by a signal as its own exit
+    # status 128+signal (bash(1), EXIT STATUS). That collapses "the test
+    # actually failed" and "something outside the test (OOM killer, a
+    # resource-guard SIGKILL, host preemption) terminated it" into the same
+    # plain "failed" line — and a resource-killed run is indistinguishable
+    # from a real failure in every downstream log/triage without this (gcf-tt8:
+    # a whole-repo gate on a loaded host cannot tell load-induced kills from
+    # real regressions, so a red baseline it protects can never be proven
+    # clear). Surface the distinction explicitly; existing exit-status
+    # plumbing (the "$status" this job ultimately exits with, and exit 75 for
+    # push-gate slot starvation above) is unchanged.
+    if [[ "$status" -gt 128 && "$status" -lt 192 ]]; then
+      sig="$((status - 128))"
+      sig_name="$(kill -l "$sig" 2>/dev/null || echo "$sig")"
+      echo "[$label] KILLED by signal ${sig} (${sig_name}), not a test failure; exit ${status}; log: ${log}" >&2
+    else
+      echo "[$label] failed with exit ${status}; log: ${log}" >&2
+    fi
     sed -n '"'"'1,240p'"'"' "$log" >&2
     exit "$status"
   fi
