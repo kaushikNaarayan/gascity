@@ -48,11 +48,27 @@ expires = "2026-10-01"
 
 # Debt rows ratchet source call sites only. They are not test-size entries and
 # do not exempt or reclassify any test.
+#
+# PM ruling 2026-09-09 (gcf-ocze): baseline bumped +2 calls/+1 file for
+# scripts/install_sh_test.go's newInstallCmd/writeArchive helpers, which back
+# the gcf-vxqx installer smoke test (the control that would have caught the
+# stub-overwrite incident). Both helpers are non-runnable by census.go's
+# Test-shape check (wrong name/arity/return count), so they cannot be
+# expressed as a Medium owner no matter how the TOML is written -- verified
+# against internal/testpolicy/resourcecensus/census.go and medium.go, and by
+# a live ScanRepository probe. scripts/ already carries seven other
+# non-runnable shared-helper subprocess owners the same way
+# (runSplitTopologyGuard, goEnvValue, scriptCommand, testCommand, run,
+# shardTestCommand, runShardWithEnv), none Medium-attributed; this is the
+# eighth instance of an established, accepted shape, not a new precedent.
+# Inlining into a single Test body to force a Medium row was rejected
+# (PM ruling) because it would undo the b1963ca54 consolidation (11 exec.Command
+# construction sites -> 2) purely to satisfy bookkeeping.
 [[debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 411
-baseline_files = 117
+baseline_calls = 413
+baseline_files = 118
 reported_calls = 380
 reported_files = 98
 owner_bead = "ga-80po0c.2"
@@ -352,11 +368,14 @@ medium_reason = "package TestMain mutates process state"
 
 # Small-debt rows apply the exact Medium filter while the source-debt rows
 # above retain the raw anti-growth census.
+#
+# PM ruling 2026-09-09 (gcf-ocze): same +2 calls/+1 file bump and rationale
+# as the untagged debt row above -- see that comment.
 [[small_debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 404
-baseline_files = 113
+baseline_calls = 406
+baseline_files = 114
 reported_calls = 394
 reported_files = 105
 owner_bead = "ga-80po0c.2.1"
