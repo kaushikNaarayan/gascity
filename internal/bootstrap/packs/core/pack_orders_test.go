@@ -254,6 +254,54 @@ func TestRenudgeStaleHumanGatesOrder(t *testing.T) {
 	assertCooldownExecOrder(t, "renudge-stale-human-gates.toml", "renudge-stale-human-gates.sh")
 }
 
+// TestOrderFiringAlertOrder pins the order-firing-alert order's contract: it
+// is a cooldown-triggered exec order running the order-firing-alert script —
+// the backstop for gcf-pao6 (nothing previously ran `gc doctor` on a schedule,
+// so its order-firing-current check never actually alerted anyone).
+func TestOrderFiringAlertOrder(t *testing.T) {
+	assertCooldownExecOrder(t, "order-firing-alert.toml", "order-firing-alert.sh")
+}
+
+// TestOrderFiringAlertScriptContract guards the load-bearing behaviors of the
+// order-firing-alert script:
+//
+//   - It calls `gc doctor --json` with `set +e` around the capture: unrelated
+//     BLOCKING checks make `gc doctor` exit nonzero, and a bare
+//     `doctor_json=$(...)` under `set -e` would abort the sweep before it ever
+//     inspects order-firing-current.
+//   - It filters for the order-firing-current result by name (not by scanning
+//     the whole doctor summary), so other checks' failures never trigger this
+//     alert and this check's own status is never missed.
+//   - A clean ("ok") result must be a silent no-op — every cycle must not mail.
+//   - A non-ok result must escalate through escalate.sh (gc mail send), the
+//     shared primitive whose own dedup (open mail with the same subject)
+//     prevents a persistent stall from spamming a fresh mail every 15m cycle.
+func TestOrderFiringAlertScriptContract(t *testing.T) {
+	data, err := fs.ReadFile(PackFS, "assets/scripts/order-firing-alert.sh")
+	if err != nil {
+		t.Fatalf("reading order-firing-alert.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"gc doctor --json",
+		"order-firing-current",
+		`.results[] | select(.name == $name)`,
+		`"$status" = "ok"`,
+		"resolve_escalate_script",
+		"--subject",
+		"--severity",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("order-firing-alert.sh missing load-bearing element %q", want)
+		}
+	}
+
+	if !strings.Contains(body, "set +e") || !strings.Contains(body, "doctor_json=$(gc doctor --json") {
+		t.Error("order-firing-alert.sh must capture `gc doctor --json` under `set +e` so an unrelated blocking check's nonzero exit doesn't abort the sweep before order-firing-current is inspected")
+	}
+}
+
 // TestRenudgeStaleHumanGatesScriptContract guards the load-bearing behaviors of
 // the staleness re-nudge script. Like the creation-notify script its failures
 // are best-effort and swallowed at runtime, so the contract is pinned here:

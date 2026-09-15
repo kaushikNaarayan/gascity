@@ -1,0 +1,23 @@
+# order-firing-alert mails a human when the `order-firing-current` gc doctor
+# check goes stale or errors -- the backstop for gcf-pao6 (a companion
+# incident: the entire order-scheduling subsystem silently stopped firing for
+# ~7h, and nobody was told because nothing ever ran `gc doctor` on a cadence
+# in the first place).
+#
+# It is a cooldown sweep (mechanical: run `gc doctor --json`, inspect one
+# named result, mail on non-ok status -- no LLM judgment), mirroring
+# check-census-owner-liveness.sh's pattern for its own doctor check.
+# Escalation goes through escalate.sh, which already dedups on an existing
+# open mail with the same subject so a persistent stall re-alerts only after
+# the human clears the prior one.
+#
+# Interval is short relative to the ~1.5x-expected-interval threshold at
+# which order-firing-current first flags a warning, so a stall is caught
+# promptly rather than accumulating toward the incident's original 7h gap.
+# See assets/scripts/order-firing-alert.sh.
+[order]
+description = "Mail a human when the order-firing-current gc doctor check goes stale"
+trigger = "cooldown"
+interval = "15m"
+timeout = "60s"
+exec = "$PACK_DIR/assets/scripts/order-firing-alert.sh"
