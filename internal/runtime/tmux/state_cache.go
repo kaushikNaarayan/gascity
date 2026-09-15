@@ -375,7 +375,7 @@ func processMatchesNameSet(command, args string, names map[string]struct{}) bool
 		return false
 	}
 	command = filepath.Base(strings.TrimSpace(command))
-	if _, ok := names[command]; ok && command != "" {
+	if matchesNameOrRealVariant(command, names) {
 		return true
 	}
 	argv := strings.Fields(strings.TrimSpace(args))
@@ -383,7 +383,7 @@ func processMatchesNameSet(command, args string, names map[string]struct{}) bool
 		return false
 	}
 	argv0 := filepath.Base(argv[0])
-	if _, ok := names[argv0]; ok {
+	if matchesNameOrRealVariant(argv0, names) {
 		return true
 	}
 	if _, isInterpreter := knownInterpreters[argv0]; !isInterpreter {
@@ -406,6 +406,40 @@ func processMatchesNameSet(command, args string, names map[string]struct{}) bool
 			return true
 		}
 		break
+	}
+	return false
+}
+
+// realShimSuffix is the established Gas City host-binary wrapper convention:
+// a thin shim (e.g. gc, bd) execs into "<name>.real", which replaces the
+// process image so the OS-reported command/argv0 becomes "<name>.real"
+// instead of "<name>" (see cmd/gc/doctor_fork_rate.go's bd.real references,
+// and the schema-skew gc shim). Without this, a configured process_names
+// entry of "gc" can never match a pane actually running under the shim,
+// because filepath.Base never strips the suffix.
+const realShimSuffix = ".real"
+
+// matchesNameOrRealVariant reports whether base matches a configured process
+// name exactly, or matches after trimming a trailing ".real" shim suffix.
+// This is deliberately narrower than generic extension stripping (which the
+// knownInterpreters loop below already does for a different case, script
+// tokens after a node/bun/npx/deno interpreter): it recognizes only the one
+// documented Gas City wrapper suffix, so an unrelated same-stem binary (e.g.
+// a "foo.py" pane) does NOT spuriously match a configured "foo" process name.
+// Decided here per gcf-7gcj.2.7 AC3 rather than generalizing filepath.Ext
+// stripping to this branch, which would have introduced exactly that
+// collision.
+func matchesNameOrRealVariant(base string, names map[string]struct{}) bool {
+	if base == "" {
+		return false
+	}
+	if _, ok := names[base]; ok {
+		return true
+	}
+	if trimmed := strings.TrimSuffix(base, realShimSuffix); trimmed != base {
+		if _, ok := names[trimmed]; ok {
+			return true
+		}
 	}
 	return false
 }
