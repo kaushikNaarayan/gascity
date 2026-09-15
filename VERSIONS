@@ -30,13 +30,20 @@ DOLT_SHA256_LINUX_ARM64=e816feb7294192e6292a0756e836248f63fb19bf0f18416bb66909c9
 DOLT_SHA256_DARWIN_AMD64=f2e548e89839a014f2f2b8caed0552110695699077f7e837596ff2ce6038852d
 DOLT_SHA256_DARWIN_ARM64=f2f784ee5905cdc573330d4c2813825633b72281408cb6cca3af948689d5284b
 
-# bd (gastownhall/beads): HELD pending gcf-aetk G1 (build contract-test gate)
-# on candidate v1.3.0-rc.2. G2 (qa schema/migration gate) PASSED 2026-09-15
-# 03:36Z — migration mechanics (v59->v66, 7 migrations, --force on
-# server-mode) are clean on a real ledger copy in an isolated server. G3
-# (this release's own part — pull rc.2 assets and record checksums) is
-# already done. Do not merge this file with the bd line still empty; values
-# below are ready to promote once G1 passes:
+# bd (gastownhall/beads): HELD, gcf-aetk G1 FAILED 2026-09-15 03:5xZ — this
+# fork's gc cannot decode bd v1.3.0-rc.2's JSON contract (int64 revision
+# decoder vs rc.2's frozen string-revision shape, upstream #6053). PM ruling:
+# this is NOT a "wait for a later bd tag" situation — upstream froze the
+# contract before 1.3.0, so every future bd tag has the same shape. build is
+# porting upstream's gc-side compatibility fix (dual-shape decoder, from
+# upstream a95c730a5/#5830) onto mlhttps/main; v1.3.8 tags only once that
+# lands and G1 re-passes against BOTH bf97b73749ac and rc.2. G2 (qa
+# schema/migration gate) PASSED 2026-09-15 03:36Z — migration mechanics
+# (v59->v66, 7 migrations, --force on server-mode) are clean on a real
+# ledger copy in an isolated server. G3 (this release's own part — pull
+# rc.2 assets and record checksums) is already done. Do not merge this file
+# with the bd line still empty; values below are ready to promote once G1
+# re-passes:
 #
 # BD_VERSION=1.3.0-rc.2
 # BD_SHA256_LINUX_AMD64=e669c358a74e9d9cf244069797e2752a3bc5dd83332127f2dc15649f7f001080

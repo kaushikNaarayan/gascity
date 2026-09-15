@@ -51,8 +51,25 @@ install.sh rollout and are NOT blocked by this runbook.
 
 ## Preconditions before this runbook may be scheduled
 
+- [ ] **gc v1.3.8 (or later, dual bd-wire-shape decoder) is installed
+      and confirmed on EVERY host, BEFORE any bd binary swap.**
+      (PM ruling, gcf-aetk G1, 2026-09-15 03:5xZ.) The live gc
+      (1.4.0-506) decodes bd's revision field as int64; bd v1.3.0-rc.2
+      and later speak a string-revision JSON contract that decoder
+      cannot parse. Upstream froze this contract in #6053 before
+      1.3.0, so no future bd tag reverts it — waiting does not avoid
+      this precondition. gc v1.3.8 ports upstream's compatibility fix
+      (build, in progress as of this writing) and must speak BOTH the
+      old (bf97, int64) and new (rc.2+, string) wire shapes, because
+      the live fleet's bd stays on bf97 until this runbook's own
+      founder-gated window. **Any host still running the old gc after
+      a bd swap breaks on its first `bd show`** — this ordering is
+      not optional and is independent of, and precedes, everything
+      else in this runbook.
 - [ ] G1 (build's bd contract/integration-test gate) has PASSED for
-      the exact bd version being promoted.
+      the exact bd version being promoted, against BOTH bf97b73749ac
+      and the promoted bd version, on the same ported gc head, and
+      against the downloaded release asset (not only a source build).
 - [ ] The false "will refuse" claim has been either (a) confirmed as
       intended/reported upstream and a fix landed, or (b) accepted as
       a known gap that this runbook's step-ordering (binaries first,
@@ -73,6 +90,23 @@ live rig). Record: total wall-clock time, any manual intervention
 needed, and the exact `bd doctor` / read / write verification output
 at each stage. Do not schedule the real window until this rehearsal is
 clean.
+
+A full-copy rehearsal is FEASIBLE, not merely aspirational — QA
+measured the real live data dir (`.beads/dolt`) at 17G total (`hq`
+dominant at 14G/82%, `gy` 1.6G, everything else <120M), comfortably
+within the host's free disk. No need to fall back to a representative
+sample. `hq` alone should get its own explicit timing measurement
+during this step, since migration cost scales with row/table
+complexity, not raw bytes, and `hq` is the one database large enough
+to blow the assumed rehearsal-informs-real-window timing if it
+surprises.
+
+> **Caveat (QA, 2026-09-15):** do not use Dolt's
+> `information_schema.tables` `data_length`/`index_length` to size the
+> data for this decision — it returned an absurd ~7.2 EXABYTES for
+> `hq` in QA's own check. Dolt's information_schema size stats are not
+> reliable the way InnoDB's are. Measure with `du -sh` on the actual
+> data directory instead.
 
 ## Step a — Inventory every bd binary that can reach the shared server
 
@@ -105,6 +139,22 @@ against, not "the ones I remembered."
    ones). Confirm zero active writers via `SHOW FULL PROCESSLIST`
    before proceeding (same diagnostic pattern as the standing Dolt
    trouble-shooting steps every agent already follows).
+
+   **A rig-suspend alone is NOT sufficient (QA, 2026-09-15).** It
+   controls agent/gc sessions; it does not stop root/kanaba crontab
+   entries that shell out to `$GC` directly — QA identified at least
+   three (`offsite-backup-watch.sh` every 15 min + hourly fsck,
+   `gymbo-prod-uptime-watch.sh` every 5 min, both confirmed via grep
+   to run `bd create` on an incident/trip; `gc-rig-propel`
+   flagged with lower confidence since it drives agents that write
+   rather than writing directly). A cron firing mid-window would write
+   through whatever bd binary `$GC` resolves to at that moment —
+   possibly the old binary, per step a's own inventory logic. Before
+   proceeding: `crontab -l | grep` for every known `$GC`-invoking
+   writer (at minimum the three above) and either comment them out or
+   point `$GC` at a maintenance-mode/no-write path for the window
+   duration. Re-verify the crontab is unchanged immediately before the
+   real window — this audit does not stay valid indefinitely.
 2. Snapshot/backup **every** logical database on the server (all
    rigs' beads, not just gascity's) — Dolt's own commit/branch
    mechanism plus an out-of-band filesystem/volume snapshot if
@@ -155,14 +205,15 @@ together, or not at all.
   own authority — that is an outward-facing action pm gates
   separately (an internal P2 holds the repro in the meantime).
 
-## Open items for qa review
+## QA review (2026-09-15) — resolved
 
-- Confirm the drain/quiesce mechanism this runbook references (step
-  b.1) is sufficient to guarantee zero writers, not just zero
-  *known* agents — e.g., does anything write via a raw `bd` CLI
-  invocation outside the gc agent lifecycle that a rig-suspend would
-  not catch?
-- Confirm whether a full-copy rehearsal (step 0) is feasible in
-  practice given the live ledger's size, or whether a representative
-  sampled subset is an acceptable substitute — and if so, define
-  "representative."
+- **Drain/quiesce completeness**: rig-suspend does NOT catch crontab
+  writers. Resolved by amending step b.1 above with the named
+  cron-writer audit.
+- **Full-copy vs. representative-sample rehearsal**: full copy is
+  feasible (17G, measured via `du -sh`, comfortably within free disk).
+  Resolved by amending step 0 above; no sampling needed.
+
+Both findings are folded into the steps above rather than left open;
+this section is kept as a record of what QA's review caught, not as a
+pending-action list.
