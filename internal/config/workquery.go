@@ -257,33 +257,37 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
 }
 
-// ephemeralStatusSnapshotShell emits a memoized read of one ephemeral status
-// tier into shellVar, for the probes that filter it per identity.
+// ephemeralAssignedQueryLimit bounds the identity-scoped ephemeral queries
+// below. The assignee filter already narrows the server-side result to (in
+// practice) 0-1 rows, so this is defense in depth against a session that
+// somehow accumulated many assigned ephemeral rows turning back into an
+// effectively unbounded read, not the primary bound.
+const ephemeralAssignedQueryLimit = "5"
+
+// bdQueryEphemeralAssignedStatusShell scopes an ephemeral-status query to a
+// single assignee identity via the bd query language's own `assignee=`
+// clause, instead of fetching EVERY ephemeral row of the given status
+// city-wide (bdQueryEphemeralStatusShell's `--limit=0`) and filtering for
+// this session's assignee in jq after the fact.
 //
-// The scan itself is `bd query --limit=0` — unlimited, so a full-store
-// traversal — and it does not reference the identity the caller filters by:
-// the jq filters below select on `$id` AFTER the whole array is fetched. Both
-// probes are emitted INSIDE the `for id in ...` identity loops, so the same
-// identity-independent traversal ran once per identity, three times in the
-// standard tiers and up to six in the legacy control-dispatcher tiers, for a
-// result that cannot differ between them. On a store grown past a few seconds
-// per scan that is most of `gc hook`'s work-query budget (#5712).
+// That prior shape is the root cause pinned by gcf-uvx9: it is an unbounded
+// scan whose cost tracks the total ephemeral backlog rather than this
+// session's own footprint, issued up to 3x per hook probe (once per
+// GC_SESSION_ID/GC_SESSION_NAME/GC_ALIAS) with no concurrency guard on the
+// caller — the 2026-08-31 incident's root cause (424 -> 1325 stuck `bd`
+// processes as Dolt slowed and each individual probe grew unboundedly more
+// expensive along with the total backlog it scanned). Pushing the assignee
+// filter server-side makes each probe's cost O(this session's own rows)
+// instead of O(total ephemeral rows in the store), independent of how many
+// probes happen to be in flight at once.
 //
-// Reading it once and filtering the snapshot per identity is what the jq
-// filters were already written against. The read stays LAZY rather than being
-// hoisted to a prelude, which keeps two existing properties exactly: a tier
-// that serves a candidate and exits before reaching the probe still never
-// scans, and a query run with no identity set at all — the reconciler's
-// demand-detection form — still never enters the loop body, so it still never
-// scans.
-//
-// The trade is that identities 2 and 3 read the snapshot taken for identity 1
-// instead of a fresh one. That is the same trade ephemeralAssignedReadyProbeScript
-// already makes internally between its fast and slow filters, and a work query
-// is a point-in-time probe the caller re-runs regardless.
-func ephemeralStatusSnapshotShell(shellVar, status string) string {
-	return `[ -n "${` + shellVar + `_set:-}" ] || { ` + shellVar + `=$(` +
-		bdQueryEphemeralStatusQuietShell(status) + `); ` + shellVar + `_set=1; }; `
+// shellVar names the shell variable already holding the assignee value
+// (never interpolated as untrusted external input here — it is one of
+// GC_SESSION_ID/GC_SESSION_NAME/GC_ALIAS, populated by the controller, and
+// the same values already flow unquoted into --assignee= flags and
+// --metadata-field values elsewhere in this file, e.g. bdReadyPoolDemandShell).
+func bdQueryEphemeralAssignedStatusShell(status, shellVar string) string {
+	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=$` + shellVar + `" --limit=` + ephemeralAssignedQueryLimit + ` 2>/dev/null`
 }
 
 // ephemeralReadyBaseSelectorJQ composes the selector clauses shared by every
@@ -777,15 +781,17 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 // re-served on every hook tick (ga-qjozkw).
 func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology) string {
 	_ = topo
-	filter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `] | .[:1]`
+	// Assignee scoping now happens server-side in the `bd query` call itself
+	// (bdQueryEphemeralAssignedStatusShell) — see gcf-uvx9. The remaining jq
+	// stage only needs the hold-label exclusion and the .[:1] truncation.
+	filter := `[.[]` + excludeHoldLabelsJQClause() + `] | .[:1]`
 	// federated=false: this row comes from `bd query`, which never carries a
 	// resolved blocked_by, so the carried-lookup branch would only ever fall
 	// through to bd show — skip straight to it. checkHold=false: the filter
 	// above already excludes held candidates before the `.[:1]` truncation, so
 	// the post-truncation nheld check here would always read zero.
-	return ephemeralStatusSnapshotShell("in_progress_ephemeral", "in_progress") +
-		`r=$(printf "%s" "$in_progress_ephemeral" | ` +
-		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+	return `r=$(` + bdQueryEphemeralAssignedStatusShell("in_progress", shellVar) + ` | ` +
+		`jq ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		inProgressBlockedByEnrichmentScript(false, false) +
 		`fi; `
@@ -793,14 +799,14 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology)
 
 func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string, topo QueryTopology) string {
 	_ = topo
-	baseFilter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `]`
-	return ephemeralStatusSnapshotShell("gc_open_ephemeral_in_progress", "in_progress") +
-		`r=$(printf "%s" "$gc_open_ephemeral_in_progress" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(baseFilter+` | .[:1]`) + ` 2>/dev/null); ` +
+	baseFilter := `[.[]` + excludeHoldLabelsJQClause() + `]`
+	return `gc_open_ephemeral_in_progress=$(` + bdQueryEphemeralAssignedStatusShell("in_progress", shellVar) + `); ` +
+		`r=$(printf "%s" "$gc_open_ephemeral_in_progress" | jq ` + shellquote.Quote(baseFilter+` | .[:1]`) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		inProgressBlockedByEnrichmentScriptDeferringGraphAnchor(false, false) +
 		`fi; ` +
 		`if [ -n "$gc_assigned_workflow_anchor_json" ]; then ` +
-		`r=$(printf "%s" "$gc_open_ephemeral_in_progress" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(baseFilter+` | .[:20]`) + ` 2>/dev/null); ` +
+		`r=$(printf "%s" "$gc_open_ephemeral_in_progress" | jq ` + shellquote.Quote(baseFilter+` | .[:20]`) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		serveOrdinaryInProgressCandidateScript(false, false) +
 		`fi; ` +
@@ -826,12 +832,16 @@ func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) stri
 	if topo.includeEphemeralReady() {
 		return ""
 	}
-	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	return ephemeralStatusSnapshotShell("open_ephemeral", "open") +
-		`r=$(printf "%s" "$open_ephemeral" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
+	// Assignee scoping now happens server-side in the `bd query` call itself
+	// (bdQueryEphemeralAssignedStatusShell) — see gcf-uvx9. `.` is the
+	// identity selector: these filters compose as `.[] | <selector> | ...`,
+	// and the assignee comparison that used to fill that slot is gone.
+	fastFilter := legacyEphemeralReadyFilterJQ(`.`, 1, false)
+	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`.`, 1, false)
+	return `open_ephemeral=$(` + bdQueryEphemeralAssignedStatusShell("open", shellVar) + `); ` +
+		`r=$(printf "%s" "$open_ephemeral" | jq ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`r=$(printf "%s" "$open_ephemeral" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(slowFilter) + ` 2>/dev/null); ` +
+		`r=$(printf "%s" "$open_ephemeral" | jq ` + shellquote.Quote(slowFilter) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		// federated=false: this row comes from `bd query`, which never
 		// carries a resolved blocked_by, so skip straight to the bd show
