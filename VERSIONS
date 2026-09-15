@@ -30,27 +30,25 @@ DOLT_SHA256_LINUX_ARM64=e816feb7294192e6292a0756e836248f63fb19bf0f18416bb66909c9
 DOLT_SHA256_DARWIN_AMD64=f2e548e89839a014f2f2b8caed0552110695699077f7e837596ff2ce6038852d
 DOLT_SHA256_DARWIN_ARM64=f2f784ee5905cdc573330d4c2813825633b72281408cb6cca3af948689d5284b
 
-# bd (gastownhall/beads): HELD, gcf-aetk G1 FAILED 2026-09-15 03:5xZ — this
-# fork's gc cannot decode bd v1.3.0-rc.2's JSON contract (int64 revision
-# decoder vs rc.2's frozen string-revision shape, upstream #6053). PM ruling:
-# this is NOT a "wait for a later bd tag" situation — upstream froze the
-# contract before 1.3.0, so every future bd tag has the same shape. build is
-# porting upstream's gc-side compatibility fix (dual-shape decoder, from
-# upstream a95c730a5/#5830) onto mlhttps/main; v1.3.8 tags only once that
-# lands and G1 re-passes against BOTH bf97b73749ac and rc.2. G2 (qa
-# schema/migration gate) PASSED 2026-09-15 03:36Z — migration mechanics
-# (v59->v66, 7 migrations, --force on server-mode) are clean on a real
-# ledger copy in an isolated server. G3 (this release's own part — pull
-# rc.2 assets and record checksums) is already done. Do not merge this file
-# with the bd line still empty; values below are ready to promote once G1
-# re-passes:
-#
-# BD_VERSION=1.3.0-rc.2
-# BD_SHA256_LINUX_AMD64=e669c358a74e9d9cf244069797e2752a3bc5dd83332127f2dc15649f7f001080
-# BD_SHA256_LINUX_ARM64=3d01b7b7683e8d1d480fdf538d355462337c534434a146601e1dcc5d67db6149
-# BD_SHA256_DARWIN_AMD64=a8d3ff137714089e55a5d62deb9c12459c1537de54ff6e7a507e0d6f0eb91cae
-# BD_SHA256_DARWIN_ARM64=ac132fbf451b479f75b98e7a02f86455aef5418762c527456ff14cdcdee944b9
-#
+# bd (gastownhall/beads): RULED IN 2026-09-15 ~15:0xZ. gcf-aetk G1 FAILED
+# 2026-09-15 03:5xZ (this fork's gc could not decode bd v1.3.0-rc.2's JSON
+# contract — int64 revision decoder vs rc.2's frozen string-revision shape,
+# upstream #6053) but is now CLOSED: PR #49 (bb4ca5ece, dual-shape
+# bdRevision decoder ported from upstream a95c730a5/#5830) merged to
+# mlhttps/main as f3e9f6ce2 after fork-verify green + independent qa PASS
+# (TestBdStoreReleaseIfCurrentAgainstRealBd, 6/6 subtests, run against both
+# bf97b73749ac and the downloaded rc.2 release asset — both decode branches
+# exercised for real, not read-only). G2 (qa schema/migration gate) PASSED
+# 2026-09-15 03:36Z — migration mechanics (v59->v66, 7 migrations, --force
+# on server-mode) are clean on a real ledger copy in an isolated server. G3
+# (this release's own part — pull rc.2 assets and record checksums) done;
+# checksums below verified against the published checksums.txt.
+BD_VERSION=1.3.0-rc.2
+BD_SHA256_LINUX_AMD64=e669c358a74e9d9cf244069797e2752a3bc5dd83332127f2dc15649f7f001080
+BD_SHA256_LINUX_ARM64=3d01b7b7683e8d1d480fdf538d355462337c534434a146601e1dcc5d67db6149
+BD_SHA256_DARWIN_AMD64=a8d3ff137714089e55a5d62deb9c12459c1537de54ff6e7a507e0d6f0eb91cae
+BD_SHA256_DARWIN_ARM64=ac132fbf451b479f75b98e7a02f86455aef5418762c527456ff14cdcdee944b9
+
 # NOTE (mandatory, PM ruling 2026-09-15 03:36Z): installing this bd against
 # an existing v59 town ledger requires the coordinated migration runbook —
 # see docs/runbooks/bd-v59-to-v66-fleet-migration.md. Do NOT install this bd
