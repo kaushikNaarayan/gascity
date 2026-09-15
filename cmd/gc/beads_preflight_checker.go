@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -20,9 +22,34 @@ func newBeadsPreflightChecker(cityPath, provider string) contract.PreflightCheck
 	}
 }
 
+// preflightScopeIsRig reports whether scope is a rig subdirectory of the
+// city (needing the rig-aware bd runner) rather than the city root itself.
+// Comparison MUST resolve symlinks: on macOS in particular, cityPath and a
+// rig-declared scope can be the identical directory reached through
+// different spellings (e.g. /tmp vs the OS's real /private/tmp), and a
+// lexical-only compare (filepath.Clean) would treat that as two different
+// scopes, silently downgrading a real city-scope preflight into a
+// rig-scoped one (gcf-bym6). samePath resolves symlinks before comparing.
+func preflightScopeIsRig(scope, cityPath string) bool {
+	return !samePath(scope, cityPath)
+}
+
 func preflightBDContextReader(cityPath string) func(scope string) (contract.PreflightBDContext, error) {
+	var cfg *config.City
 	return func(scope string) (contract.PreflightBDContext, error) {
-		out, err := bdCommandRunnerForCity(cityPath)(scope, "bd", "context", "--json")
+		// Context is scope-specific.  Using the city runner for a rig pins
+		// BEADS_DIR to the rig while leaving the Dolt mode/database projection
+		// on the city, so bd can report embedded (or the wrong database) even
+		// when the rig metadata declares server mode.  Select the same
+		// rig-aware environment used by the eventual fallback store.
+		runner := bdCommandRunnerForCity(cityPath)
+		if preflightScopeIsRig(scope, cityPath) {
+			if cfg == nil {
+				cfg, _ = loadCityConfig(cityPath, io.Discard)
+			}
+			runner = bdCommandRunnerForRig(cityPath, cfg, scope)
+		}
+		out, err := runner(scope, "bd", "context", "--json")
 		if err != nil {
 			return contract.PreflightBDContext{}, err
 		}
