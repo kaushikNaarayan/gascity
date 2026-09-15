@@ -252,7 +252,6 @@ func evaluatePendingPools(
 		}
 		sp.Check = prefixShellEnv(controllerQueryPrefixEnv(probeEnv), sp.Check)
 		template := cfg.Agents[pw.agentIdx].QualifiedName()
-		probeEnv[probeTargetEnv] = template
 		agentName := cfg.Agents[pw.agentIdx].Name
 		agentIndex := pw.agentIdx
 		newDemand := pw.newDemand
@@ -264,9 +263,9 @@ func evaluatePendingPools(
 			var d int
 			var err error
 			if newDemand {
-				d, err = evaluatePoolNewDemand(agentName, sp, dir, env, shellScaleCheck)
+				d, err = evaluatePoolNewDemand(agentName, sp, dir, env, probeFlightRunner(template, shellScaleCheckUnflighted))
 			} else {
-				d, err = evaluatePool(agentName, sp, dir, env, shellScaleCheck)
+				d, err = evaluatePool(agentName, sp, dir, env, probeFlightRunner(template, shellScaleCheckUnflighted))
 			}
 			evalResults[idx] = poolEvalResult{desired: d, err: err}
 			if trace != nil {

@@ -63,8 +63,6 @@ const bdProbeTimeoutFloor = 5 * time.Second
 // synchronously in the reconciler loop and should not stall a tick.
 const hookTimeout = 30 * time.Second
 
-const probeTargetEnv = "GC_INTERNAL_PROBE_TARGET"
-
 var (
 	errProbeAlreadyInFlight = errors.New("probe already in flight")
 	probeFlights            = struct {
@@ -72,6 +70,27 @@ var (
 		active map[string]struct{}
 	}{active: make(map[string]struct{})}
 )
+
+// acquireProbeFlight claims key for the caller's probe, returning false if
+// another probe already holds it. Factored out of shellScaleCheckWithTimeout
+// so probeFlightRunner can key on a caller-supplied target instead of the
+// command string, using the same lock.
+func acquireProbeFlight(key string) bool {
+	probeFlights.Lock()
+	defer probeFlights.Unlock()
+	if _, ok := probeFlights.active[key]; ok {
+		return false
+	}
+	probeFlights.active[key] = struct{}{}
+	return true
+}
+
+// releaseProbeFlight releases a key previously claimed by acquireProbeFlight.
+func releaseProbeFlight(key string) {
+	probeFlights.Lock()
+	delete(probeFlights.active, key)
+	probeFlights.Unlock()
+}
 
 // shellCommand runs a command via sh -c with the given timeout and returns
 // stdout. On Unix the command owns a process group so cancellation reaps the
@@ -123,38 +142,57 @@ func shellScaleCheck(command, dir string, env map[string]string) (string, error)
 }
 
 func shellScaleCheckWithTimeout(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
-	key := probeFlightKey(command, dir, env)
-	probeFlights.Lock()
-	if _, ok := probeFlights.active[key]; ok {
-		probeFlights.Unlock()
-		return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, probeFlightTarget(command, env))
+	key := probeFlightKeyFor(dir, env, command)
+	if !acquireProbeFlight(key) {
+		return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, command)
 	}
-	probeFlights.active[key] = struct{}{}
-	probeFlights.Unlock()
-	defer func() {
-		probeFlights.Lock()
-		delete(probeFlights.active, key)
-		probeFlights.Unlock()
-	}()
-
-	commandEnv := cloneStringMap(env)
-	delete(commandEnv, probeTargetEnv)
-	return shellCommand(command, dir, timeout, commandEnv)
+	defer releaseProbeFlight(key)
+	return shellCommand(command, dir, timeout, env)
 }
 
-func probeFlightKey(command, dir string, env map[string]string) string {
+// shellScaleCheckUnflighted has the same signature as shellScaleCheck (it IS
+// a ScaleCheckRunner) but skips the command-keyed flight lock. It exists so
+// probeFlightRunner has an inner path to call after acquiring its own
+// target-keyed lock — passing shellScaleCheck itself to probeFlightRunner
+// would lock twice per probe (once on target, once on command inside
+// shellScaleCheckWithTimeout), which lets two different-target probes that
+// happen to share a command string block each other. That is a behaviour
+// change from single-flighting only on target, so callers that want
+// target-based single-flighting must route through this unflighted path.
+func shellScaleCheckUnflighted(command, dir string, env map[string]string) (string, error) {
+	return shellCommand(command, dir, parseBDProbeTimeout(os.Stderr), env)
+}
+
+// probeFlightRunner returns a ScaleCheckRunner that single-flights on target
+// (scope + target, scope from GC_STORE_ROOT/env or dir) instead of on the
+// command string, then calls run. Producers that already know their probe's
+// logical target (a qualified agent name, a template) use this so probes
+// sharing a target dedupe even if their generated command text differs
+// slightly, and probes with different targets never block each other even if
+// their command text happens to match. run must not itself acquire the
+// command-keyed flight lock (use shellScaleCheckUnflighted, not
+// shellScaleCheck) or a probe will double-lock — see shellScaleCheckUnflighted.
+func probeFlightRunner(target string, run ScaleCheckRunner) ScaleCheckRunner {
+	return func(command, dir string, env map[string]string) (string, error) {
+		key := probeFlightKeyFor(dir, env, target)
+		if !acquireProbeFlight(key) {
+			return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, target)
+		}
+		defer releaseProbeFlight(key)
+		return run(command, dir, env)
+	}
+}
+
+// probeFlightKeyFor builds the flight-lock key: scope (GC_STORE_ROOT from env,
+// else dir) plus the caller's chosen target — the command string for ordinary
+// shellScaleCheck callers, or a caller-supplied logical target for
+// probeFlightRunner.
+func probeFlightKeyFor(dir string, env map[string]string, target string) string {
 	scope := strings.TrimSpace(env["GC_STORE_ROOT"])
 	if scope == "" {
 		scope = dir
 	}
-	return scope + "\x00" + probeFlightTarget(command, env)
-}
-
-func probeFlightTarget(command string, env map[string]string) string {
-	if target := strings.TrimSpace(env[probeTargetEnv]); target != "" {
-		return target
-	}
-	return command
+	return scope + "\x00" + target
 }
 
 // shellRunHook runs a lifecycle hook command (on_death, on_boot) via

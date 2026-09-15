@@ -4,10 +4,12 @@
 // computeWorkSet is the legacy controller-side work_query helper. It
 // parallelizes runner calls under a bounded semaphore (see bdProbeConcurrency
 // in pool.go), so any ScaleCheckRunner passed to it must be safe to invoke
-// from multiple goroutines concurrently. shellScaleCheck is safe because it
-// only reads its arguments and spawns an independent subprocess. Map mutations
-// on beads.Bead.Metadata are visible to callers by design (maps are reference
-// types).
+// from multiple goroutines concurrently. computeWorkSet wraps the injected
+// runner per probe with probeFlightRunner(qn, runner), so callers must pass
+// an unflighted runner (shellScaleCheckUnflighted), not shellScaleCheck — the
+// latter would double-lock (see probeFlightRunner's doc in pool.go). Map
+// mutations on beads.Bead.Metadata are visible to callers by design (maps are
+// reference types).
 package main
 
 import (
@@ -357,7 +359,6 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 		if probeEnv == nil {
 			probeEnv = map[string]string{}
 		}
-		probeEnv[probeTargetEnv] = qn
 		probes = append(probes, probeWork{qn: qn, wq: wq, dir: agentCommandDir(cityDir, a, cfg.Rigs), env: probeEnv})
 	}
 
@@ -370,7 +371,7 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out, err := runner(probes[idx].wq, probes[idx].dir, probes[idx].env)
+			out, err := probeFlightRunner(probes[idx].qn, runner)(probes[idx].wq, probes[idx].dir, probes[idx].env)
 			if err != nil {
 				if errors.Is(err, errProbeAlreadyInFlight) {
 					fmt.Fprintf(stderr, "session reconcile: work query probe %s skipped: %v\n", probes[idx].qn, err) //nolint:errcheck
