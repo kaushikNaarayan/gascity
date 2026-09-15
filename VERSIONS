@@ -1,0 +1,44 @@
+# Published compatibility manifest for material-lab-io/gascity releases.
+#
+# This is the "release manifest" install.sh's usage text refers to: the exact
+# gc + Dolt + bd tuple for a given gc release, with per-OS/arch SHA256
+# checksums so a caller (human or rollout script) does not have to
+# hand-assemble them. See gcf-aetk (AC-M1/AC-M2/AC-M3) and install.sh's own
+# header for the contract this file exists to satisfy.
+#
+# Format: KEY=VALUE, one pin/checksum per line. Checksums are named
+# <DEP>_SHA256_<OS>_<ARCH>, uppercase, matching install.sh's os/arch values
+# (linux|darwin, amd64|arm64).
+#
+# gc's own release archive is verified against the release's own
+# gascity_<version>_checksums.txt (goreleaser-generated, fetched
+# automatically by install.sh) — it does not need a checksum entry here.
+# GC_VERSION below exists so a reader/script has one place to see the whole
+# pinned tuple at a glance.
+
+GC_VERSION=1.3.8
+
+# Dolt 2.1.10 (dolthub/dolt), reconfirmed 2026-09-15 by fresh download +
+# sha256sum against the published release (not copied from a prior note).
+# darwin is intentionally absent from install.sh's own Dolt install path
+# (Homebrew-owned there per gcf-ocze option B) but the checksums are
+# recorded here anyway for completeness / for anything that verifies a
+# darwin Dolt tarball out of band.
+DOLT_VERSION=2.1.10
+DOLT_SHA256_LINUX_AMD64=bf6528c10db5b304eef3ee0107762ab4a93baa4c42be36b9f37eb67b35bb422c
+DOLT_SHA256_LINUX_ARM64=e816feb7294192e6292a0756e836248f63fb19bf0f18416bb66909c9e77d1b73
+DOLT_SHA256_DARWIN_AMD64=f2e548e89839a014f2f2b8caed0552110695699077f7e837596ff2ce6038852d
+DOLT_SHA256_DARWIN_ARM64=f2f784ee5905cdc573330d4c2813825633b72281408cb6cca3af948689d5284b
+
+# bd (gastownhall/beads): HELD pending gcf-aetk G1 (build contract-test gate)
+# and G2 (qa schema/migration gate) on candidate v1.3.0-rc.2. Do not merge
+# this file with the bd line still empty — see gcf-aetk PM ruling
+# 2026-09-15 03:22Z. G3 (this release's own part — pull rc.2 assets and
+# record checksums) is already done; values below are ready to promote once
+# G1/G2 pass:
+#
+# BD_VERSION=1.3.0-rc.2
+# BD_SHA256_LINUX_AMD64=e669c358a74e9d9cf244069797e2752a3bc5dd83332127f2dc15649f7f001080
+# BD_SHA256_LINUX_ARM64=3d01b7b7683e8d1d480fdf538d355462337c534434a146601e1dcc5d67db6149
+# BD_SHA256_DARWIN_AMD64=a8d3ff137714089e55a5d62deb9c12459c1537de54ff6e7a507e0d6f0eb91cae
+# BD_SHA256_DARWIN_ARM64=ac132fbf451b479f75b98e7a02f86455aef5418762c527456ff14cdcdee944b9
