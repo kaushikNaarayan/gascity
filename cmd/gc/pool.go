@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -35,10 +37,9 @@ type poolSessionRef struct {
 // Implementations MUST be safe to invoke concurrently from multiple
 // goroutines. Both evaluatePendingPools and computeWorkSet dispatch
 // runner calls in parallel, bounded by bdProbeConcurrency. The
-// production implementation shellScaleCheck satisfies this trivially
-// because it only reads its arguments and spawns an independent
-// subprocess; test doubles should avoid shared mutable state or
-// protect it explicitly.
+// production implementation shellScaleCheck single-flights identical
+// targets while allowing different targets to run concurrently; test
+// doubles should avoid shared mutable state or protect it explicitly.
 type ScaleCheckRunner func(command, dir string, env map[string]string) (string, error)
 
 // Default bd probe concurrency is config.DefaultProbeConcurrency (8).
@@ -62,15 +63,46 @@ const bdProbeTimeoutFloor = 5 * time.Second
 // synchronously in the reconciler loop and should not stall a tick.
 const hookTimeout = 30 * time.Second
 
-// shellCommand runs a command via sh -c with the given timeout and
-// returns stdout. dir sets the command's working directory. When env is
-// non-nil, it is merged into the subprocess environment after sanitizing
-// inherited GC_DOLT_* and BEADS_* keys.
+var (
+	errProbeAlreadyInFlight = errors.New("probe already in flight")
+	probeFlights            = struct {
+		sync.Mutex
+		active map[string]struct{}
+	}{active: make(map[string]struct{})}
+)
+
+// acquireProbeFlight claims key for the caller's probe, returning false if
+// another probe already holds it. Factored out of shellScaleCheckWithTimeout
+// so probeFlightRunner can key on a caller-supplied target instead of the
+// command string, using the same lock.
+func acquireProbeFlight(key string) bool {
+	probeFlights.Lock()
+	defer probeFlights.Unlock()
+	if _, ok := probeFlights.active[key]; ok {
+		return false
+	}
+	probeFlights.active[key] = struct{}{}
+	return true
+}
+
+// releaseProbeFlight releases a key previously claimed by acquireProbeFlight.
+func releaseProbeFlight(key string) {
+	probeFlights.Lock()
+	delete(probeFlights.active, key)
+	probeFlights.Unlock()
+}
+
+// shellCommand runs a command via sh -c with the given timeout and returns
+// stdout. On Unix the command owns a process group so cancellation reaps the
+// whole nested shell/bd tree, not only the immediate sh process. dir sets the
+// command's working directory. When env is non-nil, it is merged into the
+// subprocess environment after sanitizing inherited GC_DOLT_* and BEADS_* keys.
 func shellCommand(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -106,7 +138,61 @@ func parseBDProbeTimeout(stderr io.Writer) time.Duration {
 // dir sets the command's working directory. Uses bdProbeTimeoutDefault (180s)
 // unless GC_BD_PROBE_TIMEOUT overrides it.
 func shellScaleCheck(command, dir string, env map[string]string) (string, error) {
+	return shellScaleCheckWithTimeout(command, dir, parseBDProbeTimeout(os.Stderr), env)
+}
+
+func shellScaleCheckWithTimeout(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
+	key := probeFlightKeyFor(dir, env, command)
+	if !acquireProbeFlight(key) {
+		return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, command)
+	}
+	defer releaseProbeFlight(key)
+	return shellCommand(command, dir, timeout, env)
+}
+
+// shellScaleCheckUnflighted has the same signature as shellScaleCheck (it IS
+// a ScaleCheckRunner) but skips the command-keyed flight lock. It exists so
+// probeFlightRunner has an inner path to call after acquiring its own
+// target-keyed lock — passing shellScaleCheck itself to probeFlightRunner
+// would lock twice per probe (once on target, once on command inside
+// shellScaleCheckWithTimeout), which lets two different-target probes that
+// happen to share a command string block each other. That is a behaviour
+// change from single-flighting only on target, so callers that want
+// target-based single-flighting must route through this unflighted path.
+func shellScaleCheckUnflighted(command, dir string, env map[string]string) (string, error) {
 	return shellCommand(command, dir, parseBDProbeTimeout(os.Stderr), env)
+}
+
+// probeFlightRunner returns a ScaleCheckRunner that single-flights on target
+// (scope + target, scope from GC_STORE_ROOT/env or dir) instead of on the
+// command string, then calls run. Producers that already know their probe's
+// logical target (a qualified agent name, a template) use this so probes
+// sharing a target dedupe even if their generated command text differs
+// slightly, and probes with different targets never block each other even if
+// their command text happens to match. run must not itself acquire the
+// command-keyed flight lock (use shellScaleCheckUnflighted, not
+// shellScaleCheck) or a probe will double-lock — see shellScaleCheckUnflighted.
+func probeFlightRunner(target string, run ScaleCheckRunner) ScaleCheckRunner {
+	return func(command, dir string, env map[string]string) (string, error) {
+		key := probeFlightKeyFor(dir, env, target)
+		if !acquireProbeFlight(key) {
+			return "", fmt.Errorf("%w for target %q", errProbeAlreadyInFlight, target)
+		}
+		defer releaseProbeFlight(key)
+		return run(command, dir, env)
+	}
+}
+
+// probeFlightKeyFor builds the flight-lock key: scope (GC_STORE_ROOT from env,
+// else dir) plus the caller's chosen target — the command string for ordinary
+// shellScaleCheck callers, or a caller-supplied logical target for
+// probeFlightRunner.
+func probeFlightKeyFor(dir string, env map[string]string, target string) string {
+	scope := strings.TrimSpace(env["GC_STORE_ROOT"])
+	if scope == "" {
+		scope = dir
+	}
+	return scope + "\x00" + target
 }
 
 // shellRunHook runs a lifecycle hook command (on_death, on_boot) via

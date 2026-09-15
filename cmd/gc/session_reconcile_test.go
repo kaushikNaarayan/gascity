@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -868,6 +870,59 @@ func TestComputeWorkSet_RunsWorkQuery(t *testing.T) {
 	}
 }
 
+// TestComputeWorkSetSingleFlightsOnQualifiedTarget pins that computeWorkSet
+// wraps its injected runner with probeFlightRunner(qn, runner) per probe
+// (gcf-7oai): a probe for the same qualified agent target already in flight
+// (from a concurrent computeWorkSet call, e.g. an overlapping reconcile
+// tick) is skipped rather than re-invoking the runner. The target no longer
+// travels through the env map (probeTargetEnv removed) — this exercises the
+// real flight lock via two concurrent computeWorkSet calls instead of
+// inspecting env.
+func TestComputeWorkSetSingleFlightsOnQualifiedTarget(t *testing.T) {
+	cityDir := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "myrig", WorkQuery: "printf work"},
+		},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var callCount int32
+	runner := func(_ string, _ string, _ map[string]string) (string, error) {
+		atomic.AddInt32(&callCount, 1)
+		close(started)
+		<-release
+		return "", nil
+	}
+
+	firstDone := make(chan map[string]bool, 1)
+	go func() {
+		firstDone <- computeWorkSet(cfg, runner, "test-city", cityDir, nil, nil, nil)
+	}()
+
+	<-started
+	var stderr bytes.Buffer
+	secondWork := computeWorkSet(cfg, runner, "test-city", cityDir, nil, nil, &stderr)
+	if secondWork["myrig/worker"] {
+		t.Fatal("concurrent same-target probe must not report ready work")
+	}
+	if got := stderr.String(); !strings.Contains(got, "work query probe myrig/worker skipped: probe already in flight") {
+		t.Fatalf("single-flight skip diagnostic = %q", got)
+	}
+
+	close(release)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first computeWorkSet did not finish after release")
+	}
+
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Fatalf("runner invoked %d times, want exactly 1 (the second call must skip before invoking runner)", got)
+	}
+}
+
 func TestComputeWorkSet_ResolvesRigDir(t *testing.T) {
 	cityDir := t.TempDir()
 	rigDir := filepath.Join(cityDir, "myrig")
@@ -1005,7 +1060,11 @@ func TestComputeWorkSet_ExplicitRigWorkQueryUsesRigPassword(t *testing.T) {
 		}},
 	}
 
-	work := computeWorkSet(cfg, shellScaleCheck, "test-city", cityDir, nil, nil, nil)
+	// computeWorkSet wraps runner with probeFlightRunner(qn, runner) per probe
+	// (gcf-7oai); pass the unflighted variant, matching build_desired_state.go's
+	// production wiring, so this exercises the real subprocess path without a
+	// nested command-keyed lock.
+	work := computeWorkSet(cfg, shellScaleCheckUnflighted, "test-city", cityDir, nil, nil, nil)
 	if !work["demo/worker"] {
 		t.Fatal("expected explicit rig work query to see rig-scoped password and report work")
 	}
