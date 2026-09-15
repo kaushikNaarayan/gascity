@@ -656,6 +656,36 @@ func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	return p.tm.GetSessionActivity(name)
 }
 
+// BulkEnrichSessions implements [runtime.SessionBulkEnricher]: resolves
+// Attached + LastActivity for many sessions in exactly two tmux execs total
+// (one list-sessions, one list-windows -a), instead of IsAttached +
+// GetLastActivity's two execs PER session. A name in `names` that tmux has no
+// record of (session exited between the caller's listing and this call) is
+// simply absent from the result map — callers apply the same fallback as a
+// per-session IsAttached/GetLastActivity error.
+func (p *Provider) BulkEnrichSessions(names []string) (map[string]runtime.SessionEnrichment, error) {
+	attached, err := p.tm.BulkSessionAttached()
+	if err != nil {
+		return nil, err
+	}
+	activity, err := p.tm.BulkSessionActivity()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]runtime.SessionEnrichment, len(names))
+	for _, name := range names {
+		a, hasAttached := attached[name]
+		act, hasActivity := activity[name]
+		if !hasAttached && !hasActivity {
+			continue
+		}
+		result[name] = runtime.SessionEnrichment{Attached: a, LastActive: act}
+	}
+	return result, nil
+}
+
+var _ runtime.SessionBulkEnricher = (*Provider)(nil)
+
 // ClearScrollback clears the scrollback history of the named session.
 // Delegates to [Tmux.ClearHistory].
 func (p *Provider) ClearScrollback(name string) error {

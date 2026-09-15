@@ -2739,6 +2739,107 @@ func latestActivityTimestamp(out string) (int64, error) {
 	return latest, nil
 }
 
+// BulkSessionAttached resolves #{session_attached} for every session on this
+// Tmux's socket in a single exec, instead of one `display-message` per
+// session (see IsSessionAttached). A name absent from the returned map simply
+// was not present in `tmux list-sessions` output (no session, or the server
+// itself is not running); callers treat that the same as an IsSessionAttached
+// error — collapsing to "not attached", never a crash.
+func (t *Tmux) BulkSessionAttached() (map[string]bool, error) {
+	out, err := t.run("list-sessions", "-F", "#{session_name}\t#{session_attached}")
+	if err != nil {
+		if errors.Is(err, ErrNoServer) {
+			return map[string]bool{}, nil
+		}
+		return nil, err
+	}
+	result := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, attached, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		result[name] = attached == "1"
+	}
+	return result, nil
+}
+
+// bulkRawSessionActivity resolves rawSessionActivity for every session on
+// this Tmux's socket in a single `list-windows -a` exec instead of one
+// `list-windows -t <session>` per session. Grouping is done client-side by
+// #{session_name}, then latestActivityTimestamp — the SAME per-session-max
+// helper rawSessionActivity uses — is applied to each session's own window
+// timestamps, so semantics are identical to calling rawSessionActivity once
+// per session. A session with no windows (or that has exited) is simply
+// absent from the returned map.
+func (t *Tmux) bulkRawSessionActivity() (map[string]time.Time, error) {
+	out, err := t.run("list-windows", "-a", "-F", "#{session_name}\t#{window_activity}")
+	if err != nil {
+		if errors.Is(err, ErrNoServer) {
+			return map[string]time.Time{}, nil
+		}
+		return nil, err
+	}
+	perSessionLines := make(map[string][]string)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, ts, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		perSessionLines[name] = append(perSessionLines[name], ts)
+	}
+	result := make(map[string]time.Time, len(perSessionLines))
+	for name, lines := range perSessionLines {
+		timestamp, err := latestActivityTimestamp(strings.Join(lines, "\n"))
+		if err != nil {
+			// Same shape as rawSessionActivity's error return: skip rather
+			// than fabricate a timestamp. Caller treats an absent entry like
+			// a per-session error.
+			continue
+		}
+		result[name] = time.Unix(timestamp, 0)
+	}
+	return result, nil
+}
+
+// BulkSessionActivity resolves GetSessionActivity for every session on this
+// Tmux's socket in exactly two execs total (BulkSessionAttached's caller
+// covers attachment separately) — one `list-windows -a` call here, grouped
+// and poke-discounted per session exactly as GetSessionActivity does for a
+// single session. Discounting uses the SAME discountPokeActivity helper and
+// the same in-memory t.pokes map (no subprocess), so a session's bulk result
+// is byte-identical to calling GetSessionActivity(session) on it directly.
+func (t *Tmux) BulkSessionActivity() (map[string]time.Time, error) {
+	raw, err := t.bulkRawSessionActivity()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	t.pokeMu.Lock()
+	pokesCopy := make(map[string]pokeInfo, len(t.pokes))
+	for k, v := range t.pokes {
+		pokesCopy[k] = v
+	}
+	t.pokeMu.Unlock()
+	result := make(map[string]time.Time, len(raw))
+	for name, wa := range raw {
+		if pk, ok := pokesCopy[name]; ok {
+			result[name] = discountPokeActivity(wa, pk, now)
+			continue
+		}
+		result[name] = wa
+	}
+	return result, nil
+}
+
 // ZombieStatus describes the liveness state of a tmux agent session.
 type ZombieStatus int
 

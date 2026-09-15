@@ -410,6 +410,29 @@ type ServerLifecycleProvider interface {
 	TeardownServer() error
 }
 
+// SessionEnrichment is the per-session result of a [SessionBulkEnricher]
+// query: the same two facts EnrichInfo otherwise resolves one subprocess call
+// each per session (Attached via IsAttached, LastActive via GetLastActivity).
+type SessionEnrichment struct {
+	Attached   bool
+	LastActive time.Time
+}
+
+// SessionBulkEnricher is an optional extension for providers that can resolve
+// Attached + LastActivity for many sessions at once, in a bounded number of
+// subprocess calls, instead of paying IsAttached + GetLastActivity's two
+// per-session round trips for every session in a listing (gcf-lpl6: this N+1
+// pattern cost ~2.5 CPU-s and ~150 tmux subprocess execs on a 70-session city).
+//
+// A name passed in but absent from the returned map means that session could
+// not be resolved (e.g. it exited between the caller's listing and this call);
+// the caller must treat that exactly like a per-session IsAttached/
+// GetLastActivity error — Attached collapses to false, LastActive is left
+// untouched — never a crash or stale substitute data.
+type SessionBulkEnricher interface {
+	BulkEnrichSessions(names []string) (map[string]SessionEnrichment, error)
+}
+
 // CopyEntry describes a file or directory to stage in the session's
 // working directory before the agent command starts.
 type CopyEntry struct {
