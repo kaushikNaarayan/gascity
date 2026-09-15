@@ -20,11 +20,19 @@ resource_owner = "ga-80po0c.2 owns this point-in-time source census"
 migration_target = "P0.4a"
 expires = "2026-10-01"
 
+# PM ruling 2026-09-15 (gcf-7oai.1): baseline bumped +2 calls/+1 file for
+# cmd/gc/pool_process_unix_test.go's two time.Sleep(10 * time.Millisecond)
+# calls. Both are poll intervals inside bounded deadline loops (waiting for a
+# subprocess/pool state change with a timeout), not arbitrary test padding.
+# The file is build-tagged (unix-only), so it does not fall under the
+# "untagged" debt rows and does not move the [[debt]]/[[small_debt]]
+# fixed_sleep figures below -- only this all-scope audit row, which tracks
+# total source occurrences regardless of tag.
 [[audit_baseline]]
 scope = "all"
 resource = "fixed_sleep"
-baseline_calls = 436
-baseline_files = 161
+baseline_calls = 438
+baseline_files = 162
 reported_calls = 447
 reported_files = 157
 owner_bead = "ga-80po0c.2"
