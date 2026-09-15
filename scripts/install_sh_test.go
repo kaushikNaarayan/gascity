@@ -93,6 +93,7 @@ func TestInstallScriptRefusesLiveGCWithoutOverride(t *testing.T) {
 	writeShim(t, filepath.Join(live, "gc"), liveContent)
 
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 
 	path := fake + string(os.PathListSeparator) + live + string(os.PathListSeparator) + "/usr/bin:/bin"
 	cmd := newInstallCmd(root)
@@ -161,6 +162,7 @@ func TestInstallScriptDefaultsWhenNoLiveGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
 
 	// Deliberately no "live" dir on PATH and no GC_INSTALL_DIR: `command -v
@@ -254,6 +256,7 @@ func TestInstallScriptSmokeTestRejectsBrokenBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
@@ -334,6 +337,7 @@ func TestInstallScriptSmokeTestRejectsPreservedIncidentArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
@@ -431,6 +435,7 @@ func TestInstallScriptNeverDeletesOldBackupBeforeNewOneIsWritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
 	// Fail `cp` only when writing a *.prev-* destination, so the main
 	// install (which also uses cp for its own pre-swap backup) still
@@ -502,6 +507,7 @@ func runInstallFixture(t *testing.T, goos, machine, failure string) string {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo '"+goos+"'; else echo '"+machine+"'; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\nif [ \"${FAILURE:-}\" = checksum ] && echo \"$name\" | grep -q '^gascity_.*tar.gz$'; then printf corrupt > \"$out\"; else cp \"$FIXTURES/$name\" \"$out\"; fi\n")
 	if failure == "final" {
 		writeShim(t, filepath.Join(fake, "install"), "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in */.bd.tmp.*) exit 73;; esac\nexec \"$REAL_INSTALL\" \"$@\"\n")
@@ -571,6 +577,7 @@ func runInstallFixtureVerbose(t *testing.T, goos, machine, failure string) fixtu
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo '"+goos+"'; else echo '"+machine+"'; fi\n")
+	writeNoGHShim(t, fake)
 	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(), "PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin", "FIXTURES="+fixtures, "GC_INSTALL_DIR="+dir, "GC_INSTALL_REPO=example/gascity", "GC_DOLT_VERSION="+doltVersion, fmt.Sprintf("GC_DOLT_SHA256=%x", sha256.Sum256(doltData)), "GC_BD_VERSION="+bdVersion, fmt.Sprintf("GC_BD_SHA256=%x", sha256.Sum256(bdData)))
@@ -691,6 +698,21 @@ func writeShim(t *testing.T, path, body string) {
 	}
 }
 
+// writeNoGHShim makes `gh` resolve to a binary that always fails, inside a
+// test's fake PATH dir. install.sh's authenticated-fetch (gcf-aetk) checks
+// `command -v gh` unconditionally near the top of the script; every test
+// fixture's PATH falls back to the real "/usr/bin:/bin" for tools it
+// doesn't shim (curl, tar, uname, ...), and THIS HOST HAS A REAL,
+// ALREADY-AUTHENTICATED gh AT /usr/bin/gh. Without this shim, install.sh
+// silently prefers the real gh and makes a real network round-trip against
+// api.github.com for every test that reaches that check -- not just the
+// ones actually testing gh integration. Every fixture helper below that
+// isn't specifically testing the gh path calls this to stay hermetic.
+func writeNoGHShim(t *testing.T, fake string) {
+	t.Helper()
+	writeShim(t, filepath.Join(fake, "gh"), "#!/bin/sh\nexit 1\n")
+}
+
 // writeManifestCurlShim extends the plain asset-download curl shim (match a
 // requested URL by basename against $FIXTURES, copy to --output) with a
 // plain-stdout fetch for whatever has no --output flag -- that is how
@@ -769,6 +791,7 @@ func TestInstallScriptManifestMissingKeyFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeManifestCurlShim(t, fake)
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
@@ -810,6 +833,7 @@ func TestInstallScriptManifestVersionMismatchFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeManifestCurlShim(t, fake)
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
@@ -853,6 +877,7 @@ func TestInstallScriptManifestRejectsHostileLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeManifestCurlShim(t, fake)
 	cmd := newInstallCmd(root)
 	cmd.Env = append(os.Environ(),
@@ -933,6 +958,7 @@ func runInstallFixtureViaManifest(t *testing.T, mode, _ string) string {
 		t.Fatal(err)
 	}
 	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
 	writeManifestCurlShim(t, fake)
 	cmd := newInstallCmd(root)
 	env := []string{
@@ -952,4 +978,320 @@ func runInstallFixtureViaManifest(t *testing.T, mode, _ string) string {
 		t.Fatalf("installer failed: %v\n%s", err, out)
 	}
 	return dir
+}
+
+// gcf-aetk authenticated-fetch (PM ruling 2026-09-15, following AC-V1
+// discovering material-lab-io/gascity is PRIVATE): install.sh must reach
+// GC_INSTALL_REPO's VERSIONS manifest and gc's own release assets through
+// gh (if authenticated), then a GH_TOKEN/GITHUB_TOKEN via the GitHub API,
+// then a plain unauthenticated request as a last resort, then fail closed.
+// These tests cover: the gh path (exact subcommands/args asserted), the
+// token path (argv never carries the token -- with a negative control
+// proving that check has teeth), and the fail-closed path.
+
+// writeAuthFixtures populates fixtures with a full gc archive + checksums,
+// a Dolt archive, a bd archive, a VERSIONS manifest, and a GitHub release.json
+// (pretty-printed, "id" a few lines before its asset's "name" -- the exact
+// shape a real `gh api .../releases/tags/vX` response has) naming two
+// numeric asset ids for the checksums file and the platform archive. It
+// does not touch $repo/$version network paths -- callers decide the auth
+// path via their own gh/curl shim.
+func writeAuthFixtures(t *testing.T, fixtures string) (gcVersion, gcAsset, checksumsName string, checksumsID, assetID int) {
+	t.Helper()
+	osname, arch := "linux", "amd64"
+	gcVersion = "1.3.8"
+	gcAsset = "gascity_" + gcVersion + "_" + osname + "_" + arch + ".tar.gz"
+	checksumsName = "gascity_" + gcVersion + "_checksums.txt"
+	doltVersion, bdVersion := "2.1.10", "1.3.0-rc.2"
+	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
+	bdAsset := "beads_" + bdVersion + "_" + osname + "_" + arch + ".tar.gz"
+	writeArchiveLabel(t, fixtures, gcAsset, "gc", "gc version "+gcVersion)
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version "+doltVersion)
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version "+bdVersion)
+	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcSHA := fmt.Sprintf("%x", sha256.Sum256(gcData))
+	if err := os.WriteFile(filepath.Join(fixtures, checksumsName), []byte(fmt.Sprintf("%s  %s\n", gcSHA, gcAsset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doltData, err := os.ReadFile(filepath.Join(fixtures, doltAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdData, err := os.ReadFile(filepath.Join(fixtures, bdAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := "" +
+		"GC_VERSION=" + gcVersion + "\n" +
+		"DOLT_VERSION=" + doltVersion + "\n" +
+		"DOLT_SHA256_LINUX_AMD64=" + fmt.Sprintf("%x", sha256.Sum256(doltData)) + "\n" +
+		"BD_VERSION=" + bdVersion + "\n" +
+		"BD_SHA256_LINUX_AMD64=" + fmt.Sprintf("%x", sha256.Sum256(bdData)) + "\n"
+	if err := os.WriteFile(filepath.Join(fixtures, "VERSIONS"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checksumsID, assetID = 1001, 1002
+	releaseJSON := fmt.Sprintf(`{
+  "assets": [
+    {
+      "id": %d,
+      "node_id": "RA_x",
+      "name": %q,
+      "label": ""
+    },
+    {
+      "id": %d,
+      "node_id": "RA_y",
+      "name": %q,
+      "label": ""
+    }
+  ]
+}
+`, checksumsID, checksumsName, assetID, gcAsset)
+	if err := os.WriteFile(filepath.Join(fixtures, "release.json"), []byte(releaseJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return gcVersion, gcAsset, checksumsName, checksumsID, assetID
+}
+
+// writeAuthCurlShim extends writeManifestCurlShim's plain fixture-by-name
+// behavior (still used for Dolt/bd, which are public) with the GitHub API
+// endpoints install.sh's token path calls: the Contents API for VERSIONS,
+// releases/tags for the asset-id lookup, and releases/assets/<id> for each
+// binary download -- all requiring an Authorization header read from
+// stdin (-H @-, per install.sh's own design). The plain unauthenticated
+// raw/download URLs for $repo are made to 404, simulating a private repo
+// with no working fallback, so a test can prove the token path alone
+// carried the install. Every invocation's full argv (not stdin) is
+// appended to argvLog, one line each -- this is what the token-leak
+// negative control greps.
+func writeAuthCurlShim(t *testing.T, fake, fixtures, argvLog string, checksumsID, assetID int) {
+	t.Helper()
+	script := `#!/bin/sh
+{ for a in "$@"; do printf '%s ' "$a" >> "` + argvLog + `"; done; printf '\n' >> "` + argvLog + `"; }
+out=
+url=
+accept=
+stdin_header=
+prev=
+for a in "$@"; do
+  case "$prev" in
+    --output) out=$a ;;
+    -H)
+      case "$a" in
+        @-) stdin_header="$(cat)" ;;
+        Accept:*) accept=$a ;;
+      esac
+      ;;
+  esac
+  case "$a" in http*|file*) url=$a ;; esac
+  prev=$a
+done
+case "$url" in
+  https://api.github.com/repos/*/contents/VERSIONS*)
+    [ -n "$stdin_header" ] || exit 22
+    cp "` + fixtures + `/VERSIONS" "${out:-/dev/stdout}" ;;
+  https://api.github.com/repos/*/releases/tags/*)
+    [ -n "$stdin_header" ] || exit 22
+    cp "` + fixtures + `/release.json" "${out:-/dev/stdout}" ;;
+  https://api.github.com/repos/*/releases/assets/` + fmt.Sprint(checksumsID) + `)
+    [ -n "$stdin_header" ] || exit 22
+    cp "` + fixtures + `/` + "gascity_1.3.8_checksums.txt" + `" "$out" ;;
+  https://api.github.com/repos/*/releases/assets/` + fmt.Sprint(assetID) + `)
+    [ -n "$stdin_header" ] || exit 22
+    cp "` + fixtures + `/` + "gascity_1.3.8_linux_amd64.tar.gz" + `" "$out" ;;
+  https://raw.githubusercontent.com/example/gascity/*|https://github.com/example/gascity/releases/download/*)
+    exit 22 ;;
+  *)
+    name=${url##*/}
+    cp "` + fixtures + `/$name" "$out" ;;
+esac
+`
+	writeShim(t, filepath.Join(fake, "curl"), script)
+}
+
+func TestInstallScriptAuthenticatedFetchUsesGHWhenAvailable(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, dir := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "install")
+	for _, p := range []string{fixtures, fake, dir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gcVersion, gcAsset, checksumsName, _, _ := writeAuthFixtures(t, fixtures)
+	argvLog := filepath.Join(tmp, "gh-argv.log")
+	ghScript := `#!/bin/sh
+{ for a in "$@"; do printf '%s ' "$a" >> "` + argvLog + `"; done; printf '\n' >> "` + argvLog + `"; }
+case "$1" in
+  auth) exit 0 ;;
+  api)
+    path=""
+    for a in "$@"; do path="$a"; done
+    case "$path" in
+      */contents/VERSIONS*) cat "` + fixtures + `/VERSIONS" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  release)
+    dir=""
+    patterns=""
+    prevflag=""
+    for a in "$@"; do
+      case "$prevflag" in
+        -p) patterns="$patterns $a" ;;
+        -D) dir="$a" ;;
+      esac
+      case "$a" in
+        -p|-D) prevflag="$a" ;;
+        *) prevflag="" ;;
+      esac
+    done
+    for p in $patterns; do cp "` + fixtures + `/$p" "$dir/$p"; done
+    ;;
+  *) exit 1 ;;
+esac
+`
+	writeShim(t, filepath.Join(fake, "gh"), ghScript)
+	// curl still needed for Dolt/bd (public, unaffected by auth) -- reuse
+	// the plain fixture-by-name shim, curl must never see any gascity URL
+	// in this scenario (gh_ok short-circuits before curl is invoked for
+	// $repo at all).
+	writeManifestCurlShim(t, fake)
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+
+	cmd := newInstallCmd(root)
+	cmd.Args[len(cmd.Args)-1] = gcVersion // newInstallCmd hardcodes 1.3.7; override to match these fixtures
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+dir,
+		"GC_INSTALL_REPO=example/gascity",
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err != nil {
+		t.Fatalf("installer failed via the gh path: %v\n%s", err, out)
+	}
+	for _, name := range []string{"gc", "bd", "dolt"} {
+		if got, rerr := os.ReadFile(filepath.Join(dir, name)); rerr != nil || !strings.Contains(string(got), name) {
+			t.Fatalf("%s install = %q, %v", name, got, rerr)
+		}
+	}
+	ghArgs, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatalf("gh argv log missing: %v", err)
+	}
+	log := string(ghArgs)
+	if !strings.Contains(log, "auth status") {
+		t.Fatalf("gh auth status was never checked, log:\n%s", log)
+	}
+	if !strings.Contains(log, "Accept: application/vnd.github.raw") || !strings.Contains(log, "contents/VERSIONS?ref=v"+gcVersion) {
+		t.Fatalf("gh api did not fetch the manifest via the documented contents endpoint, log:\n%s", log)
+	}
+	if !strings.Contains(log, "release download v"+gcVersion) || !strings.Contains(log, checksumsName) || !strings.Contains(log, gcAsset) {
+		t.Fatalf("gh release download did not fetch both gc assets as documented, log:\n%s", log)
+	}
+}
+
+func TestInstallScriptAuthenticatedFetchUsesTokenAPIWhenNoGH(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, dir := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "install")
+	for _, p := range []string{fixtures, fake, dir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gcVersion, _, _, checksumsID, assetID := writeAuthFixtures(t, fixtures)
+	argvLog := filepath.Join(tmp, "curl-argv.log")
+	writeAuthCurlShim(t, fake, fixtures, argvLog, checksumsID, assetID)
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
+	// No gh binary on PATH at all in this scenario.
+
+	const token = "gh-secret-token-xyz-do-not-leak-9f8e7d6c"
+	cmd := newInstallCmd(root)
+	cmd.Args[len(cmd.Args)-1] = gcVersion
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+dir,
+		"GC_INSTALL_REPO=example/gascity",
+		"GH_TOKEN="+token,
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err != nil {
+		t.Fatalf("installer failed via the token path: %v\n%s", err, out)
+	}
+	for _, name := range []string{"gc", "bd", "dolt"} {
+		if got, rerr := os.ReadFile(filepath.Join(dir, name)); rerr != nil || !strings.Contains(string(got), name) {
+			t.Fatalf("%s install = %q, %v", name, got, rerr)
+		}
+	}
+
+	argvBytes, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatalf("curl argv log missing: %v", err)
+	}
+	realLog := string(argvBytes)
+	if !strings.Contains(realLog, "api.github.com") {
+		t.Fatalf("token path never actually hit the GitHub API, log:\n%s", realLog)
+	}
+	if strings.Contains(realLog, token) {
+		t.Fatalf("TOKEN LEAKED into a recorded curl argv line -- ps on a shared host would see it. Log:\n%s", realLog)
+	}
+
+	// Negative control: prove the check above has teeth. A curl invocation
+	// that (incorrectly) puts the token in a -H argument, appended to a
+	// SEPARATE log in the exact same format, MUST be caught by the same
+	// grep this test just used to certify the real log clean.
+	badLog := filepath.Join(tmp, "curl-argv-BAD-control.log")
+	if err := os.WriteFile(badLog, []byte("curl -H \"Authorization: Bearer "+token+"\" https://api.github.com/repos/x/y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badBytes, err := os.ReadFile(badLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(badBytes), token) {
+		t.Fatalf("negative control is broken: a deliberately-leaked token was not detected by the same check")
+	}
+}
+
+func TestInstallScriptAuthenticatedFetchFailsClosedWithoutGHOrToken(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, dir := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "install")
+	for _, p := range []string{fixtures, fake, dir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gcVersion, _, _, checksumsID, assetID := writeAuthFixtures(t, fixtures)
+	argvLog := filepath.Join(tmp, "curl-argv.log")
+	writeAuthCurlShim(t, fake, fixtures, argvLog, checksumsID, assetID)
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
+	// No gh, no GH_TOKEN/GITHUB_TOKEN.
+
+	cmd := newInstallCmd(root)
+	cmd.Args[len(cmd.Args)-1] = gcVersion
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+dir,
+		"GC_INSTALL_REPO=example/gascity",
+		"GH_TOKEN=", "GITHUB_TOKEN=",
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err == nil {
+		t.Fatalf("installer succeeded with neither gh nor a token against a simulated-private repo: %s", out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "gh CLI") || !strings.Contains(got, "GH_TOKEN") {
+		t.Fatalf("fail-closed message did not name both recovery options, output: %s", got)
+	}
 }
