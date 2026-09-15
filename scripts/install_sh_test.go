@@ -24,10 +24,19 @@ func TestInstallScriptPlatformsAndTransactionalFailure(t *testing.T) {
 	// GC_INSTALL_DIR is set here purely to bypass the live-gc refusal path
 	// (this test host may itself have a live gc on PATH) so the assertion
 	// below actually reaches the pin-validation code it means to exercise.
+	//
+	// GC_MANIFEST_URL is pointed at a path that cannot possibly exist
+	// (gcf-aetk AC-M2): leaving GC_DOLT_VERSION/GC_DOLT_SHA256 empty now
+	// means the installer attempts a manifest fetch for them before
+	// failing, rather than failing immediately -- point it at a guaranteed
+	// 404 so this stays hermetic and fast instead of hitting the real
+	// network. Either failure message (the fetch itself, or a manifest that
+	// resolved but still lacked the key) names GC_DOLT_VERSION, so match on
+	// that rather than the older, more specific "is required" string.
 	missingPinsSandbox := t.TempDir()
 	missingPins := newInstallCmd(root)
-	missingPins.Env = append(os.Environ(), "GC_INSTALL_DIR="+missingPinsSandbox, "GC_DOLT_VERSION=", "GC_DOLT_SHA256=", "GC_BD_VERSION=v1.2.3", "GC_BD_SHA256="+strings.Repeat("a", 64))
-	if out, err := runSandboxed(t, missingPins, missingPinsSandbox); err == nil || !strings.Contains(string(out), "GC_DOLT_VERSION is required") {
+	missingPins.Env = append(os.Environ(), "GC_INSTALL_DIR="+missingPinsSandbox, "GC_DOLT_VERSION=", "GC_DOLT_SHA256=", "GC_BD_VERSION=v1.2.3", "GC_BD_SHA256="+strings.Repeat("a", 64), "GC_MANIFEST_URL=file:///nonexistent/gcf-aetk-no-such-manifest/VERSIONS")
+	if out, err := runSandboxed(t, missingPins, missingPinsSandbox); err == nil || !strings.Contains(string(out), "GC_DOLT_VERSION") {
 		t.Fatalf("installer did not fail closed without a release tuple: %v\n%s", err, out)
 	}
 	for _, tc := range []struct{ os, machine string }{{"Linux", "x86_64"}, {"Linux", "aarch64"}, {"Darwin", "x86_64"}, {"Darwin", "arm64"}} {
@@ -680,4 +689,267 @@ func writeShim(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// writeManifestCurlShim extends the plain asset-download curl shim (match a
+// requested URL by basename against $FIXTURES, copy to --output) with a
+// plain-stdout fetch for whatever has no --output flag -- that is how
+// install.sh fetches the VERSIONS manifest itself (command substitution,
+// not a file download).
+func writeManifestCurlShim(t *testing.T, fake string) {
+	t.Helper()
+	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\n"+
+		"out=\nurl=\n"+
+		"while [ $# -gt 0 ]; do\n"+
+		"  case \"$1\" in\n"+
+		"    --output) out=$2; shift 2 ;;\n"+
+		"    http*|file*) url=$1; shift ;;\n"+
+		"    *) shift ;;\n"+
+		"  esac\n"+
+		"done\n"+
+		"name=${url##*/}\n"+
+		"if [ -n \"$out\" ]; then cp \"$FIXTURES/$name\" \"$out\"; else cat \"$FIXTURES/$name\"; fi\n")
+}
+
+// gcf-aetk AC-M2: install.sh must actually read the published VERSIONS
+// manifest, not just have one sitting next to it unread. These five tests
+// are the acceptance list from the PM ruling on gcf-aetk: (1) manifest
+// resolves the right values per platform, (2) an explicit env value beats
+// the manifest, (3) a missing key fails closed, (4) a GC_VERSION mismatch
+// fails closed, (5) a hostile manifest line is rejected outright (parsed as
+// data, never sourced/eval'd).
+
+// TestInstallScriptManifestResolvesPerPlatform is acceptance test (1): with
+// no GC_BD_*/GC_DOLT_* env set at all, the installer must fetch VERSIONS for
+// the requested tag and complete a real install using the values it finds
+// there for the detected OS/arch.
+func TestInstallScriptManifestResolvesPerPlatform(t *testing.T) {
+	dir := runInstallFixtureViaManifest(t, "", "")
+	for _, name := range []string{"gc", "dolt", "bd"} {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !strings.Contains(string(got), name) {
+			t.Fatalf("%s install = %q, %v", name, got, err)
+		}
+	}
+}
+
+// TestInstallScriptManifestEnvOverrideWins is acceptance test (2): the
+// manifest carries a BD_SHA256 that does NOT match the real bd asset (it
+// would fail its download/checksum step if used), but GC_BD_VERSION/
+// GC_BD_SHA256 are also set explicitly to the correct values. The explicit
+// env values must win outright -- the installer must not even consult the
+// manifest's bd entry.
+func TestInstallScriptManifestEnvOverrideWins(t *testing.T) {
+	dir := runInstallFixtureViaManifest(t, "override-bd", "")
+	got, err := os.ReadFile(filepath.Join(dir, "bd"))
+	if err != nil || !strings.Contains(string(got), "bd") {
+		t.Fatalf("bd install = %q, %v (env override should have made this succeed with the real asset, not the manifest's mismatched one)", got, err)
+	}
+}
+
+// TestInstallScriptManifestMissingKeyFailsClosed is acceptance test (3): the
+// manifest is missing the SHA256 key for this exact OS/arch. There is no
+// fallback value anywhere in the script -- the installer must fail closed
+// with a clear message, not proceed with an empty/guessed checksum.
+func TestInstallScriptManifestMissingKeyFailsClosed(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin")
+	for _, p := range []string{fixtures, fake} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "VERSIONS"), []byte(""+
+		"GC_VERSION=1.3.7\n"+
+		"DOLT_VERSION=2.1.10\n"+
+		"DOLT_SHA256_LINUX_AMD64="+strings.Repeat("a", 64)+"\n"+
+		"BD_VERSION=1.2.3\n"+
+		// BD_SHA256_LINUX_AMD64 deliberately absent.
+		""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeManifestCurlShim(t, fake)
+	cmd := newInstallCmd(root)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+filepath.Join(tmp, "install"),
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_MANIFEST_URL=file://"+filepath.Join(fixtures, "VERSIONS"),
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err == nil {
+		t.Fatalf("installer succeeded with no BD_SHA256 for this platform anywhere (env or manifest): %s", out)
+	}
+	if !strings.Contains(string(out), "Missing or malformed checksum for GC_BD_SHA256") {
+		t.Fatalf("installer failed for the wrong reason, output: %s", out)
+	}
+}
+
+// TestInstallScriptManifestVersionMismatchFailsClosed is acceptance test
+// (4): the fetched manifest's own GC_VERSION does not match the tag being
+// installed (a stale cache, a wrong URL, a manifest for a different
+// release). Using it anyway would silently pair this gc with a bd/Dolt tuple
+// nobody certified together, so the installer must refuse outright.
+func TestInstallScriptManifestVersionMismatchFailsClosed(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin")
+	for _, p := range []string{fixtures, fake} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "VERSIONS"), []byte(""+
+		"GC_VERSION=1.3.6\n"+ // requested tag below is 1.3.7 -- deliberate mismatch
+		"DOLT_VERSION=2.1.10\n"+
+		"DOLT_SHA256_LINUX_AMD64="+strings.Repeat("a", 64)+"\n"+
+		"BD_VERSION=1.2.3\n"+
+		"BD_SHA256_LINUX_AMD64="+strings.Repeat("a", 64)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeManifestCurlShim(t, fake)
+	cmd := newInstallCmd(root)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+filepath.Join(tmp, "install"),
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_MANIFEST_URL=file://"+filepath.Join(fixtures, "VERSIONS"),
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err == nil {
+		t.Fatalf("installer accepted a manifest whose GC_VERSION (1.3.6) does not match the requested tag (1.3.7): %s", out)
+	}
+	if !strings.Contains(string(out), "does not match requested version") {
+		t.Fatalf("installer failed for the wrong reason, output: %s", out)
+	}
+}
+
+// TestInstallScriptManifestRejectsHostileLine is acceptance test (5): a
+// manifest line is remote content, and this installer parses it as inert
+// KEY=VALUE data -- it must never be sourced or eval'd. A line shaped like a
+// command substitution must be dropped outright (leaving the key
+// unresolved, so the normal missing-key fail-closed path catches it), and
+// whatever it tried to run must never actually run.
+func TestInstallScriptManifestRejectsHostileLine(t *testing.T) {
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin")
+	for _, p := range []string{fixtures, fake} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canary := filepath.Join(tmp, "pwned")
+	if err := os.WriteFile(filepath.Join(fixtures, "VERSIONS"), []byte(""+
+		"GC_VERSION=1.3.7\n"+
+		"DOLT_VERSION=2.1.10\n"+
+		"DOLT_SHA256_LINUX_AMD64="+strings.Repeat("a", 64)+"\n"+
+		"BD_VERSION=$(touch "+canary+")\n"+ // hostile: not KEY=VALUE-shaped data
+		"BD_SHA256_LINUX_AMD64="+strings.Repeat("a", 64)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeManifestCurlShim(t, fake)
+	cmd := newInstallCmd(root)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+filepath.Join(tmp, "install"),
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_MANIFEST_URL=file://"+filepath.Join(fixtures, "VERSIONS"),
+	)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err == nil {
+		t.Fatalf("installer succeeded with a hostile, non-KEY=VALUE manifest line: %s", out)
+	}
+	if !strings.Contains(string(out), "GC_BD_VERSION is required") {
+		t.Fatalf("installer failed for the wrong reason (expected the hostile BD_VERSION line to be dropped, not used), output: %s", out)
+	}
+	if _, statErr := os.Stat(canary); statErr == nil {
+		t.Fatalf("hostile manifest line executed: canary file %s was created", canary)
+	}
+}
+
+// runInstallFixtureViaManifest drives a full, successful install exactly
+// like runInstallFixture, except GC_BD_VERSION/GC_BD_SHA256/GC_DOLT_VERSION/
+// GC_DOLT_SHA256 are left UNSET so the installer must resolve them from a
+// published VERSIONS manifest fixture instead. mode selects a variant:
+//   - "": no env override at all -- pure manifest resolution.
+//   - "override-bd": GC_BD_VERSION/GC_BD_SHA256 ARE set (to the correct
+//     values), while the manifest's bd entry is deliberately WRONG (a
+//     checksum that would fail against the real bd asset) -- proves the env
+//     override, not the manifest, was actually used.
+func runInstallFixtureViaManifest(t *testing.T, mode, _ string) string {
+	t.Helper()
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, dir := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "install")
+	for _, p := range []string{fixtures, fake, dir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	osname, arch := "linux", "amd64"
+	gcVersion := "1.3.7"
+	gcAsset := "gascity_" + gcVersion + "_" + osname + "_" + arch + ".tar.gz"
+	doltVersion, bdVersion := "2.1.10", "1.2.3" // manifest records bd WITHOUT the "v" prefix, like the real VERSIONS file.
+	doltAsset := "dolt-" + osname + "-" + arch + ".tar.gz"
+	bdAsset := "beads_" + bdVersion + "_" + osname + "_" + arch + ".tar.gz"
+	writeArchiveLabel(t, fixtures, gcAsset, "gc", "gc version "+gcVersion)
+	writeArchiveLabel(t, fixtures, doltAsset, "dolt-"+osname+"-"+arch+"/bin/dolt", "dolt version "+doltVersion)
+	writeArchiveLabel(t, fixtures, bdAsset, "bd", "bd version "+bdVersion)
+	gcData, err := os.ReadFile(filepath.Join(fixtures, gcAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "gascity_"+gcVersion+"_checksums.txt"), []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(gcData), gcAsset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doltData, err := os.ReadFile(filepath.Join(fixtures, doltAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdData, err := os.ReadFile(filepath.Join(fixtures, bdAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doltSHA := fmt.Sprintf("%x", sha256.Sum256(doltData))
+	bdSHA := fmt.Sprintf("%x", sha256.Sum256(bdData))
+	manifestBDSHA := bdSHA
+	if mode == "override-bd" {
+		manifestBDSHA = strings.Repeat("f", 64) // wrong on purpose; env override must win instead
+	}
+	manifest := "" +
+		"GC_VERSION=" + gcVersion + "\n" +
+		"DOLT_VERSION=" + doltVersion + "\n" +
+		"DOLT_SHA256_LINUX_AMD64=" + doltSHA + "\n" +
+		"BD_VERSION=" + bdVersion + "\n" +
+		"BD_SHA256_LINUX_AMD64=" + manifestBDSHA + "\n"
+	if err := os.WriteFile(filepath.Join(fixtures, "VERSIONS"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeManifestCurlShim(t, fake)
+	cmd := newInstallCmd(root)
+	env := []string{
+		"PATH=" + fake + string(os.PathListSeparator) + "/usr/bin:/bin",
+		"FIXTURES=" + fixtures,
+		"HOME=" + tmp,
+		"GC_INSTALL_DIR=" + dir,
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_MANIFEST_URL=file://" + filepath.Join(fixtures, "VERSIONS"),
+	}
+	if mode == "override-bd" {
+		env = append(env, "GC_BD_VERSION=v"+bdVersion, "GC_BD_SHA256="+bdSHA)
+	}
+	cmd.Env = append(os.Environ(), env...)
+	out, err := runSandboxed(t, cmd, tmp)
+	if err != nil {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+	return dir
 }

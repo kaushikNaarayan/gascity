@@ -17,11 +17,16 @@ may also be supplied through GC_VERSION. Existing binaries are replaced only
 after every archive has downloaded, passed SHA-256 verification, unpacked, and
 passed a smoke test (each new binary must run its own version command).
 
-Required environment: GC_BD_VERSION, GC_BD_SHA256, and on Linux also
-GC_DOLT_VERSION/GC_DOLT_SHA256. Supply the checksum for the selected OS/
-architecture asset from the release manifest. This installer deliberately has
-no dependency defaults: the release manager owns the published gc/Dolt/bd
-compatibility tuple.
+Dependency pins: GC_BD_VERSION/GC_BD_SHA256, and on Linux also
+GC_DOLT_VERSION/GC_DOLT_SHA256. When any of these is not set explicitly, the
+installer fetches the published VERSIONS manifest for this exact gc tag and
+reads the matching value(s) for the detected OS/arch from it; an explicit
+environment value always wins over whatever the manifest says. If the
+manifest cannot be fetched, does not match this tag, or is missing a
+required key, the installer fails closed rather than guessing. This
+installer deliberately has no baked-in dependency defaults: the release
+manager owns the published gc/Dolt/bd compatibility tuple, either by hand
+via these variables or through the manifest they publish alongside the tag.
 
 On darwin, Dolt is intentionally NOT installed here: the Mac's live Dolt is
 Homebrew-owned. The installer names Homebrew as the owner and refuses to
@@ -36,7 +41,9 @@ PATH does it fall back to ~/.local/bin.
 On success, the previous gc/dolt/bd binaries are kept beside the new ones as
 <binary>.prev-<old-version> for a manual revert.
 
-Optional environment: GC_INSTALL_REPO.
+Optional environment: GC_INSTALL_REPO, GC_MANIFEST_URL (advanced/test-only
+override for where the VERSIONS manifest is fetched from; defaults to the
+raw VERSIONS file published at this tag in GC_INSTALL_REPO).
 EOF
 }
 
@@ -84,7 +91,61 @@ case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *
 for command in curl tar install cp mv; do command -v "$command" >/dev/null || { echo "Required command not found: $command" >&2; exit 1; }; done
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 require_sha() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || { echo "Missing or malformed checksum for $2" >&2; exit 1; }; }
-[[ -n "$bd_version" ]] || { echo "GC_BD_VERSION is required" >&2; exit 2; }
+
+# Release manifest (VERSIONS): fills in whichever of GC_BD_VERSION/
+# GC_BD_SHA256/GC_DOLT_VERSION/GC_DOLT_SHA256 were not supplied explicitly.
+# Explicit env values always win — this only fills gaps, never overrides.
+# Only fetched when something is actually missing, so a caller who pins
+# every value by hand never touches the network for it.
+need_bd_manifest=false
+if [[ -z "$bd_version" || -z "$bd_sha" ]]; then need_bd_manifest=true; fi
+need_dolt_manifest=false
+if [[ "$os" == linux && ( -z "$dolt_version" || -z "$dolt_sha" ) ]]; then need_dolt_manifest=true; fi
+
+if "$need_bd_manifest" || "$need_dolt_manifest"; then
+  manifest_url="${GC_MANIFEST_URL:-https://raw.githubusercontent.com/${repo}/v${version}/VERSIONS}"
+  manifest_raw="$(curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$manifest_url")" || {
+    echo "Failed to fetch release manifest for v${version} from ${manifest_url}; supply GC_BD_VERSION/GC_BD_SHA256 (and on Linux GC_DOLT_VERSION/GC_DOLT_SHA256) explicitly instead." >&2
+    exit 1
+  }
+  # Parse as inert data, never source/eval: this is remote content. Only a
+  # strict KEY=VALUE shape is accepted; anything else (a hostile line with
+  # shell metacharacters, command substitution, spaces) is silently dropped
+  # by the loop below, which leaves the corresponding required value empty
+  # and lets the existing required-var/require_sha checks fail closed on it.
+  declare -A manifest
+  while IFS= read -r manifest_line; do
+    if [[ "$manifest_line" =~ ^([A-Z0-9_]+)=([A-Za-z0-9._-]+)$ ]]; then
+      manifest["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    fi
+  done <<<"$manifest_raw"
+
+  manifest_gc_version="${manifest[GC_VERSION]:-}"
+  [[ "$manifest_gc_version" == "$version" ]] || {
+    echo "Release manifest GC_VERSION (${manifest_gc_version:-<missing>}) does not match requested version ${version} (from ${manifest_url}); refusing to use it." >&2
+    exit 1
+  }
+
+  manifest_os="$(printf '%s' "$os" | tr '[:lower:]' '[:upper:]')"
+  manifest_arch="$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')"
+
+  if "$need_bd_manifest"; then
+    [[ -n "$bd_version" ]] || bd_version="${manifest[BD_VERSION]:-}"
+    [[ -n "$bd_sha" ]] || bd_sha="${manifest["BD_SHA256_${manifest_os}_${manifest_arch}"]:-}"
+  fi
+  if "$need_dolt_manifest"; then
+    [[ -n "$dolt_version" ]] || dolt_version="${manifest[DOLT_VERSION]:-}"
+    [[ -n "$dolt_sha" ]] || dolt_sha="${manifest["DOLT_SHA256_${manifest_os}_${manifest_arch}"]:-}"
+  fi
+fi
+
+# gastownhall/beads release tags carry a "v" prefix in their download URL
+# (unlike Dolt's, which this script prepends itself below); normalize here
+# so both an explicit GC_BD_VERSION and a manifest-sourced BD_VERSION (which
+# is recorded without the prefix, e.g. "1.3.0-rc.2") resolve the same asset.
+if [[ -n "$bd_version" && "$bd_version" != v* ]]; then bd_version="v${bd_version}"; fi
+
+[[ -n "$bd_version" ]] || { echo "GC_BD_VERSION is required (not set, and not resolvable from the release manifest)" >&2; exit 2; }
 require_sha "$bd_sha" "GC_BD_SHA256"
 
 # gcf-ocze ruling (option B, 2026-09-08): on darwin the Dolt pin is satisfied
@@ -103,7 +164,7 @@ if [[ "$os" == darwin ]]; then
     echo "Not installing Dolt: darwin's Dolt is Homebrew-owned, and none was found on PATH. Install it with Homebrew ('brew install dolt'), not this installer." >&2
   fi
 elif [[ -z "$dolt_version" ]]; then
-  echo "GC_DOLT_VERSION is required" >&2
+  echo "GC_DOLT_VERSION is required (not set, and not resolvable from the release manifest)" >&2
   exit 2
 else
   require_sha "$dolt_sha" "GC_DOLT_SHA256"
