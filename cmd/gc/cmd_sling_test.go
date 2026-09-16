@@ -449,6 +449,46 @@ func TestSlingJSONFromResult(t *testing.T) {
 	}
 }
 
+// TestPrintSlingResultPoolDispatchUnconfirmedIsHonest is the CLI-level
+// negative control for gcf-xsaw fault (b): the printed message for a pool
+// dispatch with no confirmed spawn must say so, not just "Slung". Before the
+// fix (no PoolDispatchUnconfirmed field/branch), this string is never
+// printed, so the assertion fails.
+func TestPrintSlingResultPoolDispatchUnconfirmedIsHonest(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	result := sling.SlingResult{
+		BeadID:                  "BL-1",
+		Target:                  "gascity/gastown.polecat",
+		PoolDispatchUnconfirmed: true,
+	}
+	printSlingResult(result, &stdout, &stderr)
+	out := stdout.String()
+	if !strings.Contains(out, "Slung BL-1 → gascity/gastown.polecat") {
+		t.Fatalf("expected routing confirmation line, got %q", out)
+	}
+	if !strings.Contains(out, "not confirmed") {
+		t.Errorf("expected an honest not-confirmed caveat for unconfirmed pool dispatch, got %q", out)
+	}
+	if strings.Contains(out, "failed") {
+		t.Errorf("must not claim spawn failure — sling genuinely does not know; got %q", out)
+	}
+}
+
+// TestPrintSlingResultConfirmedRouteHasNoCaveat: the ordinary (non-pool, or
+// nudged) success path must stay exactly as it was — no new noise.
+func TestPrintSlingResultConfirmedRouteHasNoCaveat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	result := sling.SlingResult{
+		BeadID: "BL-1",
+		Target: "mayor",
+	}
+	printSlingResult(result, &stdout, &stderr)
+	out := stdout.String()
+	if out != "Slung BL-1 → mayor\n" {
+		t.Errorf("expected unchanged plain success line, got %q", out)
+	}
+}
+
 func TestDoSlingBeadToFixedAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

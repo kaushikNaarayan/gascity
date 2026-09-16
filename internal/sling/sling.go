@@ -209,6 +209,15 @@ type SlingResult struct {
 	Total         int
 	NudgeAgent    *config.Agent // non-nil if caller should nudge
 
+	// PoolDispatchUnconfirmed is true when the bead was routed to a pool
+	// (multi-instance) target with no --nudge, so DoSling only fired a
+	// best-effort, fire-and-forget controller poke (sling_core.go's
+	// PokeController call). Routing a bead never confirms a session actually
+	// reaches StateActive — that happens later, asynchronously, in the
+	// controller/reconciler — so this flags the gap for display rather than
+	// letting the CLI imply spawn success it cannot see (gcf-xsaw).
+	PoolDispatchUnconfirmed bool
+
 	// Per-child results for batch operations.
 	Children []SlingChildResult
 }

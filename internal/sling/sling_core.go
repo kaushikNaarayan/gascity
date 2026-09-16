@@ -730,6 +730,12 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 	// Signal nudge.
 	if opts.Nudge {
 		result.NudgeAgent = &a
+	} else if a.SupportsInstanceExpansion() {
+		// No --nudge: nothing here (or downstream) confirms the poke above
+		// actually resulted in a session reaching StateActive. Flag it for
+		// display rather than letting the caller read plain routing success
+		// as spawn success (gcf-xsaw AC3 fault b).
+		result.PoolDispatchUnconfirmed = true
 	}
 
 	return result, nil
