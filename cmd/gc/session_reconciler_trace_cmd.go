@@ -382,6 +382,15 @@ func traceStatusHeadSeq(status traceStatusJSON, cityPath string) (uint64, error)
 	return traceHeadSeq(traceCityRuntimeDir(cityPath))
 }
 
+// printTraceSegmentWarnings tells a reader which segments cost them
+// completeness, distinct from "your query failed" (gcf-pfsz AC2): the
+// command below this still returns 0 and prints whatever records it found.
+func printTraceSegmentWarnings(cmdName string, warnings []TraceSegmentWarning, stderr io.Writer) {
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "%s: skipped unreadable segment %s (results are partial): %v\n", cmdName, w.Path, w.Cause) //nolint:errcheck
+	}
+}
+
 func cmdTraceShow(template, since, traceID, tickID, recordType, reason string, jsonOut bool, stdout, stderr io.Writer) int {
 	cityPath, err := resolveCity()
 	if err != nil {
@@ -403,11 +412,12 @@ func cmdTraceShow(template, since, traceID, tickID, recordType, reason string, j
 		}
 		filter.Since = time.Now().Add(-d)
 	}
-	recs, err := ReadTraceRecords(traceCityRuntimeDir(cityPath), filter)
+	recs, warnings, err := ReadTraceRecordsTolerant(traceCityRuntimeDir(cityPath), filter)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc trace show: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	printTraceSegmentWarnings("gc trace show", warnings, stderr)
 	if recs == nil {
 		recs = []SessionReconcilerTraceRecord{}
 	}
@@ -468,11 +478,12 @@ func cmdTraceReasons(template, since string, stdout, stderr io.Writer) int {
 		}
 		filter.Since = time.Now().Add(-d)
 	}
-	recs, err := ReadTraceRecords(traceCityRuntimeDir(cityPath), filter)
+	recs, warnings, err := ReadTraceRecordsTolerant(traceCityRuntimeDir(cityPath), filter)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc trace reasons: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	printTraceSegmentWarnings("gc trace reasons", warnings, stderr)
 	reasons := make(map[string]int)
 	for _, rec := range recs {
 		if rec.ReasonCode != "" {

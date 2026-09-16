@@ -600,19 +600,82 @@ func sortTraceArms(arms []TraceArm) {
 	})
 }
 
+// TraceSegmentWarning names a segment file that ReadTraceRecords could not
+// fully read, and why. Callers that care about completeness (the CLI) should
+// surface these; callers that don't (internal head-seq bookkeeping) can
+// ignore the second return value.
+type TraceSegmentWarning struct {
+	Path  string
+	Cause error
+}
+
+// traceSegmentDayFromPath extracts the UTC calendar day a segment file
+// belongs to from its path, which is always laid out as
+// .../segments/YYYY/MM/DD/segment-NNNNNN.jsonl (see openSegment). Returns
+// false if the path doesn't match that shape, in which case callers must not
+// prune the file by date -- an unrecognized layout is not evidence the file
+// is out of range.
+func traceSegmentDayFromPath(path string) (time.Time, bool) {
+	dd := filepath.Dir(path)
+	day := filepath.Base(dd)
+	mm := filepath.Base(filepath.Dir(dd))
+	yyyy := filepath.Base(filepath.Dir(filepath.Dir(dd)))
+	t, err := time.ParseInLocation("2006-01-02", yyyy+"-"+mm+"-"+day, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// traceSegmentOutsideWindow reports whether a segment's entire calendar day
+// falls before filter.Since (or after filter.Until, when set) -- i.e. the
+// file cannot contain any record the filter would keep, so it must never be
+// opened at all (gcf-pfsz AC1/AC3: a corrupt segment outside the requested
+// window must never be the reason a query fails).
+func traceSegmentOutsideWindow(path string, filter TraceFilter) bool {
+	day, ok := traceSegmentDayFromPath(path)
+	if !ok {
+		return false
+	}
+	dayEnd := day.Add(24 * time.Hour)
+	if !filter.Since.IsZero() && !dayEnd.After(filter.Since) {
+		return true
+	}
+	if !filter.Until.IsZero() && day.After(filter.Until) {
+		return true
+	}
+	return false
+}
+
 func ReadTraceRecords(rootDir string, filter TraceFilter) ([]SessionReconcilerTraceRecord, error) {
+	records, _, err := ReadTraceRecordsTolerant(rootDir, filter)
+	return records, err
+}
+
+// ReadTraceRecordsTolerant is ReadTraceRecords, but a segment that cannot be
+// parsed no longer aborts the whole read (gcf-pfsz): a segment entirely
+// outside the requested time window is skipped without ever being opened,
+// and a segment inside the window that fails to parse is skipped with a
+// warning naming the file, so the query still returns every record it could
+// actually read.
+func ReadTraceRecordsTolerant(rootDir string, filter TraceFilter) ([]SessionReconcilerTraceRecord, []TraceSegmentWarning, error) {
 	segmentRoot := filepath.Join(rootDir, sessionReconcilerTraceSegments)
 	paths, err := filepath.Glob(filepath.Join(segmentRoot, "*", "*", "*", "*.jsonl"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sort.Strings(paths)
+	var warnings []TraceSegmentWarning
 	if filter.SeqAfter > 0 && len(paths) > 0 {
 		var filtered []string
 		for i := len(paths) - 1; i >= 0; i-- {
+			if traceSegmentOutsideWindow(paths[i], filter) {
+				continue
+			}
 			maxSeq, ok, scanErr := scanTraceSegment(paths[i])
 			if scanErr != nil {
-				return nil, fmt.Errorf("reading trace file %s: %w", paths[i], scanErr)
+				warnings = append(warnings, TraceSegmentWarning{Path: paths[i], Cause: scanErr})
+				continue
 			}
 			if !ok {
 				continue
@@ -629,14 +692,18 @@ func ReadTraceRecords(rootDir string, filter TraceFilter) ([]SessionReconcilerTr
 	}
 	records := make([]SessionReconcilerTraceRecord, 0)
 	for _, path := range paths {
+		if traceSegmentOutsideWindow(path, filter) {
+			continue
+		}
 		fileRecords, _, err := readTraceRecordsFile(path, filter, true)
 		if err != nil {
-			return nil, fmt.Errorf("reading trace file %s: %w", path, err)
+			warnings = append(warnings, TraceSegmentWarning{Path: path, Cause: err})
+			continue
 		}
 		records = append(records, fileRecords...)
 	}
 	sortTraceRecords(records)
-	return records, nil
+	return records, warnings, nil
 }
 
 func readTraceRecordsFile(path string, filter TraceFilter, tolerateTail bool) ([]SessionReconcilerTraceRecord, uint64, error) {

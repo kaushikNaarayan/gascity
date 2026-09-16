@@ -415,6 +415,123 @@ func TestTraceRecoveryQuarantinesInteriorCorruption(t *testing.T) {
 	}
 }
 
+// writeRawTraceSegment plants a hand-written segment file at a specific
+// calendar day, bypassing the store's own writer -- the day-directory
+// structure alone is what ReadTraceRecordsTolerant's window pruning reads,
+// so tests need direct control over which day a file lands in.
+func writeRawTraceSegment(t *testing.T, cityDir string, day time.Time, contents string) string {
+	t.Helper()
+	dir := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir,
+		sessionReconcilerTraceSegments, day.Format("2006"), day.Format("01"), day.Format("02"))
+	if err := os.MkdirAll(dir, sessionReconcilerTraceOwnerDirPerm); err != nil {
+		t.Fatalf("mkdir segment dir: %v", err)
+	}
+	path := filepath.Join(dir, "segment-000001.jsonl")
+	if err := os.WriteFile(path, []byte(contents), sessionReconcilerTraceOwnerFilePerm); err != nil {
+		t.Fatalf("write segment: %v", err)
+	}
+	return path
+}
+
+// writeValidTraceSegmentToday uses the real store writer (so the record is
+// correctly wrapped in a batch_commit, which readTraceRecordsFile requires
+// to emit anything) to produce a genuine, readable segment under today's
+// date directory.
+func writeValidTraceSegmentToday(t *testing.T, cityDir, tickID string) {
+	t.Helper()
+	store, err := newSessionReconcilerTraceStore(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	rec := SessionReconcilerTraceRecord{
+		TraceSchemaVersion: sessionReconcilerTraceSchemaVersion,
+		TraceID:            "cycle-" + tickID,
+		TickID:             tickID,
+		RecordType:         TraceRecordDecision,
+		Template:           "repo/polecat",
+		SessionName:        "polecat-1",
+		SiteCode:           TraceSiteReconcilerWakeDecision,
+		TraceMode:          TraceModeDetail,
+		TraceSource:        TraceSourceManual,
+		Ts:                 time.Now().UTC(),
+	}
+	if err := store.AppendBatch([]SessionReconcilerTraceRecord{rec}, TraceDurabilityDurable); err != nil {
+		t.Fatalf("append batch: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+}
+
+// TestReadTraceRecordsTolerantNeverOpensSegmentOutsideWindow is the
+// negative control for gcf-pfsz AC1/AC3: a corrupt segment entirely outside
+// the requested --since window must never be opened at all, so it cannot
+// break a query scoped to a later day. Before the fix (ReadTraceRecords
+// globs every segment and aborts the whole read on the first parse error,
+// unconditionally), this assertion fails with a non-nil error naming the
+// old, out-of-window file.
+func TestReadTraceRecordsTolerantNeverOpensSegmentOutsideWindow(t *testing.T) {
+	cityDir := t.TempDir()
+	old := time.Now().UTC().AddDate(0, 0, -5)
+	oldPath := writeRawTraceSegment(t, cityDir, old, "{this is not json at all, and has no closing brace")
+	writeValidTraceSegmentToday(t, cityDir, "trace-recent")
+
+	rootDir := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir)
+	filter := TraceFilter{Since: time.Now().UTC().Add(-time.Hour), Template: "repo/polecat"}
+	records, warnings, err := ReadTraceRecordsTolerant(rootDir, filter)
+	if err != nil {
+		t.Fatalf("ReadTraceRecordsTolerant returned an error for a query that never needed the corrupt old segment: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("expected zero warnings (the corrupt segment is outside the window and must never be opened), got %+v", warnings)
+	}
+	if len(records) != 1 || records[0].TickID != "trace-recent" {
+		t.Fatalf("records = %+v, want exactly the in-window recent record", records)
+	}
+	for _, w := range warnings {
+		if w.Path == oldPath {
+			t.Fatalf("the out-of-window corrupt segment %s was opened at all", oldPath)
+		}
+	}
+
+	// Back-compat wrapper must show the same fix.
+	if _, err := ReadTraceRecords(rootDir, filter); err != nil {
+		t.Fatalf("ReadTraceRecords: %v", err)
+	}
+}
+
+// TestReadTraceRecordsTolerantSkipsInWindowCorruptionWithWarning is gcf-pfsz
+// AC1/AC2's other half: a corrupt segment INSIDE the requested window must
+// be skipped, not abort the read, and the caller must be told which file it
+// cost them. Before the fix this fails: ReadTraceRecords returns a nil
+// record slice and a non-nil error instead of the good segment's records
+// plus a named warning.
+func TestReadTraceRecordsTolerantSkipsInWindowCorruptionWithWarning(t *testing.T) {
+	cityDir := t.TempDir()
+	yesterday := time.Now().UTC().AddDate(0, 0, -1)
+	// Write the good segment FIRST: constructing a store also recovers/
+	// quarantines any pre-existing corrupt segment as a side effect of
+	// opening (recoverExisting), which would remove the very file this test
+	// needs ReadTraceRecordsTolerant -- not the store -- to tolerate. The
+	// corrupt segment must land on disk after the store has already opened
+	// and closed once.
+	writeValidTraceSegmentToday(t, cityDir, "trace-good")
+	corruptPath := writeRawTraceSegment(t, cityDir, yesterday, "{this is not json at all, and has no closing brace\nmore-data-after-the-corrupt-line-so-it-is-not-mistaken-for-a-truncated-tail-write\n")
+
+	rootDir := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir)
+	filter := TraceFilter{Since: yesterday.Add(-time.Hour), Template: "repo/polecat"} // covers both days
+	records, warnings, err := ReadTraceRecordsTolerant(rootDir, filter)
+	if err != nil {
+		t.Fatalf("ReadTraceRecordsTolerant: %v", err)
+	}
+	if len(records) != 1 || records[0].TickID != "trace-good" {
+		t.Fatalf("records = %+v, want exactly the readable good-day record", records)
+	}
+	if len(warnings) != 1 || warnings[0].Path != corruptPath {
+		t.Fatalf("warnings = %+v, want exactly one naming %s", warnings, corruptPath)
+	}
+}
+
 func TestTraceCycleResultRollupIncludesFlushedRecords(t *testing.T) {
 	cityDir := t.TempDir()
 	tracer := newSessionReconcilerTracer(cityDir, "trace-town", io.Discard)
