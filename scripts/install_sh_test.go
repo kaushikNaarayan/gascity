@@ -6,9 +6,118 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// bash4OnlyConstructs are the constructs stock macOS's /bin/bash 3.2.57
+// (2006, the last GPLv2 release Apple ships) does not support. gcf-h3ny:
+// declare -A at install.sh:182 (introduced by the VERSIONS-manifest reader,
+// PR #50) was already present in v1.3.8; the unauthenticated-fetch bug
+// gcf-aetk fixed masked it on every platform until QA's real Mac execution
+// reached it. This is a static guard, not proof the script runs -- that
+// stays QA's Mac execution at the release gate (PM ruling R2) -- but it
+// catches a REINTRODUCTION of any of these constructs on gt2 (Linux CI),
+// without a per-PR macos runner job (the merge-queue constraint PM named).
+var bash4OnlyConstructs = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"declare -A (associative arrays, bash 4+)", regexp.MustCompile(`\bdeclare\s+-A\b`)},
+	{"local -A (associative arrays, bash 4+)", regexp.MustCompile(`\blocal\s+-A\b`)},
+	{"mapfile (bash 4+)", regexp.MustCompile(`\bmapfile\b`)},
+	{"readarray (bash 4+)", regexp.MustCompile(`\breadarray\b`)},
+	{"${x,,} lowercase expansion (bash 4+)", regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*,,?\}`)},
+	{"${x^^} uppercase expansion (bash 4+)", regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\^\^?\}`)},
+	{"coproc (bash 4+)", regexp.MustCompile(`\bcoproc\b`)},
+	{"&>> redirection (bash 4+)", regexp.MustCompile(`&>>`)},
+}
+
+// stripBashComment removes a trailing `# comment`, but only when the `#` is
+// preceded by whitespace or is the first character on the line -- so it does
+// NOT truncate real code using bash's `#`-based parameter expansion
+// (${var#pattern}, ${#array[@]}), which install.sh uses in several places
+// (e.g. ${version#v}, ${#manifest_lines[@]}) and where the `#` is always
+// immediately adjacent to an identifier, never preceded by whitespace.
+var bashCommentStart = regexp.MustCompile(`(^|\s)#`)
+
+func stripBashComment(line string) string {
+	loc := bashCommentStart.FindStringIndex(line)
+	if loc == nil {
+		return line
+	}
+	return line[:loc[1]-1]
+}
+
+// TestInstallScriptRejectsBash4OnlyConstructs is the gcf-h3ny R2 static
+// guard: it scans install.sh's CODE (comments stripped, so this test file's
+// and install.sh's own prose about bash-3.2-portability can freely mention
+// these construct names without tripping the guard on themselves) for any
+// bash-4-only construct, and fails naming the exact line if one is found.
+func TestInstallScriptRejectsBash4OnlyConstructs(t *testing.T) {
+	root := repoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(script), "\n") {
+		code := stripBashComment(line)
+		for _, c := range bash4OnlyConstructs {
+			if c.re.MatchString(code) {
+				t.Errorf("install.sh:%d uses %s, which stock macOS bash 3.2.57 does not support (gcf-h3ny): %s", i+1, c.name, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
+// TestInstallScriptBash4GuardHasTeeth is the negative control for the guard
+// above: without it, a regression that silently reintroduces declare -A (or
+// any sibling construct) would pass CI clean on gt2's bash 5, exactly the
+// failure mode gcf-h3ny exists to catch. Proves the regexes actually match
+// bash-4-only syntax when it's really there, not just when it's absent.
+func TestInstallScriptBash4GuardHasTeeth(t *testing.T) {
+	hit := false
+	for _, c := range bash4OnlyConstructs {
+		if c.re.MatchString(stripBashComment("declare -A manifest")) && c.name == bash4OnlyConstructs[0].name {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatal("bash4OnlyConstructs' declare -A pattern does not match a real declare -A line -- the guard has no teeth")
+	}
+	for _, tc := range []string{
+		"declare -A manifest",
+		"local -A lookup",
+		"mapfile -t lines < file",
+		"readarray -t lines < file",
+		`x="${y,,}"`,
+		`x="${y^^}"`,
+		"coproc foo { bar; }",
+		"cmd &>> log.txt",
+	} {
+		matched := false
+		for _, c := range bash4OnlyConstructs {
+			if c.re.MatchString(stripBashComment(tc)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("no bash4OnlyConstructs pattern matched known bash-4-only line %q -- guard is not catching this construct", tc)
+		}
+	}
+	// And the comment-stripping half of the negative control: a line that
+	// only MENTIONS declare -A in a comment must NOT be flagged, or every
+	// explanatory comment in install.sh (including this guard's own) would
+	// be a false positive -- the exact "verdict phrase quoted in prose"
+	// failure mode.
+	for _, c := range bash4OnlyConstructs {
+		if c.re.MatchString(stripBashComment("  # gcf-h3ny: NOT declare -A, see below")) {
+			t.Errorf("comment-only mention of %q was flagged as real code -- stripBashComment is not stripping comments correctly", c.name)
+		}
+	}
+}
 
 func TestInstallScriptPlatformsAndTransactionalFailure(t *testing.T) {
 	root := repoRoot(t)
