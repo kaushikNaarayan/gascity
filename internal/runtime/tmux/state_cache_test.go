@@ -896,3 +896,48 @@ func TestProcessAliveWrappedPane(t *testing.T) {
 		t.Fatal("processAlive = false for systemd-run pane with claude child, want true (descendant fallback)")
 	}
 }
+
+// TestProcessAliveMatchesRealShimVariant pins the gcf-7gcj.2.7 fix (AC1): a
+// pane whose process is alive under a wrapper-renamed binary (the shim execs
+// "gc" into "gc.real", replacing the process image) must be classified
+// alive against a configured process_names of ["gc"], not permanently
+// zombie. Before the fix, filepath.Base("gc.real") == "gc.real" never
+// matched the exact "gc" entry, so control-dispatcher was reaped/respawned
+// on every reconcile tick despite being alive.
+func TestProcessAliveMatchesRealShimVariant(t *testing.T) {
+	snapshot := newProcessSnapshot([]processRuntimeState{
+		{PID: "200", PPID: "1", Command: "/home/kanaba/.local/bin/gc.real", Args: "/home/kanaba/.local/bin/gc.real convoy control --serve --follow gascity/core.control-dispatcher"},
+	})
+	pane := paneRuntimeState{Command: "gc.real", PID: "200"}
+	if !pane.processAlive(processNameSet([]string{"gc"}), snapshot) {
+		t.Fatal("processAlive = false for gc.real-wrapped pane against process_names [gc], want true (AC1)")
+	}
+}
+
+// TestProcessAliveStillDetectsGenuineExitOfRealShimTarget is the AC2
+// negative control paired with the fix above: a pane that genuinely has no
+// live process behind it (no PID entry in the snapshot at all) must still
+// be classified dead. The ".real" suffix match must not blind the detector
+// to an actual exit.
+func TestProcessAliveStillDetectsGenuineExitOfRealShimTarget(t *testing.T) {
+	snapshot := newProcessSnapshot(nil)
+	pane := paneRuntimeState{Command: "gc.real", PID: "200"}
+	if pane.processAlive(processNameSet([]string{"gc"}), snapshot) {
+		t.Fatal("processAlive = true for a PID absent from the snapshot, want false (AC2 negative control)")
+	}
+}
+
+// TestProcessAliveDoesNotMatchUnrelatedSameStemBinary is the AC3 negative
+// control: matchesNameOrRealVariant recognizes only the documented ".real"
+// Gas City shim suffix, not generic extension stripping. A "foo.py" pane
+// must NOT match a configured process_names of ["foo"] — that would be an
+// undecided widening (see the doc comment on matchesNameOrRealVariant).
+func TestProcessAliveDoesNotMatchUnrelatedSameStemBinary(t *testing.T) {
+	snapshot := newProcessSnapshot([]processRuntimeState{
+		{PID: "300", PPID: "1", Command: "foo.py", Args: "foo.py"},
+	})
+	pane := paneRuntimeState{Command: "foo.py", PID: "300"}
+	if pane.processAlive(processNameSet([]string{"foo"}), snapshot) {
+		t.Fatal("processAlive = true for foo.py pane against process_names [foo], want false (AC3 negative control: no generic extension-stripping widening)")
+	}
+}
