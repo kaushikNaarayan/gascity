@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Install a pinned Gas City release and its runtime data-plane dependencies.
 #
-# Usage: curl -fsSL https://raw.githubusercontent.com/material-lab-io/gascity/main/install.sh | bash
-#        ./install.sh 1.3.7
+# material-lab-io/gascity is a PRIVATE repo (gcf-aetk): a plain unauthenticated
+# fetch of this script -- or of anything else in that repo -- 404s. Use the gh
+# CLI (already authenticated) to pull the script itself, then run it normally:
+#   gh api -H 'Accept: application/vnd.github.raw' \
+#     repos/material-lab-io/gascity/contents/install.sh?ref=main > install.sh
+#   bash install.sh 1.3.8
+# Once running, install.sh authenticates its OWN downloads the same way --
+# see "Dependency pins" below.
 set -euo pipefail
 
 repo="${GC_INSTALL_REPO:-material-lab-io/gascity}"
@@ -41,9 +47,19 @@ PATH does it fall back to ~/.local/bin.
 On success, the previous gc/dolt/bd binaries are kept beside the new ones as
 <binary>.prev-<old-version> for a manual revert.
 
+GC_INSTALL_REPO defaults to a PRIVATE repo (material-lab-io/gascity): every
+fetch from it (the VERSIONS manifest, gc's own release assets) needs one of,
+tried in order: the gh CLI already authenticated (`gh auth status`); a
+GH_TOKEN or GITHUB_TOKEN env var; or -- as a last-resort fallback, only
+useful if GC_INSTALL_REPO happens to be public -- a plain unauthenticated
+request. With none of those, the installer fails closed rather than
+guessing. Dolt (dolthub/dolt) and bd (gastownhall/beads) are public and
+always fetched unauthenticated.
+
 Optional environment: GC_INSTALL_REPO, GC_MANIFEST_URL (advanced/test-only
 override for where the VERSIONS manifest is fetched from; defaults to the
-raw VERSIONS file published at this tag in GC_INSTALL_REPO).
+raw VERSIONS file published at this tag in GC_INSTALL_REPO), GH_TOKEN /
+GITHUB_TOKEN (authenticate GC_INSTALL_REPO fetches without the gh CLI).
 EOF
 }
 
@@ -91,6 +107,39 @@ case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *
 for command in curl tar install cp mv; do command -v "$command" >/dev/null || { echo "Required command not found: $command" >&2; exit 1; }; done
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 require_sha() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || { echo "Missing or malformed checksum for $2" >&2; exit 1; }; }
+download() { curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$1" --output "$2"; }
+
+# Authenticated fetch for GC_INSTALL_REPO (gcf-aetk): it defaults to a
+# PRIVATE repo, so a plain unauthenticated request 404s -- for the VERSIONS
+# manifest AND gc's own release assets, not just one of them. Tried in
+# order: the gh CLI, if it is on PATH and already authenticated; a
+# GH_TOKEN/GITHUB_TOKEN env var via the GitHub API directly; a plain
+# unauthenticated request as a last-resort fallback (only useful if $repo
+# happens to be public); then fail closed. The token is NEVER passed as a
+# curl/gh argument (visible to any other user via `ps` on a shared host):
+# it goes to curl over stdin as an -H @- header, one line, nothing else on
+# that process's argv.
+gh_ok=false
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then gh_ok=true; fi
+gh_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+auth_get() {
+  # auth_get API_PATH ACCEPT DEST -- authenticated GET against
+  # api.github.com/repos/${repo}/API_PATH, response saved to DEST.
+  local api_path="$1" accept="$2" dest="$3"
+  if "$gh_ok"; then
+    gh api -H "Accept: ${accept}" "repos/${repo}/${api_path}" >"$dest" 2>/dev/null
+    return $?
+  fi
+  if [[ -n "$gh_token" ]]; then
+    printf 'Authorization: Bearer %s\n' "$gh_token" \
+      | curl --fail --location --retry 3 --retry-all-errors --silent --show-error \
+          -H "Accept: ${accept}" -H @- \
+          "https://api.github.com/repos/${repo}/${api_path}" --output "$dest"
+    return $?
+  fi
+  return 2
+}
+auth_unavailable_msg="install/authenticate the gh CLI (gh auth login), or export GH_TOKEN/GITHUB_TOKEN"
 
 # Release manifest (VERSIONS): fills in whichever of GC_BD_VERSION/
 # GC_BD_SHA256/GC_DOLT_VERSION/GC_DOLT_SHA256 were not supplied explicitly.
@@ -103,11 +152,28 @@ need_dolt_manifest=false
 if [[ "$os" == linux && ( -z "$dolt_version" || -z "$dolt_sha" ) ]]; then need_dolt_manifest=true; fi
 
 if "$need_bd_manifest" || "$need_dolt_manifest"; then
-  manifest_url="${GC_MANIFEST_URL:-https://raw.githubusercontent.com/${repo}/v${version}/VERSIONS}"
-  manifest_raw="$(curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$manifest_url")" || {
-    echo "Failed to fetch release manifest for v${version} from ${manifest_url}; supply GC_BD_VERSION/GC_BD_SHA256 (and on Linux GC_DOLT_VERSION/GC_DOLT_SHA256) explicitly instead." >&2
-    exit 1
-  }
+  manifest_tmp="$(mktemp)"
+  if [[ -n "${GC_MANIFEST_URL:-}" ]]; then
+    # Explicit override (tests, or a caller who knows better): used exactly
+    # as given, unauthenticated, no auth_get involved.
+    manifest_url="$GC_MANIFEST_URL"
+    curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$manifest_url" --output "$manifest_tmp" || {
+      rm -f "$manifest_tmp"
+      echo "Failed to fetch release manifest for v${version} from ${manifest_url}; supply GC_BD_VERSION/GC_BD_SHA256 (and on Linux GC_DOLT_VERSION/GC_DOLT_SHA256) explicitly instead." >&2
+      exit 1
+    }
+  else
+    manifest_url="https://raw.githubusercontent.com/${repo}/v${version}/VERSIONS"
+    if ! auth_get "contents/VERSIONS?ref=v${version}" "application/vnd.github.raw" "$manifest_tmp"; then
+      if ! curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$manifest_url" --output "$manifest_tmp"; then
+        rm -f "$manifest_tmp"
+        echo "Failed to fetch release manifest for v${version}: no authenticated access to ${repo} (${auth_unavailable_msg}) and the unauthenticated fallback (${manifest_url}) also failed. Supply GC_BD_VERSION/GC_BD_SHA256 (and on Linux GC_DOLT_VERSION/GC_DOLT_SHA256) explicitly instead." >&2
+        exit 1
+      fi
+    fi
+  fi
+  manifest_raw="$(cat "$manifest_tmp")"
+  rm -f "$manifest_tmp"
   # Parse as inert data, never source/eval: this is remote content. Only a
   # strict KEY=VALUE shape is accepted; anything else (a hostile line with
   # shell metacharacters, command substitution, spaces) is silently dropped
@@ -194,11 +260,45 @@ rollback() {
 trap rollback EXIT
 mkdir -p "$stage" "$tmp/gc" "$tmp/bd"
 
-download() { curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$1" --output "$2"; }
-download "$base/$checksums" "$tmp/$checksums"
+# gc's own checksums.txt + platform archive live in ${repo}, which is
+# PRIVATE by default (gcf-aetk) -- same auth chain as the manifest: gh CLI,
+# then a token via the GitHub API (release metadata to resolve each asset's
+# numeric id, then a per-id download), then a plain unauthenticated request
+# as a last resort, then fail closed.
+fetch_gascity_assets() {
+  if "$gh_ok"; then
+    gh release download "v${version}" -R "$repo" -p "$checksums" -p "$asset" -D "$tmp" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  if [[ -n "$gh_token" ]]; then
+    local release_json="$tmp/.release.json" name id
+    auth_get "releases/tags/v${version}" "application/vnd.github+json" "$release_json" || return 1
+    for name in "$checksums" "$asset"; do
+      # GitHub's API returns pretty-printed JSON, one field per line, "id"
+      # a few lines before its asset's "name" (never the reverse) -- track
+      # the last "id" seen and emit it the moment the matching "name" line
+      # is hit. index() is a plain substring search (not a regex), so an
+      # asset name with '.'/'-' in it needs no escaping.
+      id="$(awk -v want="\"name\": \"${name}\"" '
+        /"id":/ { n=$0; sub(/[^0-9]*"id":[[:space:]]*/, "", n); sub(/[^0-9].*/, "", n); last=n }
+        index($0, want) { print last; exit }
+      ' "$release_json")"
+      [[ -n "$id" ]] || { rm -f "$release_json"; return 1; }
+      auth_get "releases/assets/${id}" "application/octet-stream" "$tmp/${name}" || { rm -f "$release_json"; return 1; }
+    done
+    rm -f "$release_json"
+    return 0
+  fi
+  return 2
+}
+if ! fetch_gascity_assets; then
+  if ! { download "$base/$checksums" "$tmp/$checksums" && download "$base/$asset" "$tmp/$asset"; }; then
+    echo "Failed to download gc release assets for v${version} from ${repo}: no authenticated access (${auth_unavailable_msg}) and the unauthenticated fallback also failed." >&2
+    exit 1
+  fi
+fi
 gc_sha="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$tmp/$checksums")"
 require_sha "$gc_sha" "$asset"
-download "$base/$asset" "$tmp/$asset"
 [[ "$(sha256 "$tmp/$asset")" == "$gc_sha" ]] || { echo "Checksum mismatch for $asset" >&2; exit 1; }
 tar -xzf "$tmp/$asset" -C "$tmp/gc"
 gc_source="$(find "$tmp/gc" -type f -name gc -perm -u+x -print -quit)"
