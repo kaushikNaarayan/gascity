@@ -16,7 +16,7 @@
 # GC_VERSION below exists so a reader/script has one place to see the whole
 # pinned tuple at a glance.
 
-GC_VERSION=1.3.9
+GC_VERSION=1.3.10
 
 # Dolt 2.1.10 (dolthub/dolt), reconfirmed 2026-09-15 by fresh download +
 # sha256sum against the published release (not copied from a prior note).
@@ -57,6 +57,6 @@ BD_SHA256_DARWIN_ARM64=ac132fbf451b479f75b98e7a02f86455aef5418762c527456ff14cdcd
 # including writes) — there is no safe rolling/partial-upgrade window in
 # either direction. install.sh installs this binary; it does not and must
 # not run `bd migrate` itself. The fleet ledger migration is a separate,
-# founder-gated action, not part of the v1.3.9 rollout (unchanged from
-# v1.3.8 — this bump only fixes install.sh's authenticated fetch, gcf-aetk
-# AC-V1; the bd/Dolt pins are untouched).
+# founder-gated action, not part of the v1.3.10 rollout (unchanged from
+# v1.3.8/v1.3.9 — this bump only fixes install.sh's bash-3.2 portability
+# on stock macOS, gcf-h3ny; the bd/Dolt pins are untouched).
