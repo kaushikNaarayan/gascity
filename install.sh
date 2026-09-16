@@ -179,14 +179,38 @@ if "$need_bd_manifest" || "$need_dolt_manifest"; then
   # shell metacharacters, command substitution, spaces) is silently dropped
   # by the loop below, which leaves the corresponding required value empty
   # and lets the existing required-var/require_sha checks fail closed on it.
-  declare -A manifest
+  #
+  # gcf-h3ny: NOT an associative array (declare -A needs bash 4+; stock
+  # macOS ships /bin/bash 3.2.57, which does not have it -- this bug was
+  # already present in v1.3.8, just masked by the unauthenticated-fetch
+  # failure gcf-aetk fixed). manifest_lines is a plain indexed array of
+  # "KEY=VALUE" strings; manifest_get does a linear case-match scan. Both
+  # are bash-3.2-portable: no associative arrays, no mapfile/readarray, no
+  # ${x,,}/${x^^}, no coproc, no &>>.
+  manifest_lines=()
   while IFS= read -r manifest_line; do
     if [[ "$manifest_line" =~ ^([A-Z0-9_]+)=([A-Za-z0-9._-]+)$ ]]; then
-      manifest["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+      manifest_lines+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
     fi
   done <<<"$manifest_raw"
 
-  manifest_gc_version="${manifest[GC_VERSION]:-}"
+  # Always prints (possibly empty) and returns 0, matching the previous
+  # ${manifest[KEY]:-} default-to-empty behavior under `set -e`. Indexes by
+  # count rather than expanding "${manifest_lines[@]}" directly: bash < 4.4
+  # raises "unbound variable" on that expansion for an EMPTY array under
+  # `set -u`, which a manifest with every line rejected as hostile would hit.
+  manifest_get() {
+    local key="$1" line i n="${#manifest_lines[@]}"
+    for ((i = 0; i < n; i++)); do
+      line="${manifest_lines[i]}"
+      case "$line" in
+        "${key}="*) printf '%s' "${line#*=}"; return 0 ;;
+      esac
+    done
+    printf ''
+  }
+
+  manifest_gc_version="$(manifest_get GC_VERSION)"
   [[ "$manifest_gc_version" == "$version" ]] || {
     echo "Release manifest GC_VERSION (${manifest_gc_version:-<missing>}) does not match requested version ${version} (from ${manifest_url}); refusing to use it." >&2
     exit 1
@@ -196,12 +220,12 @@ if "$need_bd_manifest" || "$need_dolt_manifest"; then
   manifest_arch="$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')"
 
   if "$need_bd_manifest"; then
-    [[ -n "$bd_version" ]] || bd_version="${manifest[BD_VERSION]:-}"
-    [[ -n "$bd_sha" ]] || bd_sha="${manifest["BD_SHA256_${manifest_os}_${manifest_arch}"]:-}"
+    [[ -n "$bd_version" ]] || bd_version="$(manifest_get BD_VERSION)"
+    [[ -n "$bd_sha" ]] || bd_sha="$(manifest_get "BD_SHA256_${manifest_os}_${manifest_arch}")"
   fi
   if "$need_dolt_manifest"; then
-    [[ -n "$dolt_version" ]] || dolt_version="${manifest[DOLT_VERSION]:-}"
-    [[ -n "$dolt_sha" ]] || dolt_sha="${manifest["DOLT_SHA256_${manifest_os}_${manifest_arch}"]:-}"
+    [[ -n "$dolt_version" ]] || dolt_version="$(manifest_get DOLT_VERSION)"
+    [[ -n "$dolt_sha" ]] || dolt_sha="$(manifest_get "DOLT_SHA256_${manifest_os}_${manifest_arch}")"
   fi
 fi
 
