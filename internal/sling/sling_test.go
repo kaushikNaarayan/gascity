@@ -3757,6 +3757,80 @@ func TestDoSlingNudgeSignal(t *testing.T) {
 	}
 }
 
+// TestDoSlingPoolTargetWithoutNudgeIsUnconfirmed is the negative control for
+// gcf-xsaw fault (b): sling to a pool target with no --nudge only writes bead
+// metadata and fires a fire-and-forget controller poke — nothing confirms a
+// session ever reaches StateActive. Before the fix, PoolDispatchUnconfirmed
+// does not exist / is never set, so this assertion fails.
+func TestDoSlingPoolTargetWithoutNudgeIsUnconfirmed(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	// No MaxActiveSessions set -> EffectiveMaxActiveSessions() is nil ->
+	// SupportsInstanceExpansion() is true (pool flavor).
+	a := config.Agent{Name: "polecat"}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1",
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.NudgeAgent != nil {
+		t.Fatalf("expected NudgeAgent nil without --nudge, got %+v", result.NudgeAgent)
+	}
+	if !result.PoolDispatchUnconfirmed {
+		t.Error("expected PoolDispatchUnconfirmed=true for a pool target routed with no --nudge; " +
+			"bead-routing success does not confirm a session was spawned (gcf-xsaw)")
+	}
+}
+
+// TestDoSlingPoolTargetWithNudgeClearsUnconfirmed: --nudge takes the explicit
+// nudge-delivery path (NudgeAgent set), so the generic "unconfirmed" caveat
+// must not also fire — the caller gets the more specific nudge outcome instead.
+func TestDoSlingPoolTargetWithNudgeClearsUnconfirmed(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "polecat"}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1", Nudge: true,
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.NudgeAgent == nil {
+		t.Fatal("expected NudgeAgent set with --nudge")
+	}
+	if result.PoolDispatchUnconfirmed {
+		t.Error("expected PoolDispatchUnconfirmed=false when --nudge was requested")
+	}
+}
+
+// TestDoSlingNonPoolTargetNeverUnconfirmed: a named-session (non-pool) target
+// has a stable canonical identity, not the pool-reconciler ambiguity this
+// flag exists for, so it must never be set for one.
+func TestDoSlingNonPoolTargetNeverUnconfirmed(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1",
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.PoolDispatchUnconfirmed {
+		t.Error("expected PoolDispatchUnconfirmed=false for a non-pool (named-session) target")
+	}
+}
+
 func TestDoSlingIdempotentHonorsNudge(t *testing.T) {
 	// A warm pool slot may miss its wake, so re-slinging an already-routed bead
 	// with --nudge must still surface a nudge signal even though the route is

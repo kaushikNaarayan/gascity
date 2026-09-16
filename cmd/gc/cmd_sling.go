@@ -849,6 +849,15 @@ func printSlingResult(result sling.SlingResult, stdout, _ io.Writer) {
 	default:
 		fmt.Fprintf(stdout, "Slung %s → %s\n", result.BeadID, result.Target) //nolint:errcheck
 	}
+	if result.PoolDispatchUnconfirmed {
+		// Routing a bead to a pool target only writes bead metadata and fires
+		// a best-effort controller poke; it never confirms a session reached
+		// StateActive. Say so honestly instead of leaving "Slung" to imply a
+		// spawn that may not have happened (gcf-xsaw AC3 fault b). This is
+		// NOT a claim that the spawn failed — sling genuinely cannot see
+		// that far downstream.
+		fmt.Fprintf(stdout, "  (routed only — controller poked, wake not confirmed; session not confirmed)\n") //nolint:errcheck
+	}
 }
 
 // printBatchSlingResult formats a batch SlingResult for CLI display.
