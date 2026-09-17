@@ -101,6 +101,25 @@ func (s *SessionReconcilerTraceStore) recoverExisting() error {
 	sort.Strings(paths)
 	var maxSeq uint64
 	for _, path := range paths {
+		// gcf-2cty: repair any torn tail (an interrupted write left a
+		// record with no closing brace and no trailing newline at true
+		// EOF) before scanning. Every process restart begins a fresh
+		// segment index (currentSegmentPath never reopens an existing
+		// segment for writing), so a torn tail left by a crashed or
+		// short-written previous process would otherwise sit at EOF
+		// forever: readTraceRecordsFile's tail-tolerance exists precisely
+		// so a reader never aborts on it, but nothing was ever repairing it
+		// either. This is the only code path guaranteed to visit every
+		// segment on every store construction, so it is where that repair
+		// has to happen.
+		if dropped, repairErr := repairTornSegmentTail(path); repairErr != nil {
+			if quarantineErr := s.quarantine(path, repairErr); quarantineErr != nil && s.stderr != nil {
+				fmt.Fprintf(s.stderr, "trace: quarantine %s: %v\n", path, quarantineErr) //nolint:errcheck
+			}
+			continue
+		} else if dropped > 0 && s.stderr != nil {
+			fmt.Fprintf(s.stderr, "trace: repaired torn tail in %s: dropped %d trailing byte(s) after the last complete record\n", path, dropped) //nolint:errcheck
+		}
 		seq, ok, scanErr := scanTraceSegment(path)
 		if scanErr != nil {
 			if quarantineErr := s.quarantine(path, scanErr); quarantineErr != nil && s.stderr != nil {
@@ -166,6 +185,73 @@ func (s *SessionReconcilerTraceStore) openSegment(path string, knownBytes int64,
 		}
 	}
 	return nil
+}
+
+// tornSegmentTailScanWindow bounds how far repairTornSegmentTail scans
+// backward from EOF looking for the last newline. A single AppendBatch
+// writeBuf (one cycle's records plus its commit line) is always far smaller
+// than this, so any torn tail from a real interrupted write is found well
+// inside the window.
+const tornSegmentTailScanWindow = 8 << 20
+
+// repairTornSegmentTail drops a torn trailing fragment from an existing
+// segment file, if one is present. A segment's tail is torn iff the file is
+// non-empty and its last byte is not '\n' -- AppendBatch always writes each
+// record and the trailing batch-commit record terminated by '\n' in one
+// buffer, so a clean write never ends any other way; anything else means a
+// prior write was cut short (a fatal signal such as an OOM-kill, or disk
+// pressure/ENOSPC, interrupting the copy mid-record) before its trailing
+// newline landed on disk.
+//
+// It reports the number of trailing bytes it dropped (0 if the tail was
+// already clean).
+func repairTornSegmentTail(path string) (droppedBytes int64, err error) {
+	f, err := os.OpenFile(path, os.O_RDWR, sessionReconcilerTraceOwnerFilePerm)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close() //nolint:errcheck
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	size := info.Size()
+	if size == 0 {
+		return 0, nil
+	}
+	lastByte := make([]byte, 1)
+	if _, err := f.ReadAt(lastByte, size-1); err != nil {
+		return 0, err
+	}
+	if lastByte[0] == '\n' {
+		return 0, nil
+	}
+
+	start := int64(0)
+	if size > tornSegmentTailScanWindow {
+		start = size - tornSegmentTailScanWindow
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return 0, err
+	}
+	var newSize int64
+	if lastNL := bytes.LastIndexByte(buf, '\n'); lastNL >= 0 {
+		newSize = start + int64(lastNL) + 1
+	} else if start == 0 {
+		// No newline anywhere in the file -- the whole thing is torn.
+		newSize = 0
+	} else {
+		// The torn fragment is bigger than the scan window. Refuse to guess
+		// past it and drop everything scanned rather than leave a
+		// still-torn file that a future append would glue onto again.
+		newSize = start
+	}
+	if err := f.Truncate(newSize); err != nil {
+		return 0, err
+	}
+	return size - newSize, nil
 }
 
 func countBatchesInSegment(path string) int {
@@ -417,8 +503,28 @@ func (s *SessionReconcilerTraceStore) AppendBatch(records []SessionReconcilerTra
 	commitLine = append(commitLine, '\n')
 	writeBuf = append(writeBuf, commitLine...)
 
-	if _, err := s.currentFile.Write(writeBuf); err != nil {
-		return err
+	if n, werr := s.currentFile.Write(writeBuf); werr != nil || n != len(writeBuf) {
+		// gcf-2cty: a write() to a regular file CAN legitimately return a
+		// short count with a non-nil error mid-copy -- disk pressure
+		// (ENOSPC) behaves exactly this way, and the store's own
+		// isLowSpace() gate is only a best-effort heuristic checked before
+		// the write, not a guarantee the write itself completes. The file
+		// descriptor stays open across calls (it is not closed on error),
+		// so if we left those partial bytes in place, the NEXT successful
+		// AppendBatch would append starting from the real end-of-file --
+		// landing its complete record directly onto the torn remainder of
+		// this one, with no separating newline. Truncate back to the size
+		// this store believed was on disk before the write, so the file's
+		// tail is always either fully-committed-and-clean or rolled back
+		// to the last clean boundary; never left torn for something else
+		// to glue onto.
+		if truncErr := s.currentFile.Truncate(s.currentBytes); truncErr != nil && s.stderr != nil {
+			fmt.Fprintf(s.stderr, "trace: truncate after short/failed write on %s: %v\n", s.currentPath, truncErr) //nolint:errcheck
+		}
+		if werr != nil {
+			return werr
+		}
+		return fmt.Errorf("trace: short write to %s: wrote %d of %d bytes", s.currentPath, n, len(writeBuf))
 	}
 	s.seq = seq
 	s.currentBytes += int64(len(writeBuf))
