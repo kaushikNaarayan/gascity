@@ -35,7 +35,25 @@ jobs:
       DOLT_VERSION: "2.1.10"
       BD_VERSION: "v1.1.0"
       GO_VERSION: "1.26.5"
+      # gt2's root filesystem is shared by all three runners, /tmp and every
+      # agent worktree. It has hit 0 bytes free before (gcf-b7fn) and the
+      # resulting job failures were indistinguishable from a code failure —
+      # every step up to actions/setup-go's cache save had passed. This
+      # threshold is a preflight tripwire, not a capacity plan.
+      FORK_VERIFY_MIN_FREE_GB: "5"
     steps:
+      - name: Preflight — fail fast and loud on host disk exhaustion (gcf-b7fn)
+        run: |
+          set -euo pipefail
+          df_line="$(df -Pk . | tail -1)"
+          fs="$(echo "$df_line" | awk '{print $1}')"
+          avail_kb="$(echo "$df_line" | awk '{print $4}')"
+          avail_gb=$(( avail_kb / 1024 / 1024 ))
+          echo "runner filesystem: $fs, available: ${avail_gb}GiB (min required: ${FORK_VERIFY_MIN_FREE_GB}GiB)"
+          if [ "$avail_kb" -lt $(( FORK_VERIFY_MIN_FREE_GB * 1024 * 1024 )) ]; then
+            echo "::error::FORK-VERIFY PREFLIGHT: host disk exhaustion on $fs — only ${avail_gb}GiB free (need >= ${FORK_VERIFY_MIN_FREE_GB}GiB). This is a RUNNER RESOURCE failure, not a code failure — no later step ran, so this candidate's code has not been evaluated. See gcf-b7fn."
+            exit 1
+          fi
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
