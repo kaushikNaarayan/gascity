@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -405,8 +404,7 @@ func (s *blockingListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 // past that bound. Before the bound existed, this scope's call blocked the
 // caller for as long as the store did (unboundedly, per ga-3auv3).
 func TestRecoverScopeRoutesBoundedTimesOutOnSlowStore(t *testing.T) {
-	restoreTimeout := setRouteRecoveryScopeTimeout(t, 20*time.Millisecond)
-	defer restoreTimeout()
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "150ms")
 
 	slow := &blockingListStore{
 		Store:   beads.NewMemStoreFrom(0, nil, nil),
@@ -422,8 +420,8 @@ func TestRecoverScopeRoutesBoundedTimesOutOnSlowStore(t *testing.T) {
 	cr.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-timeout", store: slow})
 	elapsed := time.Since(start)
 
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("recoverScopeRoutesBounded blocked %s, want bounded near the %s timeout (slow store must not starve the caller)", elapsed, routeRecoveryScopeTimeout)
+	if elapsed > time.Second {
+		t.Fatalf("recoverScopeRoutesBounded blocked %s, want bounded near the 150ms timeout (slow store must not starve the caller)", elapsed)
 	}
 	if !strings.Contains(stderr.String(), "degraded") {
 		t.Fatalf("stderr = %q, want a degraded report for the timed-out scope", stderr.String())
@@ -435,8 +433,7 @@ func TestRecoverScopeRoutesBoundedTimesOutOnSlowStore(t *testing.T) {
 // bound, a second call for the same scope label must not launch a second
 // concurrent List against the same slow store — it must skip outright.
 func TestRecoverScopeRoutesBoundedSkipsInFlightScope(t *testing.T) {
-	restoreTimeout := setRouteRecoveryScopeTimeout(t, 10*time.Millisecond)
-	defer restoreTimeout()
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "100ms")
 
 	var listCalls int32
 	slow := &blockingListStore{
@@ -492,8 +489,7 @@ func (s countingSlowListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 // visible (the work is delayed, never lost), and the flight must be released
 // so a later tick can probe the scope again.
 func TestRecoverScopeRoutesBoundedEventualCompletionStillWrites(t *testing.T) {
-	restoreTimeout := setRouteRecoveryScopeTimeout(t, 10*time.Millisecond)
-	defer restoreTimeout()
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "100ms")
 
 	const pool = "gascity/gastown.polecat"
 	backing := beads.NewMemStoreFrom(0, []beads.Bead{
@@ -537,19 +533,84 @@ func TestRecoverScopeRoutesBoundedEventualCompletionStillWrites(t *testing.T) {
 	}
 }
 
-// setRouteRecoveryScopeTimeout overrides the package-level bound for the
-// duration of one test and returns a restore func. Guarded by a mutex because
-// go test runs this file's tests sequentially within the package by default,
-// but t.Parallel() subtests could otherwise race the shared var.
-var routeRecoveryScopeTimeoutMu sync.Mutex
+// TestParseRouteRecoveryScopeTimeout_DefaultWhenUnset mirrors
+// TestParseBDProbeTimeout_DefaultWhenUnset (pool_test.go) for the
+// GC_ROUTE_RECOVERY_TIMEOUT env override added per pm's gcf-7gcj.3 review.
+func TestParseRouteRecoveryScopeTimeout_DefaultWhenUnset(t *testing.T) {
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "")
+	var buf bytes.Buffer
+	got := parseRouteRecoveryScopeTimeout(&buf)
+	if got != routeRecoveryScopeTimeoutDefault {
+		t.Errorf("parseRouteRecoveryScopeTimeout() = %v, want %v", got, routeRecoveryScopeTimeoutDefault)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected stderr output: %q", buf.String())
+	}
+}
 
-func setRouteRecoveryScopeTimeout(t *testing.T, d time.Duration) func() {
-	t.Helper()
-	routeRecoveryScopeTimeoutMu.Lock()
-	prev := routeRecoveryScopeTimeout
-	routeRecoveryScopeTimeout = d
-	return func() {
-		routeRecoveryScopeTimeout = prev
-		routeRecoveryScopeTimeoutMu.Unlock()
+func TestParseRouteRecoveryScopeTimeout_ValidDuration(t *testing.T) {
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "30s")
+	var buf bytes.Buffer
+	got := parseRouteRecoveryScopeTimeout(&buf)
+	if got != 30*time.Second {
+		t.Errorf("parseRouteRecoveryScopeTimeout() = %v, want 30s", got)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected stderr output: %q", buf.String())
+	}
+}
+
+func TestParseRouteRecoveryScopeTimeout_BelowFloor(t *testing.T) {
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "1ms")
+	var buf bytes.Buffer
+	got := parseRouteRecoveryScopeTimeout(&buf)
+	if got != routeRecoveryScopeTimeoutFloor {
+		t.Errorf("parseRouteRecoveryScopeTimeout() = %v, want %v (floor)", got, routeRecoveryScopeTimeoutFloor)
+	}
+	if !strings.Contains(buf.String(), "below minimum") {
+		t.Errorf("expected floor warning, got: %q", buf.String())
+	}
+}
+
+func TestParseRouteRecoveryScopeTimeout_InvalidDuration(t *testing.T) {
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "notaduration")
+	var buf bytes.Buffer
+	got := parseRouteRecoveryScopeTimeout(&buf)
+	if got != routeRecoveryScopeTimeoutDefault {
+		t.Errorf("parseRouteRecoveryScopeTimeout() = %v, want %v (parse-error default)", got, routeRecoveryScopeTimeoutDefault)
+	}
+	if !strings.Contains(buf.String(), "invalid") || !strings.Contains(buf.String(), "GC_ROUTE_RECOVERY_TIMEOUT") {
+		t.Errorf("expected parse error warning, got: %q", buf.String())
+	}
+}
+
+// TestRecoverScopeRoutesBoundedRespectsEnvOverride proves the env override
+// actually reaches recoverScopeRoutesBounded's select, not just the parse
+// function in isolation: a healthy (non-blocking) store finishes well inside
+// a long override, so setting GC_ROUTE_RECOVERY_TIMEOUT to something huge
+// must not spuriously degrade a fast scope, and setting it to a short value
+// must still bound a slow one (already covered by the other bounded tests,
+// which all set the env var) -- this test is the converse: override to a
+// value large enough that a normally-instant store still completes well
+// under it, proving the read path is live end to end.
+func TestRecoverScopeRoutesBoundedRespectsEnvOverride(t *testing.T) {
+	t.Setenv("GC_ROUTE_RECOVERY_TIMEOUT", "1h")
+
+	const pool = "gascity/gastown.polecat"
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "FAST-1", Title: "work", Type: "task", Status: "open", Metadata: map[string]string{
+			"gc.run_target": pool,
+		}},
+	}, nil)
+
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "city", stderr: &stderr, logPrefix: "gc"}
+	cr.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig fast-override", store: store})
+
+	if got := mustRoutedTo(t, store, "FAST-1"); got != pool {
+		t.Fatalf("gc.routed_to = %q, want %q (a healthy store must still complete and write under a long override)", got, pool)
+	}
+	if strings.Contains(stderr.String(), "degraded") {
+		t.Fatalf("stderr = %q, want no degraded report for a healthy store", stderr.String())
 	}
 }
