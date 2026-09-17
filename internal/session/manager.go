@@ -1905,6 +1905,26 @@ func (m *Manager) infoFromBead(b beads.Bead) Info {
 // It reads only Info fields that mirror the exact bead metadata the raw overlay
 // cracked (via transportForInfo), so it is byte-identical to the raw overlay.
 func (m *Manager) EnrichInfo(info Info) Info {
+	info = m.enrichInfoTransportAndState(info)
+
+	// Enrich with live runtime state if active.
+	if info.State == StateActive && m.sp != nil {
+		info.Attached = m.sp.IsAttached(info.SessionName)
+		if t, err := m.sp.GetLastActivity(info.SessionName); err == nil && !t.IsZero() {
+			info.LastActive = t
+		}
+	}
+
+	return info
+}
+
+// enrichInfoTransportAndState applies the non-subprocess half of EnrichInfo's
+// overlay: transport detection, ACP routing, and the stale "awake"/"active"
+// bead downgrade. Split out of EnrichInfo so EnrichInfos' bulk path (gcf-lpl6)
+// can apply this per-session work — none of it spawns a subprocess — and
+// defer Attached/LastActivity resolution to a single bulk tmux query instead
+// of IsAttached/GetLastActivity's two-subprocess-per-session cost.
+func (m *Manager) enrichInfoTransportAndState(info Info) Info {
 	sessName := info.SessionName
 
 	if !info.Closed {
@@ -1919,23 +1939,73 @@ func (m *Manager) EnrichInfo(info Info) Info {
 		}
 	}
 
-	// Enrich with live runtime state if active.
-	if info.State == StateActive && m.sp != nil {
-		info.Attached = m.sp.IsAttached(sessName)
-		if t, err := m.sp.GetLastActivity(sessName); err == nil && !t.IsZero() {
-			info.LastActive = t
-		}
-	}
-
 	return info
 }
 
 // EnrichInfos applies EnrichInfo to each element in place and returns the same
 // slice, for the list read path (filter the persisted projection first, then
 // enrich the survivors — matching ListFullFromBeads' order).
+//
+// When m.sp implements [runtime.SessionBulkEnricher] (gcf-lpl6), Attached and
+// LastActivity for every StateActive session are resolved with a single bulk
+// query (two tmux execs total) instead of IsAttached + GetLastActivity's two
+// execs PER session — the same semantics, applied in bulk. A bulk query
+// failure falls back to the untouched per-session path for every entry (never
+// a partial mix of bulk-enriched and per-session-enriched infos).
 func (m *Manager) EnrichInfos(infos []Info) []Info {
+	enricher, ok := m.sp.(runtime.SessionBulkEnricher)
+	if !ok {
+		for i := range infos {
+			infos[i] = m.EnrichInfo(infos[i])
+		}
+		return infos
+	}
+
 	for i := range infos {
-		infos[i] = m.EnrichInfo(infos[i])
+		infos[i] = m.enrichInfoTransportAndState(infos[i])
+	}
+
+	var activeNames []string
+	for i := range infos {
+		if infos[i].State == StateActive {
+			activeNames = append(activeNames, infos[i].SessionName)
+		}
+	}
+	if len(activeNames) == 0 {
+		return infos
+	}
+
+	results, err := enricher.BulkEnrichSessions(activeNames)
+	if err != nil {
+		// Fall back to the per-session path for every entry rather than leave
+		// the transport/state pass half-applied on top of unresolved
+		// Attached/LastActivity.
+		for i := range infos {
+			if infos[i].State != StateActive || m.sp == nil {
+				continue
+			}
+			infos[i].Attached = m.sp.IsAttached(infos[i].SessionName)
+			if t, err := m.sp.GetLastActivity(infos[i].SessionName); err == nil && !t.IsZero() {
+				infos[i].LastActive = t
+			}
+		}
+		return infos
+	}
+
+	for i := range infos {
+		if infos[i].State != StateActive {
+			continue
+		}
+		if r, ok := results[infos[i].SessionName]; ok {
+			infos[i].Attached = r.Attached
+			if !r.LastActive.IsZero() {
+				infos[i].LastActive = r.LastActive
+			}
+			continue
+		}
+		// Session vanished between the listing and the bulk query: same
+		// collapse IsAttached's own error path applies, LastActive untouched.
+		infos[i].Attached = false
 	}
 	return infos
 }
