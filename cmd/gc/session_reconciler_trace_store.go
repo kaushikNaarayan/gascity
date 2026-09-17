@@ -159,6 +159,20 @@ func (s *SessionReconcilerTraceStore) openSegment(path string, knownBytes int64,
 	if err != nil {
 		return err
 	}
+	// gcf-2cty: hold an exclusive advisory lock on this segment for as long
+	// as we keep it open. repairTornSegmentTail (below) truncates a torn
+	// tail it finds on disk, but a torn tail is indistinguishable by
+	// content alone from another writer's in-flight record -- both look
+	// exactly the same mid-write. This lock is what lets that repair tell
+	// the two apart: it only ever touches a segment it can also lock
+	// itself, so it can never truncate a record we are still writing.
+	// Overlapping runtimes for the same city are a real, already-observed
+	// failure mode here (gcf-7gcj's duplicate-runtime lifecycle), not just
+	// theoretical, so this has to hold even when two writers exist.
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close() //nolint:errcheck
+		return fmt.Errorf("lock segment %s: %w (another writer may already hold it)", path, err)
+	}
 	fi, err := file.Stat()
 	if err != nil {
 		file.Close() //nolint:errcheck
@@ -211,6 +225,22 @@ func repairTornSegmentTail(path string) (droppedBytes int64, err error) {
 		return 0, err
 	}
 	defer f.Close() //nolint:errcheck
+
+	// gcf-2cty: a torn tail (last byte not '\n') looks identical on disk
+	// whether it is abandoned garbage from a crash, or a record another
+	// writer is still in the middle of appending right now. openSegment
+	// holds an exclusive flock on a segment for as long as it is open for
+	// writing, so only ever repair a segment we can also lock ourselves --
+	// if the lock is held (by another process, or by this process's own
+	// live writer in the pathological case), leave it alone: closing over
+	// this call releases our own lock attempt, never the writer's.
+	// Silently skipping is correct either way -- a segment we can't lock is
+	// either genuinely in use (nothing to repair yet) or was already clean
+	// (nothing to repair at all).
+	if flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); flockErr != nil {
+		return 0, nil
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
 
 	info, err := f.Stat()
 	if err != nil {

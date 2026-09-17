@@ -483,6 +483,78 @@ func TestNewStoreRepairsTornSegmentTailLeftByPriorProcess(t *testing.T) {
 	}
 }
 
+// TestNewStoreDoesNotTruncateATornSegmentAnotherWriterStillHoldsOpen is
+// gcf-2cty's PM-review follow-up (PR #61): a torn tail (last byte not '\n')
+// looks identical on disk whether it is abandoned garbage from a crash, or a
+// record another writer is still in the middle of appending right now.
+// Overlapping runtimes for the same city are a real, already-observed
+// failure mode here (gcf-7gcj's duplicate-runtime lifecycle), not just
+// theoretical -- today's single-writer topology (city_runtime.go:395) is not
+// a guarantee. Without a way to tell the two apart, the repair in
+// TestNewStoreRepairsTornSegmentTailLeftByPriorProcess above would
+// truncate a live writer's in-flight record, manufacturing exactly the
+// corruption gcf-2cty exists to prevent. The fix: openSegment holds an
+// exclusive flock on a segment for as long as it is open for writing, and
+// repairTornSegmentTail only ever repairs a segment it can also lock
+// itself. This test holds that same lock on the torn segment for the whole
+// call and asserts the file is untouched. Before this fix (i.e. with the
+// flock calls in openSegment/repairTornSegmentTail removed), this test
+// fails: the still-locked, still-torn segment gets truncated anyway.
+func TestNewStoreDoesNotTruncateATornSegmentAnotherWriterStillHoldsOpen(t *testing.T) {
+	cityDir := t.TempDir()
+	writeValidTraceSegmentToday(t, cityDir, "trace-live-writer")
+
+	root := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir)
+	segments, err := filepath.Glob(filepath.Join(root, sessionReconcilerTraceSegments, "*", "*", "*", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segments))
+	}
+	segPath := segments[0]
+
+	// Leave the segment's tail torn, exactly as a genuinely abandoned crash
+	// would -- but simulate a still-live writer by holding the file open
+	// with the same exclusive flock openSegment takes, for the whole test.
+	tornFragment := `{"trace_schema_version":1,"seq":999,"tick_id":"trace-in-flight","record_type":"decisi`
+	liveWriter, err := os.OpenFile(segPath, os.O_APPEND|os.O_RDWR, sessionReconcilerTraceOwnerFilePerm)
+	if err != nil {
+		t.Fatalf("open segment as simulated live writer: %v", err)
+	}
+	defer liveWriter.Close() //nolint:errcheck
+	if err := syscall.Flock(int(liveWriter.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("lock segment as simulated live writer: %v", err)
+	}
+	if _, err := liveWriter.WriteString(tornFragment); err != nil {
+		t.Fatalf("write in-flight fragment: %v", err)
+	}
+
+	before, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment before recovery: %v", err)
+	}
+
+	// A second process's store construction runs recoverExisting while the
+	// "live writer" above still holds segPath open and locked.
+	other, err := newSessionReconcilerTraceStore(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("construct second store: %v", err)
+	}
+	defer other.Close() //nolint:errcheck
+
+	after, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment after recovery: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("segment held open by a live writer was modified by another store's recovery\nbefore: %q\nafter:  %q", before, after)
+	}
+	if !strings.Contains(string(after), "trace-in-flight") {
+		t.Fatalf("the in-flight fragment was dropped even though its writer still held the segment locked: %q", after)
+	}
+}
+
 // TestAppendBatchTruncatesPartialWriteInsteadOfLeavingTornTail is the
 // primary reproduction for gcf-2cty. It root-causes the corruption gcf-pfsz's
 // AC4 filed separately (two full JSON records glued on one physical line,
