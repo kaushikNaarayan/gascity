@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -159,11 +160,30 @@ type routeRecoveryScope struct {
 	store beads.Store
 }
 
+// routeRecoveryScopeTimeout bounds how long recoverUnroutedWorkRoutes waits on
+// a single scope's restoreCarriedWorkRoutes pass before moving on to the next
+// scope (gcf-7gcj.3). beads.Store has no context.Context parameter, so a
+// hung/slow store call cannot be canceled from here — only bounded from the
+// caller's side, the same limitation the TOCTOU-narrowing comment on
+// restoreCarriedWorkRoutes already documents for the write path. This is the
+// read-path analog: a per-store failure must not block every other scope's
+// reconciliation the way it did in ga-3auv3 (one rig's route recovery ran
+// 452,154ms of a 468,013ms tick, starving an unrelated dispatcher demand for
+// over 7 minutes).
+//
+// A var, not a const, so route_recovery_test.go can shrink it and keep the
+// bounded-wait tests deterministic and fast instead of sleeping the real
+// production bound.
+var routeRecoveryScopeTimeout = 5 * time.Second
+
 // recoverUnroutedWorkRoutes restores gc.routed_to from each bead's own carried
 // route across the city store and every active rig store, so ready work
 // re-enters pool demand after a controller restart without a manual `gc sling`
 // (ga-n2d.4). Best-effort: a per-store failure is logged and the remaining
-// stores still run.
+// stores still run. Each scope is bounded by routeRecoveryScopeTimeout and
+// single-flighted (gcf-7gcj.3): a scope that is still slow/hung from a prior
+// tick is skipped rather than probed again, so a wedged store cannot pile up
+// unbounded concurrent List/Get/SetMetadata calls against itself.
 func (cr *CityRuntime) recoverUnroutedWorkRoutes() {
 	scopes := []routeRecoveryScope{{label: "city", store: cr.cityBeadStore()}}
 	for name, store := range cr.rigBeadStores() {
@@ -173,12 +193,56 @@ func (cr *CityRuntime) recoverUnroutedWorkRoutes() {
 		if sc.store == nil {
 			continue
 		}
+		cr.recoverScopeRoutesBounded(sc)
+	}
+}
+
+// routeRecoveryResult carries one scope's restoreCarriedWorkRoutes outcome
+// across the goroutine boundary recoverScopeRoutesBounded uses to bound the
+// wait.
+type routeRecoveryResult struct {
+	restored int
+	err      error
+}
+
+// recoverScopeRoutesBounded runs restoreCarriedWorkRoutes for one scope,
+// single-flighted per scope label and bounded to routeRecoveryScopeTimeout.
+//
+// Single-flight (via the same acquireProbeFlight/releaseProbeFlight registry
+// pool.go's probe runners use, keyed "route-recovery:"+label) guarantees at
+// most one in-flight restoreCarriedWorkRoutes call per scope: if a prior
+// tick's probe for this scope hasn't returned yet, this call is skipped
+// outright rather than launching a second concurrent probe against the same
+// slow/hung store.
+//
+// The bound is on the caller's wait, not the store call itself: the launched
+// goroutine keeps running restoreCarriedWorkRoutes to completion (or forever,
+// for a truly wedged store) even after the timeout fires and this method
+// returns. When it does return late, it still performs its writes and still
+// releases the flight, so the next tick can probe the scope again. This is
+// why the timeout path logs "degraded" instead of an error: the scope was
+// neither skipped nor failed, just not waited for.
+func (cr *CityRuntime) recoverScopeRoutesBounded(sc routeRecoveryScope) {
+	key := "route-recovery:" + sc.label
+	if !acquireProbeFlight(key) {
+		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): previous pass still in flight, skipping this tick\n", cr.logPrefix, sc.label) //nolint:errcheck // best-effort stderr
+		return
+	}
+	done := make(chan routeRecoveryResult, 1)
+	go func() {
+		defer releaseProbeFlight(key)
 		restored, err := restoreCarriedWorkRoutes(sc.store)
-		if err != nil {
-			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): %v\n", cr.logPrefix, sc.label, err) //nolint:errcheck // best-effort stderr
+		done <- routeRecoveryResult{restored: restored, err: err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): %v\n", cr.logPrefix, sc.label, res.err) //nolint:errcheck // best-effort stderr
 		}
-		if restored > 0 {
-			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): restored gc.routed_to on %d ready bead(s) from gc.run_target\n", cr.logPrefix, sc.label, restored) //nolint:errcheck // best-effort stderr
+		if res.restored > 0 {
+			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): restored gc.routed_to on %d ready bead(s) from gc.run_target\n", cr.logPrefix, sc.label, res.restored) //nolint:errcheck // best-effort stderr
 		}
+	case <-time.After(routeRecoveryScopeTimeout):
+		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): degraded — exceeded %s bound, continuing with remaining scopes; this scope's probe keeps running in the background and will be retried once it returns\n", cr.logPrefix, sc.label, routeRecoveryScopeTimeout) //nolint:errcheck // best-effort stderr
 	}
 }

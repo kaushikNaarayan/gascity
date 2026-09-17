@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 )
@@ -373,5 +377,179 @@ func TestRestoreCarriedWorkRoutesSkipsBlockedBead(t *testing.T) {
 	}
 	if route := strings.TrimSpace(mustRoutedTo(t, live, "EB-42o8")); route != "" {
 		t.Errorf("gc.routed_to = %q, want empty (a blocked bead must stay unrouted)", route)
+	}
+}
+
+// blockingListStore's List blocks until release is closed, modeling a
+// slow/hung rig store (ga-3auv3: a real List call ran 452,154ms). It signals
+// entry on started (best-effort, non-blocking) so a test can wait until the
+// probe goroutine is actually inside List before asserting on timing.
+type blockingListStore struct {
+	beads.Store
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return s.Store.List(q)
+}
+
+// TestRecoverScopeRoutesBoundedTimesOutOnSlowStore is the fail-before/pass-
+// after case for gcf-7gcj.3 AC1+AC2: a scope whose store.List never returns
+// within routeRecoveryScopeTimeout must not block recoverScopeRoutesBounded
+// past that bound. Before the bound existed, this scope's call blocked the
+// caller for as long as the store did (unboundedly, per ga-3auv3).
+func TestRecoverScopeRoutesBoundedTimesOutOnSlowStore(t *testing.T) {
+	restoreTimeout := setRouteRecoveryScopeTimeout(t, 20*time.Millisecond)
+	defer restoreTimeout()
+
+	slow := &blockingListStore{
+		Store:   beads.NewMemStoreFrom(0, nil, nil),
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	defer close(slow.release) // let the background probe finish so the test process can exit cleanly
+
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "city", stderr: &stderr, logPrefix: "gc"}
+
+	start := time.Now()
+	cr.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-timeout", store: slow})
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("recoverScopeRoutesBounded blocked %s, want bounded near the %s timeout (slow store must not starve the caller)", elapsed, routeRecoveryScopeTimeout)
+	}
+	if !strings.Contains(stderr.String(), "degraded") {
+		t.Fatalf("stderr = %q, want a degraded report for the timed-out scope", stderr.String())
+	}
+}
+
+// TestRecoverScopeRoutesBoundedSkipsInFlightScope covers AC4 (no unbounded
+// concurrent store probes): while a scope's probe is still running past the
+// bound, a second call for the same scope label must not launch a second
+// concurrent List against the same slow store — it must skip outright.
+func TestRecoverScopeRoutesBoundedSkipsInFlightScope(t *testing.T) {
+	restoreTimeout := setRouteRecoveryScopeTimeout(t, 10*time.Millisecond)
+	defer restoreTimeout()
+
+	var listCalls int32
+	slow := &blockingListStore{
+		Store:   beads.NewMemStoreFrom(0, nil, nil),
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	countingSlow := countingSlowListStore{blockingListStore: slow, calls: &listCalls}
+	defer close(slow.release)
+
+	var stderr1, stderr2 bytes.Buffer
+	cr1 := &CityRuntime{cityName: "city", stderr: &stderr1, logPrefix: "gc"}
+	cr2 := &CityRuntime{cityName: "city", stderr: &stderr2, logPrefix: "gc"}
+
+	// First call claims the flight and times out waiting.
+	cr1.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-skip", store: countingSlow})
+	// Wait for the underlying List to actually be entered before racing a
+	// second call against it, so this isn't timing-dependent on scheduling.
+	select {
+	case <-slow.started:
+	case <-time.After(time.Second):
+		t.Fatal("first probe never entered List")
+	}
+
+	// Second call for the same scope label, while the first probe is still
+	// running (release is not yet closed): must skip, not probe again.
+	cr2.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-skip", store: countingSlow})
+
+	if !strings.Contains(stderr2.String(), "still in flight, skipping") {
+		t.Fatalf("second call stderr = %q, want an in-flight skip message", stderr2.String())
+	}
+	if got := atomic.LoadInt32(&listCalls); got != 1 {
+		t.Fatalf("List calls = %d, want exactly 1 (the skip must not launch a second concurrent probe)", got)
+	}
+}
+
+// countingSlowListStore wraps blockingListStore to count List invocations,
+// proving TestRecoverScopeRoutesBoundedSkipsInFlightScope's skip actually
+// prevented a second concurrent call rather than merely racing to report it.
+type countingSlowListStore struct {
+	*blockingListStore
+	calls *int32
+}
+
+func (s countingSlowListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	atomic.AddInt32(s.calls, 1)
+	return s.blockingListStore.List(q)
+}
+
+// TestRecoverScopeRoutesBoundedEventualCompletionStillWrites covers AC3: a
+// scope that times out is reported degraded, not dropped — once its
+// background probe actually returns, the write it produced must still be
+// visible (the work is delayed, never lost), and the flight must be released
+// so a later tick can probe the scope again.
+func TestRecoverScopeRoutesBoundedEventualCompletionStillWrites(t *testing.T) {
+	restoreTimeout := setRouteRecoveryScopeTimeout(t, 10*time.Millisecond)
+	defer restoreTimeout()
+
+	const pool = "gascity/gastown.polecat"
+	backing := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "SLOW-1", Title: "work", Type: "task", Status: "open", Metadata: map[string]string{
+			"gc.run_target": pool,
+		}},
+	}, nil)
+	slow := &blockingListStore{Store: backing, started: make(chan struct{}, 1), release: make(chan struct{})}
+
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "city", stderr: &stderr, logPrefix: "gc"}
+
+	cr.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-eventual", store: slow})
+	if got := mustRoutedTo(t, backing, "SLOW-1"); got != "" {
+		t.Fatalf("gc.routed_to = %q before the slow probe returned, want empty (nothing written yet)", got)
+	}
+
+	// Release the store call and let the background goroutine finish.
+	close(slow.release)
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := mustRoutedTo(t, backing, "SLOW-1"); got == pool {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("background probe never completed its write after release")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// The flight must be released once the background probe finishes, so a
+	// fresh call for the same scope label can run (not skip) immediately.
+	slow2 := &blockingListStore{Store: backing, started: make(chan struct{}, 1), release: make(chan struct{})}
+	close(slow2.release) // resolves immediately
+	var stderr2 bytes.Buffer
+	cr2 := &CityRuntime{cityName: "city", stderr: &stderr2, logPrefix: "gc"}
+	cr2.recoverScopeRoutesBounded(routeRecoveryScope{label: "rig slow-eventual", store: slow2})
+	if strings.Contains(stderr2.String(), "still in flight") {
+		t.Fatalf("second call stderr = %q, want the flight released after the first probe completed", stderr2.String())
+	}
+}
+
+// setRouteRecoveryScopeTimeout overrides the package-level bound for the
+// duration of one test and returns a restore func. Guarded by a mutex because
+// go test runs this file's tests sequentially within the package by default,
+// but t.Parallel() subtests could otherwise race the shared var.
+var routeRecoveryScopeTimeoutMu sync.Mutex
+
+func setRouteRecoveryScopeTimeout(t *testing.T, d time.Duration) func() {
+	t.Helper()
+	routeRecoveryScopeTimeoutMu.Lock()
+	prev := routeRecoveryScopeTimeout
+	routeRecoveryScopeTimeout = d
+	return func() {
+		routeRecoveryScopeTimeout = prev
+		routeRecoveryScopeTimeoutMu.Unlock()
 	}
 }
