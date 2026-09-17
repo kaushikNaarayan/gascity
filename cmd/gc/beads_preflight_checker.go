@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -20,9 +23,54 @@ func newBeadsPreflightChecker(cityPath, provider string) contract.PreflightCheck
 	}
 }
 
+// preflightScopeIsRig reports whether scope is a rig subdirectory of the
+// city (needing the rig-aware bd runner) rather than the city root itself.
+// Comparison MUST resolve symlinks: on macOS in particular, cityPath and a
+// rig-declared scope can be the identical directory reached through
+// different spellings (e.g. /tmp vs the OS's real /private/tmp), and a
+// lexical-only compare (filepath.Clean) would treat that as two different
+// scopes, silently downgrading a real city-scope preflight into a
+// rig-scoped one (gcf-bym6). samePath resolves symlinks before comparing.
+func preflightScopeIsRig(scope, cityPath string) bool {
+	return !samePath(scope, cityPath)
+}
+
+// preflightBDCommandRunnerForRig is bdCommandRunnerForRig without the
+// managed-dolt recovery side effects: a preflight probe must fail fast
+// rather than start (or wait to recover) a managed Dolt server just to
+// report context. Mirrors scopedBdStoreForCity / bdRuntimeEnvWithErrorNoRecovery's
+// established no-recovery pattern for exactly this class of caller (gascity
+// ga-cdmx6x), applied to the rig-scoped env resolver so a preflight bd
+// context read never has the side effect of starting a database.
+func preflightBDCommandRunnerForRig(cityPath string, cfg *config.City, rigPath string) beads.CommandRunner {
+	return func(dir, name string, args ...string) ([]byte, error) {
+		env, err := bdRuntimeEnvForRigWithErrorNoRecovery(cityPath, cfg, rigPath)
+		if err != nil {
+			return nil, err
+		}
+		ensureProjectedDoltEnvExplicit(env)
+		return beadsExecCommandRunnerWithEnv(env)(dir, name, args...)
+	}
+}
+
 func preflightBDContextReader(cityPath string) func(scope string) (contract.PreflightBDContext, error) {
+	var cfg *config.City
 	return func(scope string) (contract.PreflightBDContext, error) {
-		out, err := bdCommandRunnerForCity(cityPath)(scope, "bd", "context", "--json")
+		// Context is scope-specific.  Using the city runner for a rig pins
+		// BEADS_DIR to the rig while leaving the Dolt mode/database projection
+		// on the city, so bd can report embedded (or the wrong database) even
+		// when the rig metadata declares server mode.  Select the same
+		// rig-aware environment used by the eventual fallback store, but
+		// never the recovery-enabled runner: a preflight probe must not
+		// start a managed Dolt server as a side effect.
+		runner := bdCommandRunnerForCity(cityPath)
+		if preflightScopeIsRig(scope, cityPath) {
+			if cfg == nil {
+				cfg, _ = loadCityConfig(cityPath, io.Discard)
+			}
+			runner = preflightBDCommandRunnerForRig(cityPath, cfg, scope)
+		}
+		out, err := runner(scope, "bd", "context", "--json")
 		if err != nil {
 			return contract.PreflightBDContext{}, err
 		}

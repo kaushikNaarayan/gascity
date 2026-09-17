@@ -707,6 +707,18 @@ func TestControllerStateOpenRigStoreExecBdProjectsRigDoltEnv(t *testing.T) {
 
 func TestControllerStateOpenRigStoreExecBdRefusesAnUnregisteredBackend(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
+	// Hermetic: openExecStore's rig-env resolution is unconditionally
+	// recovery-enabled by production design (gcf-bym6 propose-only bead,
+	// not this test's concern), and -- given a materialized gc-beads-bd.sh
+	// shim -- will actually run `gc-beads-bd.sh health` then `... recover`,
+	// starting a real dolt sql-server (gcf-bym6). dolt.auto-start:false
+	// above does NOT gate this Go-side health/recover path -- only bd's own
+	// CLI auto-start, a separate mechanism. disableManagedDoltRecoveryForTest
+	// sets GC_DOLT=skip, the documented escape hatch that makes
+	// healthBeadsProviderContext a clean no-op, so this test exercises the
+	// unregistered-backend refusal without depending on whether a real
+	// gc-beads-bd.sh happens to exist on disk.
+	disableManagedDoltRecoveryForTest(t)
 
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
