@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -412,6 +414,265 @@ func TestTraceRecoveryQuarantinesInteriorCorruption(t *testing.T) {
 	}
 	if len(segments) != 0 {
 		t.Fatalf("segments after quarantine = %d, want 0", len(segments))
+	}
+}
+
+// TestNewStoreRepairsTornSegmentTailLeftByPriorProcess is a secondary,
+// defense-in-depth reproduction for gcf-2cty. Every process restart begins a
+// fresh segment index (currentSegmentPath never reopens an existing segment
+// for writing -- see TestAppendBatchTruncatesPartialWriteInsteadOfLeavingTornTail
+// below for the primary, directly-reachable reproduction), so a torn tail
+// left behind by a crashed or short-written earlier process would otherwise
+// sit at true EOF forever: readTraceRecordsFile's tail-tolerance exists
+// precisely so a reader never aborts on it, but before this fix nothing
+// ever repaired it either, so the corrupt fragment stayed on disk
+// indefinitely. Before this fix, this test fails: the physical line holding
+// the simulated crash's torn fragment is not valid standalone JSON, and
+// newSessionReconcilerTraceStore does not drop it.
+func TestNewStoreRepairsTornSegmentTailLeftByPriorProcess(t *testing.T) {
+	cityDir := t.TempDir()
+	writeValidTraceSegmentToday(t, cityDir, "trace-before-crash")
+
+	root := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir)
+	segments, err := filepath.Glob(filepath.Join(root, sessionReconcilerTraceSegments, "*", "*", "*", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segments))
+	}
+	segPath := segments[0]
+
+	// Simulate a fatal signal (or ENOSPC) cutting a prior process's
+	// AppendBatch write() short: some record bytes were copied to disk
+	// before the write was interrupted, so the file ends mid-record with no
+	// closing brace and no trailing newline.
+	tornFragment := `{"trace_schema_version":1,"seq":999,"tick_id":"trace-crashed","record_type":"decisi`
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, sessionReconcilerTraceOwnerFilePerm)
+	if err != nil {
+		t.Fatalf("open segment for torn append: %v", err)
+	}
+	if _, err := f.WriteString(tornFragment); err != nil {
+		f.Close() //nolint:errcheck
+		t.Fatalf("write torn fragment: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close after torn write: %v", err)
+	}
+
+	// A new process picks the trace store back up. Constructing the store
+	// alone (before any AppendBatch call) must repair the torn tail it
+	// finds on disk.
+	reopened, err := newSessionReconcilerTraceStore(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close() //nolint:errcheck
+
+	data, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	for i, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("physical line %d is not valid standalone JSON after recovery: %q", i, line)
+		}
+	}
+	if strings.Contains(string(data), "trace-crashed") {
+		t.Fatalf("torn fragment from the simulated crash was not dropped: %q", data)
+	}
+}
+
+// TestNewStoreDoesNotTruncateATornSegmentAnotherWriterStillHoldsOpen is
+// gcf-2cty's PM-review follow-up (PR #61): a torn tail (last byte not '\n')
+// looks identical on disk whether it is abandoned garbage from a crash, or a
+// record another writer is still in the middle of appending right now.
+// Overlapping runtimes for the same city are a real, already-observed
+// failure mode here (gcf-7gcj's duplicate-runtime lifecycle), not just
+// theoretical -- today's single-writer topology (city_runtime.go:395) is not
+// a guarantee. Without a way to tell the two apart, the repair in
+// TestNewStoreRepairsTornSegmentTailLeftByPriorProcess above would
+// truncate a live writer's in-flight record, manufacturing exactly the
+// corruption gcf-2cty exists to prevent. The fix: openSegment holds an
+// exclusive flock on a segment for as long as it is open for writing, and
+// repairTornSegmentTail only ever repairs a segment it can also lock
+// itself. This test holds that same lock on the torn segment for the whole
+// call and asserts the file is untouched. Before this fix (i.e. with the
+// flock calls in openSegment/repairTornSegmentTail removed), this test
+// fails: the still-locked, still-torn segment gets truncated anyway.
+func TestNewStoreDoesNotTruncateATornSegmentAnotherWriterStillHoldsOpen(t *testing.T) {
+	cityDir := t.TempDir()
+	writeValidTraceSegmentToday(t, cityDir, "trace-live-writer")
+
+	root := filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir)
+	segments, err := filepath.Glob(filepath.Join(root, sessionReconcilerTraceSegments, "*", "*", "*", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segments))
+	}
+	segPath := segments[0]
+
+	// Leave the segment's tail torn, exactly as a genuinely abandoned crash
+	// would -- but simulate a still-live writer by holding the file open
+	// with the same exclusive flock openSegment takes, for the whole test.
+	tornFragment := `{"trace_schema_version":1,"seq":999,"tick_id":"trace-in-flight","record_type":"decisi`
+	liveWriter, err := os.OpenFile(segPath, os.O_APPEND|os.O_RDWR, sessionReconcilerTraceOwnerFilePerm)
+	if err != nil {
+		t.Fatalf("open segment as simulated live writer: %v", err)
+	}
+	defer liveWriter.Close() //nolint:errcheck
+	if err := syscall.Flock(int(liveWriter.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("lock segment as simulated live writer: %v", err)
+	}
+	if _, err := liveWriter.WriteString(tornFragment); err != nil {
+		t.Fatalf("write in-flight fragment: %v", err)
+	}
+
+	before, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment before recovery: %v", err)
+	}
+
+	// A second process's store construction runs recoverExisting while the
+	// "live writer" above still holds segPath open and locked.
+	other, err := newSessionReconcilerTraceStore(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("construct second store: %v", err)
+	}
+	defer other.Close() //nolint:errcheck
+
+	after, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment after recovery: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("segment held open by a live writer was modified by another store's recovery\nbefore: %q\nafter:  %q", before, after)
+	}
+	if !strings.Contains(string(after), "trace-in-flight") {
+		t.Fatalf("the in-flight fragment was dropped even though its writer still held the segment locked: %q", after)
+	}
+}
+
+// TestAppendBatchTruncatesPartialWriteInsteadOfLeavingTornTail is the
+// primary reproduction for gcf-2cty. It root-causes the corruption gcf-pfsz's
+// AC4 filed separately (two full JSON records glued on one physical line,
+// the first missing its closing brace and trailing newline entirely) as an
+// interrupted write: write(2) to a regular file CAN return a genuine short
+// count together with a non-nil error mid-copy -- ENOSPC (disk pressure,
+// explicitly one of this bead's suspected causes) behaves exactly like the
+// RLIMIT_FSIZE/EFBIG condition this test induces to make the interruption
+// deterministic. Before this fix, AppendBatch's write call
+// (cmd/gc/session_reconciler_trace_store.go, `s.currentFile.Write(writeBuf)`)
+// checks only the error and returns without disturbing whatever partial
+// bytes already landed on disk; the store's file descriptor stays open
+// across calls, so the NEXT successful AppendBatch appends starting from
+// the real end-of-file -- landing its complete record directly onto the
+// torn remainder of the failed one, with no separating newline. This test
+// fails on unmodified main: the physical line spanning the failed and the
+// following successful append is not valid standalone JSON.
+func TestAppendBatchTruncatesPartialWriteInsteadOfLeavingTornTail(t *testing.T) {
+	// RLIMIT_FSIZE is process-global, so this test must not run in parallel
+	// with anything else in this package that writes large files.
+	cityDir := t.TempDir()
+	store, err := newSessionReconcilerTraceStore(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close() //nolint:errcheck
+
+	baseline := SessionReconcilerTraceRecord{
+		TraceSchemaVersion: sessionReconcilerTraceSchemaVersion,
+		TraceID:            "cycle-baseline",
+		TickID:             "trace-baseline",
+		RecordType:         TraceRecordDecision,
+		Template:           "repo/polecat",
+		SessionName:        "polecat-1",
+		SiteCode:           TraceSiteReconcilerWakeDecision,
+		TraceMode:          TraceModeDetail,
+		TraceSource:        TraceSourceManual,
+		Ts:                 time.Now().UTC(),
+	}
+	if err := store.AppendBatch([]SessionReconcilerTraceRecord{baseline}, TraceDurabilityDurable); err != nil {
+		t.Fatalf("baseline append: %v", err)
+	}
+
+	segments, err := filepath.Glob(filepath.Join(cityDir, ".gc", "runtime", sessionReconcilerTraceRootDir, sessionReconcilerTraceSegments, "*", "*", "*", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segments))
+	}
+	segPath := segments[0]
+	baselineSize, err := os.Stat(segPath)
+	if err != nil {
+		t.Fatalf("stat baseline segment: %v", err)
+	}
+
+	// A large batch, so the write is comfortably big enough for a tight
+	// RLIMIT_FSIZE to cut it off mid-record rather than at a line boundary.
+	bigFields := map[string]any{"padding": strings.Repeat("X", 4000)}
+	big := baseline
+	big.TraceID = "cycle-interrupted"
+	big.TickID = "trace-interrupted"
+	big.Fields = bigFields
+	big.Ts = time.Now().UTC()
+
+	// Force the next Write() to this file to return a genuine short count
+	// with a non-nil error (EFBIG), the same shape a real ENOSPC mid-write
+	// takes: some bytes physically written, then an error. SIGXFSZ must be
+	// ignored or the default action kills the test process.
+	signal.Ignore(syscall.SIGXFSZ)
+	defer signal.Reset(syscall.SIGXFSZ)
+	var origLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &origLimit); err != nil {
+		t.Fatalf("getrlimit: %v", err)
+	}
+	// Only ever lower the soft limit (Cur), never the hard limit (Max):
+	// lowering Max is irreversible for an unprivileged process and would
+	// permanently cripple every later test in this binary.
+	restoreLimit := func() {
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &origLimit); err != nil {
+			t.Fatalf("restore rlimit: %v", err)
+		}
+	}
+	defer restoreLimit()
+
+	tightLimit := uint64(baselineSize.Size()) + 120 // enough to land mid-record, not on a boundary
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: tightLimit, Max: origLimit.Max}); err != nil {
+		t.Fatalf("setrlimit: %v", err)
+	}
+	err = store.AppendBatch([]SessionReconcilerTraceRecord{big}, TraceDurabilityDurable)
+	restoreLimit()
+	if err == nil {
+		t.Fatalf("expected the fsize-limited append to fail, it succeeded")
+	}
+	t.Logf("interrupted append failed as expected: %v", err)
+
+	clean := baseline
+	clean.TraceID = "cycle-after-interruption"
+	clean.TickID = "trace-after-interruption"
+	clean.Ts = time.Now().UTC()
+	if err := store.AppendBatch([]SessionReconcilerTraceRecord{clean}, TraceDurabilityDurable); err != nil {
+		t.Fatalf("append after interruption cleared: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	data, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	for i, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("physical line %d is not valid standalone JSON (torn partial write glued to the next append): %q\nfull segment: %q", i, line, data)
+		}
+	}
+	if strings.Contains(string(data), "cycle-interrupted") {
+		t.Fatalf("the interrupted batch's partial bytes were not truncated away: %q", data)
 	}
 }
 
