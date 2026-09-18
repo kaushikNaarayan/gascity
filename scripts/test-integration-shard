@@ -112,9 +112,11 @@ cmd_gc_integration_tests=(
   TestControllerDiscoversAddedCronOrderWithoutRestart
   TestFreshGCInitAgainstRealPinnedBdLegacyGuard
   TestManagedBdRigProviderStoreRecoversAfterHardKillPortRebind
+  TestPathBdInThisPackageIsNotARealBd
   TestPhase2WorkerCoreRealTransportProof
   TestRigAddIncludeResolvesScopedRegistryPackName
   TestStorageGateServesACityFromItsBeadsWorkspace
+  TestVerifyBinaryReportsVersion
 )
 
 join_regex() {

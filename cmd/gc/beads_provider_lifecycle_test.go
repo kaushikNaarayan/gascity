@@ -7717,7 +7717,14 @@ esac
 	}
 }
 
-func TestGcBeadsBdInitDoltliteInitializesDelegatedBdWrites(t *testing.T) {
+// TestGcBeadsBdInitDoltliteWrapperInvocationWithTestscriptBd checks the
+// gc-beads-bd wrapper's doltlite init wiring (metadata.json contents) and that
+// the delegated "bd create" is invoked and returns a gc-* issue. It does NOT
+// run a real bd: inside cmd/gc, TestMain (testscript.Main) puts the in-package
+// fake bdTestCmd first on PATH, so the bd resolved here is that fake and its
+// create is served by a file store, not DoltLite (gcf-9qh6). Do not read a pass
+// as evidence about real bd or DoltLite writes.
+func TestGcBeadsBdInitDoltliteWrapperInvocationWithTestscriptBd(t *testing.T) {
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
 		t.Skip("bd CLI required for DoltLite wrapper init smoke test")

@@ -13,8 +13,12 @@ resource = "subprocess"
 # 611/175 -> 613/176 (gcf-er79): accounted for entirely by #68 (gcf-g9j3)
 # adding cmd/gc/init_legacy_guard_regression_test.go (+1 file, +2 dolt
 # exec.Command calls). Verified by adding only that file to pre-#68 main.
-baseline_calls = 613
-baseline_files = 176
+# 613/176 -> 614/177 (gcf-9qh6): accounted for entirely by the new integration-
+# tagged cmd/gc/real_binary_guard_exec_test.go (+1 file, +1 exec.Command call:
+# the `bd version` pin check). The untagged and Small debt ratchets are
+# deliberately unchanged.
+baseline_calls = 614
+baseline_files = 177
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-80po0c.2"
