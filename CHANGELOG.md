@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Known issues
+
+- **`gc init` can fail with `exec beads init: context deadline exceeded` on a
+  slow disk or heavily loaded host.** gc bounds the beads-init phase with a
+  fixed 120s deadline; a fresh init that legitimately takes longer (observed
+  122-142s under sustained load) is cancelled and reported as a failure. This
+  is pre-existing (the same code shipped in v1.3.9-v1.3.11), not introduced by
+  this release, and is tracked as gcf-6ryi with a fix targeted for v1.3.13.
+  **Workaround:** re-run `gc init`.
+
 ### Fixed
 
 - **The dolt pack's `run_bounded` python3 fallback now sends SIGTERM before

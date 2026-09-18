@@ -16,7 +16,7 @@
 # GC_VERSION below exists so a reader/script has one place to see the whole
 # pinned tuple at a glance.
 
-GC_VERSION=1.3.11
+GC_VERSION=1.3.12
 
 # Dolt 2.1.10 (dolthub/dolt), reconfirmed 2026-09-15 by fresh download +
 # sha256sum against the published release (not copied from a prior note).
@@ -57,7 +57,14 @@ BD_SHA256_DARWIN_ARM64=ac132fbf451b479f75b98e7a02f86455aef5418762c527456ff14cdcd
 # including writes) — there is no safe rolling/partial-upgrade window in
 # either direction. install.sh installs this binary; it does not and must
 # not run `bd migrate` itself. The fleet ledger migration is a separate,
-# founder-gated action, not part of the v1.3.11 rollout (unchanged from
-# v1.3.8/v1.3.9/v1.3.10 — this bump only carries gc fixes (gcf-bym6,
-# gcf-b7fn, gcf-lpl6, gcf-2cty, gcf-7gcj.3); the bd/Dolt pins are
-# untouched).
+# founder-gated action, not part of the v1.3.12 rollout (unchanged from
+# v1.3.8-v1.3.11 — this bump carries gc fixes (gcf-g9j3: fresh `gc init` no
+# longer trips bd's legacy-upgrade guard; gcf-7gcj.3 follow-up: route-recovery
+# timeout env override) and release/CI hardening (gcf-6o8l release disk
+# preflight, gcf-9kd1 tag-push hook skip, gcf-g9j3 AC3 blocking release
+# tripwire); the bd/Dolt pins are untouched).
+#
+# KNOWN ISSUE (gcf-6ryi, targeted for v1.3.13): gc's fixed 120s `gc init`
+# deadline can be crossed on slow disks / heavily loaded hosts, failing with
+# "exec beads init: context deadline exceeded". Pre-existing (same code in
+# v1.3.9-v1.3.11), not introduced by v1.3.12. Workaround: re-run `gc init`.
