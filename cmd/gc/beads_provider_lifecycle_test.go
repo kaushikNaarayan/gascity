@@ -7254,7 +7254,7 @@ case "$cmd" in
   init)
     has_force=false
     for arg in "$@"; do
-      if [ "$arg" = "--force" ]; then
+      if [ "$arg" = "--force" ] || [ "$arg" = "--reinit-local" ]; then
         has_force=true
       fi
     done
@@ -7329,7 +7329,7 @@ esac
 		t.Fatalf("expected bd init fallback to run: %v", err)
 	}
 	got := string(data)
-	for _, want := range []string{"--force", "--server", "-p", "gc", "--database", "hq", cityPath} {
+	for _, want := range []string{"--reinit-local", "--server", "-p", "gc", "--database", "hq", cityPath} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bd init argv missing %q:\n%s", want, got)
 		}
@@ -7708,7 +7708,7 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --force --quiet --server -p gc --database hq",
+		"metadata=yes args=init --reinit-local --quiet --server -p gc --database hq",
 		"metadata=no args=init --quiet --server -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {
