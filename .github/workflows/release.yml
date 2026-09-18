@@ -25,7 +25,29 @@ jobs:
     runs-on: [self-hosted, gt2]
     permissions:
       contents: write
+    env:
+      # gt2's root filesystem is shared by all three runners, /tmp and every
+      # agent worktree — it hit 0 bytes free mid cross-build on v1.3.11
+      # (gcf-6o8l), 42s into GoReleaser, after six earlier steps had already
+      # gone green. That read like a code/toolchain failure to triage later;
+      # it wasn't. This is a preflight tripwire, not a capacity plan. The
+      # threshold is higher than fork-verify's (gcf-b7fn, 5GB) because this
+      # job cross-builds four linux/darwin x amd64/arm64 targets, not one.
+      RELEASE_MIN_FREE_GB: "15"
     steps:
+      - name: Preflight — fail fast and loud on host disk exhaustion (gcf-6o8l)
+        run: |
+          set -euo pipefail
+          df_line="$(df -Pk . | tail -1)"
+          fs="$(echo "$df_line" | awk '{print $1}')"
+          avail_kb="$(echo "$df_line" | awk '{print $4}')"
+          avail_gb=$(( avail_kb / 1024 / 1024 ))
+          echo "runner filesystem: $fs, available: ${avail_gb}GiB (min required: ${RELEASE_MIN_FREE_GB}GiB)"
+          if [ "$avail_kb" -lt $(( RELEASE_MIN_FREE_GB * 1024 * 1024 )) ]; then
+            echo "::error::RELEASE PREFLIGHT: host disk exhaustion on $fs — only ${avail_gb}GiB free (need >= ${RELEASE_MIN_FREE_GB}GiB). This is a RUNNER RESOURCE failure, not a code failure — no later step ran, so GoReleaser has not built anything. See gcf-6o8l."
+            exit 1
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
