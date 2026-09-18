@@ -243,10 +243,19 @@ func TestGCBeadsBDScript_InitForcesReinitOverPreSeededMetadata(t *testing.T) {
 	}
 	script := string(data)
 
-	guard := `if [ -f "$dir/.beads/metadata.json" ]; then`
+	// gcf-g9j3 (#68) added "&& skip_preinit_check != true": a database proven
+	// freshly created in this same invocation skips this branch and sets
+	// --force unconditionally on its own path. The branch must still key on
+	// the metadata.json file (not project_id) for every NON-fresh database.
+	guard := `if [ -f "$dir/.beads/metadata.json" ] && [ "$skip_preinit_check" != true ]; then`
 	if !strings.Contains(script, guard) {
-		t.Fatalf("gc-beads-bd.sh op_init must gate the already-initialized branch on the metadata.json file, not on project_id; " +
+		t.Fatalf("gc-beads-bd.sh op_init must gate the already-initialized branch on the metadata.json file (and not on a freshly-created database), not on project_id; " +
 			"gating on project_id leaves --force unset for gc-pre-seeded metadata and bd init aborts")
+	}
+	freshForce := `skip_preinit_check=true
+        bd_init_force="--force"`
+	if !strings.Contains(script, freshForce) {
+		t.Fatal("gc-beads-bd.sh op_init's freshly-created-database path must still set --force: gc pre-seeds a metadata.json stub even for a brand-new city")
 	}
 	if strings.Contains(script, `if metadata_has_project_id "$dir/.beads/metadata.json"; then
         if ensure_database_registered`) {

@@ -10,8 +10,11 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 611
-baseline_files = 175
+# 611/175 -> 613/176 (gcf-er79): accounted for entirely by #68 (gcf-g9j3)
+# adding cmd/gc/init_legacy_guard_regression_test.go (+1 file, +2 dolt
+# exec.Command calls). Verified by adding only that file to pre-#68 main.
+baseline_calls = 613
+baseline_files = 176
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-80po0c.2"
