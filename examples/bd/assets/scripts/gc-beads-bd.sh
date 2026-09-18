@@ -2476,8 +2476,48 @@ run_bd_pinned() {
         export GC_DOLT_PASSWORD="$DOLT_PASSWORD"
         export BEADS_DOLT_SERVER_USER="$DOLT_USER"
         export BEADS_DOLT_PASSWORD="$DOLT_PASSWORD"
+        # gc always owns the Dolt sql-server lifecycle for a managed scope
+        # (already started and registered via SQL above); bd must never try
+        # to start its own.
+        export BEADS_DOLT_AUTO_START=0
         bd "$@"
     )
+}
+
+# seed_current_era_version_witness writes bd's local-version witness
+# (.beads/.local_version) with the running bd's own version, but only when no
+# witness exists yet. bd's legacy-upgrade guard cannot yet tell "gc's own
+# managed Dolt sql-server owns this fresh .beads/dolt" apart from "a pre-1.0
+# embedded workspace" the instant .beads/dolt exists on disk with no witness
+# (gcf-g9j3); a witness naming a bd 1.0+ release settles that ambiguity for
+# every mode (guardLegacyUpgradeWorkspace's witnessEraCurrent early return).
+#
+# The seeded value MUST equal the running bd's own version exactly, not an
+# arbitrary current-era placeholder: .local_version does double duty as bd's
+# own upgrade-detection marker (trackBdVersionFile), and a mismatched value
+# reads as "this workspace was last touched by real bd <placeholder>",
+# driving bd into its version-upgrade schema-reconciliation path against a
+# database that was never actually initialized at that version (observed:
+# a placeholder of 1.0.0 made bd refuse a brand-new empty "hq" database with
+# "refusing to auto-apply 30 pending schema migrations (v36 -> v66)" — the
+# reconciler for bd 1.0.0's schema generation, not this bd's own). `bd
+# version` is on guardLegacyNoStoreCommand's fixed exemption list, so it is
+# always safe to shell out to regardless of guard state.
+#
+# Callers only reach this once bd_runtime_schema_ready has already queried
+# the live server and found this exact database has no bd schema at all
+# (no `config` table). A real legacy 0.55-0.62 server-era workspace already
+# has that table from its own prior bd, so it is routed to the
+# already-initialized fast path instead and never reaches here — this seed
+# cannot mask that case.
+seed_current_era_version_witness() {
+    local dir="$1"
+    local witness="$dir/.beads/.local_version"
+    [ -e "$witness" ] && return 0
+    local running_version
+    running_version=$(bd version 2>/dev/null | head -1 | awk '{print $3}')
+    [ -n "$running_version" ] || return 0
+    printf '%s\n' "$running_version" > "$witness" 2>/dev/null || true
 }
 
 run_bd_init_pinned() {
@@ -2486,12 +2526,44 @@ run_bd_init_pinned() {
     local dolt_database="$3"
     local host="$4"
     local force_init="${5:-false}"
+    local freshly_created_database="${6:-false}"
+    # Seed unconditionally, on every path: bd's legacy-upgrade guard fires
+    # on ANY server-mode .beads/dolt directory with no witness the instant
+    # it exists on disk, including the plain (non-force) first-ever init
+    # below (gcf-g9j3 R1) — not only the --reinit-local path. Still safe: a
+    # real legacy workspace already has this exact directory on disk with
+    # real prior data, so it never takes the plain/fresh branches that call
+    # this (freshly_created_database proves the directory was absent, or
+    # force_init's own bd_runtime_schema_ready check already proved no
+    # schema exists yet), and the function itself is a no-op once a witness
+    # is already present.
+    seed_current_era_version_witness "$dir"
     if [ "$force_init" = "true" ]; then
-        run_bd_pinned "$dir" init --force --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
-            --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
+        if [ "$freshly_created_database" = "true" ]; then
+            # A registered-but-schema-less database makes bd's server-mode
+            # init treat applying its own baseline schema as a "shared
+            # server" migration and refuse without explicit consent
+            # (beads#5920). Consent is granted ONLY when the caller proved
+            # (before any registration attempt this run) that this exact
+            # database's on-disk directory did not exist yet — i.e. gc
+            # minted it moments ago and is its only writer. An existing
+            # workspace that merely lost its schema, or a legacy directory
+            # that was never registered, does NOT set this, and hits bd's
+            # own consent refusal below unmodified (gcf-g9j3 R2).
+            BD_ALLOW_REMOTE_MIGRATE=1 run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+                --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
+        else
+            run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+                --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
+        fi
         return 0
     fi
 
+    # Plain (non-force) path: op_init's fresh-database shortcut always sets
+    # bd_init_force="--force" (see skip_preinit_check), so this branch is
+    # reached only by the hosted-gateway/compat fallback callers that pass
+    # force_init="" directly — an already-registered, schema-bearing
+    # database. No migrate consent needed here.
     run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
         --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
 }
@@ -2766,6 +2838,114 @@ op_init() {
         exit 0
     fi
 
+    # Hold a per-database init lock across the whole schema bring-up below
+    # (registration/existence checks through wait_for_bd_runtime_schema
+    # settling), so no concurrent op_init/gc caller targeting the SAME
+    # dolt_database can become a second migrator (gcf-g9j3 D1/D2: the
+    # dirty-tables failures traced to a second writer touching a database
+    # whose first write had not yet settled). fd 9 is opened and flocked
+    # here; bash preserves open fds across `exec` unless marked
+    # close-on-exec, so the GC_BD_INIT_RETRY re-exec below inherits this
+    # same held lock rather than trying (and needing) to reacquire it —
+    # guarded by GC_BD_INIT_LOCK_HELD so the re-exec does not reopen/
+    # retruncate the lock file and lose lock continuity. The lock is
+    # released automatically on process exit (every op_init exit path is
+    # a real `exit`), so no explicit unlock is needed.
+    #
+    # The lock file lives under DATA_DIR (the managed server's actual data
+    # dir, $GC_CITY_PATH/.beads/dolt), keyed by dolt_database — NOT under
+    # $dir/.beads/dolt. $dir is the calling rig's own scope directory, which
+    # for every rig other than the city itself is a DIFFERENT directory from
+    # where the managed server's data actually lives (gcf-g9j3 B2, pm review
+    # 2026-09-18 11:4xZ). Creating $dir/.beads/dolt would itself trip bd's
+    # legacy-upgrade guard the next time that rig runs ANY bd command with no
+    # witness present (hasLegacyDoltRoot keys on that exact directory
+    # existing). Two different rig scope dirs can also legitimately target
+    # the same dolt_database on one server, so the lock belongs with the data,
+    # not with either caller's scope dir.
+    if [ "${GC_BD_INIT_LOCK_HELD:-0}" != "1" ]; then
+        if [ "$FLOCK_AVAILABLE" = true ]; then
+            local init_lock_dir="$DATA_DIR/.gc-init-locks"
+            mkdir -p "$init_lock_dir" 2>/dev/null || true
+            local init_lock_file="$init_lock_dir/$dolt_database.lock"
+            exec 9>"$init_lock_file"
+            if ! flock -w "${GC_BD_INIT_LOCK_TIMEOUT_SECONDS:-60}" 9; then
+                die "timed out waiting for per-database init lock on '$dolt_database' ($init_lock_file); another init/start for this database appears to be stuck."
+            fi
+            export GC_BD_INIT_LOCK_HELD=1
+        else
+            echo "warning: flock unavailable; per-database init lock disabled (gcf-g9j3)" >&2
+        fi
+    fi
+
+    # Captured BEFORE any registration attempt below, so it answers "does
+    # this exact database exist anywhere yet" — the freshness proof
+    # run_bd_init_pinned requires before it may grant BD_ALLOW_REMOTE_MIGRATE
+    # consent (gcf-g9j3 R2) and before op_init may skip the raw pre-create
+    # SQL (gcf-g9j3 D3/skip_preinit_check below).
+    #
+    # This checks the RUNNING SERVER's catalog (database_exists, a live "USE
+    # `db`") and the managed server's actual on-disk data dir (DATA_DIR =
+    # $GC_CITY_PATH/.beads/dolt) — never $dir/.beads/dolt. $dir is the
+    # CALLING rig's own scope directory; the managed dolt server's data for
+    # EVERY rig in the city lives under the city's own DATA_DIR, not under
+    # each rig's scope dir (gcf-g9j3 B1, pm review 2026-09-18 11:4xZ — a rig's
+    # own $dir/.beads/dolt is empty for every existing rig, which made every
+    # rig read as "freshly created" on every gc start and would have run
+    # --reinit-local with migrate consent against live, populated rig
+    # ledgers). A real legacy directory, or one left behind by an earlier
+    # session, already exists in one of these two places and reads false
+    # here regardless of what happens below.
+    #
+    # server_reachable is checked FIRST and required: an unreachable server
+    # means freshness cannot be proven, so this fails closed to "not fresh"
+    # (skip_preinit_check stays false, normal existing-workspace handling
+    # applies) rather than risk treating live data as fresh because a
+    # transient connection blip made it look absent.
+    #
+    # GC_BD_INIT_FRESHLY_CREATED=1 overrides this on a retry re-exec
+    # (GC_BD_INIT_RETRY=1): the ORIGINAL attempt already proved freshness
+    # (server_reachable, not in catalog, not on disk) and has since created
+    # the database itself, so the retry's own fresh re-check would otherwise
+    # see that now-existing database and wrongly read a still-in-progress
+    # fresh init as pre-existing.
+    local freshly_created_database=false
+    if [ "${GC_BD_INIT_FRESHLY_CREATED:-}" = "1" ]; then
+        freshly_created_database=true
+    elif server_reachable; then
+        if ! database_exists "$dolt_database" && [ ! -e "$DATA_DIR/$dolt_database" ]; then
+            freshly_created_database=true
+        fi
+    fi
+
+    # skip_preinit_check is true ONLY for the very first attempt against a
+    # genuinely fresh database (freshly_created_database, and not a
+    # GC_BD_INIT_RETRY re-exec of that same attempt). On this path gc must
+    # not pre-create the database with raw CREATE DATABASE SQL at all
+    # (gcf-g9j3 D1/D3): that raw-SQL-then-bd-init handoff is exactly the
+    # cross-process hazard that produced both the dirty-tables and the
+    # "context canceled" failures.
+    #
+    # This does NOT mean skipping --reinit-local, though: gc's Go layer
+    # (normalizeCanonicalBdScopeFilesForInit) always pre-writes a metadata.json
+    # stub before op_init runs, even on the very first-ever call for a brand
+    # new city, so a PLAIN `bd init` (no --reinit-local) sees that stub and
+    # aborts with its own local "This workspace is already initialized"
+    # guard, unconditionally on schema/registration state — confirmed by
+    # direct reproduction (gcf-g9j3 follow-up to D1: D1's own 20/20-clean
+    # test ran in a bare directory with no pre-existing metadata.json, which
+    # is why it never hit this guard; gc's real flow always has one). So the
+    # fresh path below still sets bd_init_force="--force" unconditionally
+    # (no need to probe registration/schema state we already know is absent)
+    # and runs the SAME already-verified --reinit-local + BD_ALLOW_REMOTE_MIGRATE=1
+    # call as R1/R2 — what changes is only that the raw pre-create SQL below
+    # is skipped for this case.
+    local skip_preinit_check=false
+    if [ "$freshly_created_database" = true ] && [ "${GC_BD_INIT_RETRY:-0}" != "1" ]; then
+        skip_preinit_check=true
+        bd_init_force="--force"
+    fi
+
     # If already initialized on disk, ensure the database is also registered
     # with the running server. gc's normalizeCanonicalBdScopeFilesForInit
     # writes metadata.json (dolt_database/dolt_mode) BEFORE invoking us, so a
@@ -2777,7 +2957,7 @@ op_init() {
     # workspace is already initialized" guard. Gating this branch on project_id
     # instead breaks fresh init: gc-pre-seeded metadata has no project_id, so
     # --force is never set and bd init aborts.
-    if [ -f "$dir/.beads/metadata.json" ]; then
+    if [ -f "$dir/.beads/metadata.json" ] && [ "$skip_preinit_check" != true ]; then
         # A pre-existing metadata.json means the store may already be
         # initialized. Both checks below run SQL against the managed Dolt
         # server, so a transient server-unreachable blip (port drift, an
@@ -2815,18 +2995,27 @@ op_init() {
     local host
     host=$(connect_host)
 
-    # Register the database with the running server first. CREATE DATABASE
-    # IF NOT EXISTS both creates the on-disk directory and registers it in
-    # the server's catalog. This is the upstream gastown pattern — when the
-    # server is running, always go through SQL rather than dolt init on disk.
-    #
-    # Failure here is a hard stop: bd init in server mode requires the
-    # database to exist on the server. The previous `|| true` swallowed
-    # CREATE DATABASE failures and let bd init fail later with a cryptic
-    # "database not found" error — root cause of the gascity-3 reproducer
-    # where the city's hq database was never created on first start.
-    if ! ensure_database_registered "$dolt_database"; then
-        die "failed to register Dolt database '$dolt_database' on running server (CREATE DATABASE failed); see warnings above. cannot proceed with bd init."
+    if [ "$skip_preinit_check" = true ]; then
+        echo "database '$dolt_database' does not exist yet; bd init --server will create it directly (gcf-g9j3: no raw CREATE DATABASE pre-create on the fresh-database path)" >&2
+    else
+        # Register the database with the running server first. CREATE DATABASE
+        # IF NOT EXISTS both creates the on-disk directory and registers it in
+        # the server's catalog. This is the upstream gastown pattern — when the
+        # server is running, always go through SQL rather than dolt init on disk.
+        #
+        # Failure here is a hard stop: bd init in server mode requires the
+        # database to exist on the server. The previous `|| true` swallowed
+        # CREATE DATABASE failures and let bd init fail later with a cryptic
+        # "database not found" error — root cause of the gascity-3 reproducer
+        # where the city's hq database was never created on first start.
+        #
+        # This branch never runs on the genuinely-fresh first-attempt path
+        # (skip_preinit_check above) — only for an existing workspace being
+        # re-registered/re-initialized, where the database may already have
+        # real on-disk data.
+        if ! ensure_database_registered "$dolt_database"; then
+            die "failed to register Dolt database '$dolt_database' on running server (CREATE DATABASE failed); see warnings above. cannot proceed with bd init."
+        fi
     fi
 
     # Run bd init in server mode through the pinned wrapper so the fallback
@@ -2837,7 +3026,7 @@ op_init() {
     # visible issue prefix, while `--database` tells bd which existing Dolt
     # database to initialize. Without `--database`, bd can seed beads_<prefix>
     # and leave the pinned database schema-less.
-    run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_force:+true}"
+    run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_force:+true}" "$freshly_created_database"
 
     # Re-register post-init: if bd init didn't catalog-register the DB
     # (server-mode quirk), do it now. After a successful bd init this is a
@@ -2860,7 +3049,17 @@ op_init() {
                 rm -f "$dir/.beads/metadata.json"
             fi
             echo "warning: bd schema for '$dolt_database' not visible after init; retrying init" >&2
-            GC_BD_INIT_RETRY=1 exec "$0" init "$dir" "$prefix" "$dolt_database"
+            # Carry the freshness proof across the re-exec: the retry's own
+            # on-disk check would otherwise see the directory this same
+            # invocation already created and wrongly read it as pre-existing,
+            # denying the migrate consent a still-in-progress fresh init
+            # legitimately needs (gcf-g9j3 R2 must not turn this propagation
+            # retry into a hard failure).
+            if [ "$freshly_created_database" = "true" ]; then
+                GC_BD_INIT_RETRY=1 GC_BD_INIT_FRESHLY_CREATED=1 exec "$0" init "$dir" "$prefix" "$dolt_database"
+            else
+                GC_BD_INIT_RETRY=1 exec "$0" init "$dir" "$prefix" "$dolt_database"
+            fi
             die "failed to re-exec init for $dir"
         fi
         die "bd schema not visible for $dolt_database after init"
