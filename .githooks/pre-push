@@ -26,14 +26,45 @@ if [ -f "$upg" ]; then
   assert_not_unproven_upstream_push "${2:-}" || exit 1
 fi
 
+# Tag-only-push skip (gcf-9kd1): a tag ref is always a brand-new remote ref
+# (remote_sha == zero), so the "new remote branch: run the suite" rule below
+# used to fire on every tag push even when the tagged commit is byte-identical
+# to code already verified on the remote's default branch — v1.3.11 sat 44
+# minutes re-running the suite on a loaded host for exactly this reason. Skip
+# ONLY when the local ref is under refs/tags/ AND the commit it points at is
+# already an ancestor of the remote's default branch. A tag pointing at a
+# commit NOT yet on the remote (a real code push wearing a tag) still runs it,
+# and this check is remote-name-aware so it does not trust a stale local
+# remote-tracking ref for a different remote.
+remote_name="${1:-origin}"
+tag_already_verified() {
+  local local_sha="$1"
+  local commit remote_default
+  commit="$(git rev-parse "${local_sha}^{commit}" 2>/dev/null)" || return 1
+  remote_default="$(git symbolic-ref -q --short "refs/remotes/${remote_name}/HEAD" 2>/dev/null)"
+  remote_default="${remote_default:-${remote_name}/main}"
+  git rev-parse --verify -q "$remote_default" >/dev/null 2>&1 || return 1
+  git merge-base --is-ancestor "$commit" "$remote_default" 2>/dev/null
+}
+
 go_changed=0
 any_non_deletion=0
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r local_ref local_sha _remote_ref remote_sha; do
   # Branch deletion — nothing to test, nothing to guard.
   if [ "$local_sha" = "$zero" ]; then
     continue
   fi
   any_non_deletion=1
+  case "$local_ref" in
+    refs/tags/*)
+      if tag_already_verified "$local_sha"; then
+        echo "pre-push: $local_ref points at a commit already verified on ${remote_name}'s default branch — skipping fast suite for this ref" >&2
+        continue
+      fi
+      go_changed=1
+      continue
+      ;;
+  esac
   # New remote branch: no cheap base to diff against — run the suite.
   if [ "$remote_sha" = "$zero" ]; then
     go_changed=1
