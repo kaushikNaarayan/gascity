@@ -20,6 +20,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      fresh_runs:
+        description: "release-path-regression: number of fresh gc init runs (standing gate = 3; pm's rate measurement = 10)"
+        required: false
+        default: "3"
+      keep_going:
+        description: "release-path-regression: 1 = keep going past a failing fresh init and report N/M (rate measurement); 0 = stop at first failure (standing gate)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -80,3 +89,213 @@ jobs:
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+
+  fresh-init-gate:
+    name: fresh-init-gate
+    # Runs on every PR and push:main (this job's own trigger, shared with
+    # `verify` above), so a commit that breaks fresh `gc init` or a
+    # city-with-rigs restart against the RELEASED bd (VERSIONS-pinned by
+    # sha, NOT the `verify` job's own long-standing v1.1.0 contract-test
+    # pin) cannot land on main and therefore cannot be tagged. Per pm's
+    # W1-W4 ruling on gcf-g9j3: a tag-job-only gate fails after the tag
+    # already exists (how v1.3.11 shipped broken) — see release.yml's
+    # tripwire copy of this same check for the last-line-of-defense half.
+    # Manual dispatch ONLY (pm M1, gcf-g9j3): a gate that is red on PRs for reasons unrelated to
+    # the PR trains people to ignore red. Run: gh workflow run fork-verify.yml --ref <branch>
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository != 'gastownhall/gascity' }}
+    timeout-minutes: 40
+    runs-on: [self-hosted, gt2]
+    env:
+      GO_VERSION: "1.26.5"
+      AC3_MIN_FREE_GB: "5"
+    steps:
+      - name: Preflight — fail fast and loud on host disk exhaustion (gcf-b7fn)
+        run: |
+          set -euo pipefail
+          df_line="$(df -Pk . | tail -1)"
+          avail_kb="$(echo "$df_line" | awk '{print $4}')"
+          avail_gb=$(( avail_kb / 1024 / 1024 ))
+          echo "runner filesystem available: ${avail_gb}GiB (min required: ${AC3_MIN_FREE_GB}GiB)"
+          if [ "$avail_kb" -lt $(( AC3_MIN_FREE_GB * 1024 * 1024 )) ]; then
+            echo "::error::AC3 PREFLIGHT: host disk exhaustion — only ${avail_gb}GiB free (need >= ${AC3_MIN_FREE_GB}GiB). Runner resource failure, not a code failure."
+            exit 1
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Resolve VERSIONS pin
+        id: pins
+        run: |
+          set -euo pipefail
+          bd_version="$(grep -E '^BD_VERSION=' VERSIONS | cut -d= -f2)"
+          dolt_version="$(grep -E '^DOLT_VERSION=' VERSIONS | cut -d= -f2)"
+          test -n "$bd_version" || { echo "::error::BD_VERSION not found in VERSIONS"; exit 1; }
+          test -n "$dolt_version" || { echo "::error::DOLT_VERSION not found in VERSIONS"; exit 1; }
+          echo "bd_version=v${bd_version}" >> "$GITHUB_OUTPUT"
+          echo "dolt_version=${dolt_version}" >> "$GITHUB_OUTPUT"
+      - name: Install dolt ${{ steps.pins.outputs.dolt_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ steps.pins.outputs.dolt_version }}" --cache
+      - name: Install bd ${{ steps.pins.outputs.bd_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-bd-archive.sh "${{ steps.pins.outputs.bd_version }}" --cache
+      - name: Verify installed bd/dolt actually match VERSIONS (not a stale cache hit)
+        run: |
+          set -euo pipefail
+          got_bd="$(bd version 2>&1)"
+          got_dolt="$(dolt version 2>&1)"
+          echo "installed bd:   $got_bd"
+          echo "installed dolt: $got_dolt"
+          echo "$got_bd" | grep -qF "${{ steps.pins.outputs.bd_version }}" || { echo "::error::installed bd does not report VERSIONS-pinned ${{ steps.pins.outputs.bd_version }} — got: $got_bd"; exit 1; }
+          echo "$got_dolt" | grep -qF "${{ steps.pins.outputs.dolt_version }}" || { echo "::error::installed dolt does not report VERSIONS-pinned ${{ steps.pins.outputs.dolt_version }} — got: $got_dolt"; exit 1; }
+      - name: Build the standalone gc binary (the shipped product path, not the in-process test binary)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcf-g9j3-gate-j1-bin"
+          go build -o "$RUNNER_TEMP/gcf-g9j3-gate-j1-bin/gc" ./cmd/gc
+          "$RUNNER_TEMP/gcf-g9j3-gate-j1-bin/gc" version || true
+      - name: J1 fresh-init gate — standalone gc + VERSIONS-pinned bd, N fresh inits (env -i inside the script)
+        env:
+          # dispatch inputs go through env, never interpolated into the script body
+          FRESH_RUNS_INPUT: ${{ inputs.fresh_runs || '3' }}
+          KEEP_GOING_INPUT: ${{ inputs.keep_going || '0' }}
+        run: |
+          set -euo pipefail
+          # Per-run supervisor port so two concurrent gate jobs on the shared gt2
+          # host cannot collide on the script's fixed default (28372).
+          port=$(( 21000 + (GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT * 7) % 6000 ))
+          BD_BIN="$(command -v bd)" \
+          GC_BIN="$RUNNER_TEMP/gcf-g9j3-gate-j1-bin/gc" \
+          GCF_G9J3_GATE_WORKDIR="$RUNNER_TEMP/gcf-g9j3-gate-j1" \
+          GCF_G9J3_GATE_SUPERVISOR_PORT="$port" \
+          GCF_G9J3_GATE_FRESH_RUNS="$FRESH_RUNS_INPUT" \
+          GCF_G9J3_GATE_FRESH_KEEP_GOING="$KEEP_GOING_INPUT" \
+          GCF_G9J3_GATE_SKIP_RIG=1 \
+            scripts/gcf-g9j3-fresh-init-gate.sh
+      - name: Reap any dolt the gate left behind (always; scoped to this job's own gate workdir)
+        if: ${{ always() }}
+        run: |
+          # The gate script only kills its dolt on the success path (no trap), so a
+          # failing or timed-out gate leaks a sql-server onto this shared runner host.
+          # Match ONLY processes whose argv names this job's gate workdir.
+          d="$RUNNER_TEMP/gcf-g9j3-gate-j1"
+          # Evidence for the lock-inside-dolt-data-dir hypothesis (gcf-g9j3): where do lock files sit?
+          { echo "# lock paths under $d"; find "$d" -maxdepth 9 \( -name '.init-lock*' -o -name '.gc-init-locks' -o -name '*.lock' \) 2>/dev/null; } > "$d/lock-listing.txt" 2>&1 || true
+          if pgrep -f -- "$d/" >/dev/null 2>&1; then
+            echo "reaping leaked gate processes under $d:"; pgrep -af -- "$d/" || true
+            pkill -9 -f -- "$d/" || true
+          else
+            echo "no leaked gate processes under $d"
+          fi
+      - name: Upload gate logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gcf-g9j3-j1-logs
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/gcf-g9j3-gate-j1/**/*.log
+            ${{ runner.temp }}/gcf-g9j3-gate-j1/**/dolt-config.yaml
+            ${{ runner.temp }}/gcf-g9j3-gate-j1/lock-listing.txt
+          if-no-files-found: ignore
+
+  rig-restart-gate:
+    name: rig-restart-gate
+    # Runs on every PR and push:main (this job's own trigger, shared with
+    # `verify` above), so a commit that breaks fresh `gc init` or a
+    # city-with-rigs restart against the RELEASED bd (VERSIONS-pinned by
+    # sha, NOT the `verify` job's own long-standing v1.1.0 contract-test
+    # pin) cannot land on main and therefore cannot be tagged. Per pm's
+    # W1-W4 ruling on gcf-g9j3: a tag-job-only gate fails after the tag
+    # already exists (how v1.3.11 shipped broken) — see release.yml's
+    # tripwire copy of this same check for the last-line-of-defense half.
+    # Manual dispatch ONLY (pm M1, gcf-g9j3): a gate that is red on PRs for reasons unrelated to
+    # the PR trains people to ignore red. Run: gh workflow run fork-verify.yml --ref <branch>
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository != 'gastownhall/gascity' }}
+    timeout-minutes: 40
+    runs-on: [self-hosted, gt2]
+    env:
+      GO_VERSION: "1.26.5"
+      AC3_MIN_FREE_GB: "5"
+    steps:
+      - name: Preflight — fail fast and loud on host disk exhaustion (gcf-b7fn)
+        run: |
+          set -euo pipefail
+          df_line="$(df -Pk . | tail -1)"
+          avail_kb="$(echo "$df_line" | awk '{print $4}')"
+          avail_gb=$(( avail_kb / 1024 / 1024 ))
+          echo "runner filesystem available: ${avail_gb}GiB (min required: ${AC3_MIN_FREE_GB}GiB)"
+          if [ "$avail_kb" -lt $(( AC3_MIN_FREE_GB * 1024 * 1024 )) ]; then
+            echo "::error::AC3 PREFLIGHT: host disk exhaustion — only ${avail_gb}GiB free (need >= ${AC3_MIN_FREE_GB}GiB). Runner resource failure, not a code failure."
+            exit 1
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Resolve VERSIONS pin
+        id: pins
+        run: |
+          set -euo pipefail
+          bd_version="$(grep -E '^BD_VERSION=' VERSIONS | cut -d= -f2)"
+          dolt_version="$(grep -E '^DOLT_VERSION=' VERSIONS | cut -d= -f2)"
+          test -n "$bd_version" || { echo "::error::BD_VERSION not found in VERSIONS"; exit 1; }
+          test -n "$dolt_version" || { echo "::error::DOLT_VERSION not found in VERSIONS"; exit 1; }
+          echo "bd_version=v${bd_version}" >> "$GITHUB_OUTPUT"
+          echo "dolt_version=${dolt_version}" >> "$GITHUB_OUTPUT"
+      - name: Install dolt ${{ steps.pins.outputs.dolt_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ steps.pins.outputs.dolt_version }}" --cache
+      - name: Install bd ${{ steps.pins.outputs.bd_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-bd-archive.sh "${{ steps.pins.outputs.bd_version }}" --cache
+      - name: Verify installed bd/dolt actually match VERSIONS (not a stale cache hit)
+        run: |
+          set -euo pipefail
+          got_bd="$(bd version 2>&1)"
+          got_dolt="$(dolt version 2>&1)"
+          echo "installed bd:   $got_bd"
+          echo "installed dolt: $got_dolt"
+          echo "$got_bd" | grep -qF "${{ steps.pins.outputs.bd_version }}" || { echo "::error::installed bd does not report VERSIONS-pinned ${{ steps.pins.outputs.bd_version }} — got: $got_bd"; exit 1; }
+          echo "$got_dolt" | grep -qF "${{ steps.pins.outputs.dolt_version }}" || { echo "::error::installed dolt does not report VERSIONS-pinned ${{ steps.pins.outputs.dolt_version }} — got: $got_dolt"; exit 1; }
+      - name: Build the standalone gc binary (the shipped product path, not the in-process test binary)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcf-g9j3-gate-j2-bin"
+          go build -o "$RUNNER_TEMP/gcf-g9j3-gate-j2-bin/gc" ./cmd/gc
+          "$RUNNER_TEMP/gcf-g9j3-gate-j2-bin/gc" version || true
+      - name: J2 rig-restart gate — 2 rigs, stop/start x2, positive readiness (env -i inside the script)
+        run: |
+          set -euo pipefail
+          # Per-run supervisor port so two concurrent gate jobs on the shared gt2
+          # host cannot collide on the script's fixed default (28372).
+          port=$(( 21000 + (GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT * 7 + 3000) % 6000 ))
+          BD_BIN="$(command -v bd)" \
+          GC_BIN="$RUNNER_TEMP/gcf-g9j3-gate-j2-bin/gc" \
+          GCF_G9J3_GATE_WORKDIR="$RUNNER_TEMP/gcf-g9j3-gate-j2" \
+          GCF_G9J3_GATE_SUPERVISOR_PORT="$port" \
+          GCF_G9J3_GATE_SKIP_FRESH=1 \
+            scripts/gcf-g9j3-fresh-init-gate.sh
+      - name: Reap any dolt the gate left behind (always; scoped to this job's own gate workdir)
+        if: ${{ always() }}
+        run: |
+          # The gate script only kills its dolt on the success path (no trap), so a
+          # failing or timed-out gate leaks a sql-server onto this shared runner host.
+          # Match ONLY processes whose argv names this job's gate workdir.
+          d="$RUNNER_TEMP/gcf-g9j3-gate-j2"
+          # Evidence for the lock-inside-dolt-data-dir hypothesis (gcf-g9j3): where do lock files sit?
+          { echo "# lock paths under $d"; find "$d" -maxdepth 9 \( -name '.init-lock*' -o -name '.gc-init-locks' -o -name '*.lock' \) 2>/dev/null; } > "$d/lock-listing.txt" 2>&1 || true
+          if pgrep -f -- "$d/" >/dev/null 2>&1; then
+            echo "reaping leaked gate processes under $d:"; pgrep -af -- "$d/" || true
+            pkill -9 -f -- "$d/" || true
+          else
+            echo "no leaked gate processes under $d"
+          fi
+      - name: Upload gate logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gcf-g9j3-j2-logs
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/gcf-g9j3-gate-j2/**/*.log
+            ${{ runner.temp }}/gcf-g9j3-gate-j2/**/dolt-config.yaml
+            ${{ runner.temp }}/gcf-g9j3-gate-j2/lock-listing.txt
+          if-no-files-found: ignore

@@ -71,6 +71,80 @@ jobs:
       - name: Verify release output is ignored
         run: make check-release-dist-ignore
 
+      - name: Resolve VERSIONS pin (gcf-g9j3 tripwire)
+        id: pins
+        run: |
+          set -euo pipefail
+          bd_version="$(grep -E '^BD_VERSION=' VERSIONS | cut -d= -f2)"
+          dolt_version="$(grep -E '^DOLT_VERSION=' VERSIONS | cut -d= -f2)"
+          test -n "$bd_version" || { echo "::error::BD_VERSION not found in VERSIONS"; exit 1; }
+          test -n "$dolt_version" || { echo "::error::DOLT_VERSION not found in VERSIONS"; exit 1; }
+          echo "bd_version=v${bd_version}" >> "$GITHUB_OUTPUT"
+          echo "dolt_version=${dolt_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dolt ${{ steps.pins.outputs.dolt_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ steps.pins.outputs.dolt_version }}" --cache
+
+      - name: Install bd ${{ steps.pins.outputs.bd_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-bd-archive.sh "${{ steps.pins.outputs.bd_version }}" --cache
+
+      - name: Verify installed bd/dolt actually match VERSIONS (not a stale cache hit)
+        run: |
+          set -euo pipefail
+          got_bd="$(bd version 2>&1)"
+          got_dolt="$(dolt version 2>&1)"
+          echo "installed bd:   $got_bd"
+          echo "installed dolt: $got_dolt"
+          echo "$got_bd" | grep -qF "${{ steps.pins.outputs.bd_version }}" || { echo "::error::installed bd does not report VERSIONS-pinned ${{ steps.pins.outputs.bd_version }} — got: $got_bd"; exit 1; }
+          echo "$got_dolt" | grep -qF "${{ steps.pins.outputs.dolt_version }}" || { echo "::error::installed dolt does not report VERSIONS-pinned ${{ steps.pins.outputs.dolt_version }} — got: $got_dolt"; exit 1; }
+
+      - name: Build the standalone gc binary (the shipped product path, not the in-process test binary)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcf-g9j3-gate-bin"
+          go build -o "$RUNNER_TEMP/gcf-g9j3-gate-bin/gc" ./cmd/gc
+          "$RUNNER_TEMP/gcf-g9j3-gate-bin/gc" version || true
+      - name: gcf-g9j3 tripwire (BLOCKING) — fresh inits only, standalone gc + VERSIONS-pinned bd (env -i inside the script)
+        # pm M2 (gcf-g9j3): a red tripwire means we do NOT publish. Re-running is allowed; overriding
+        # needs a pm decision recorded on the bead. Must stay BEFORE 'Run GoReleaser'.
+        run: |
+          set -euo pipefail
+          # Per-run supervisor port so two concurrent gate jobs on the shared gt2
+          # host cannot collide on the script's fixed default (28372).
+          port=$(( 21000 + (GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT * 7) % 6000 ))
+          BD_BIN="$(command -v bd)" \
+          GC_BIN="$RUNNER_TEMP/gcf-g9j3-gate-bin/gc" \
+          GCF_G9J3_GATE_WORKDIR="$RUNNER_TEMP/gcf-g9j3-gate" \
+          GCF_G9J3_GATE_SUPERVISOR_PORT="$port" \
+          GCF_G9J3_GATE_SKIP_RIG=1 \
+            scripts/gcf-g9j3-fresh-init-gate.sh
+      - name: Reap any dolt the gate left behind (always; scoped to this job's own gate workdir)
+        if: ${{ always() }}
+        run: |
+          # The gate script only kills its dolt on the success path (no trap), so a
+          # failing or timed-out gate leaks a sql-server onto this shared runner host.
+          # Match ONLY processes whose argv names this job's gate workdir.
+          d="$RUNNER_TEMP/gcf-g9j3-gate"
+          # Evidence for the lock-inside-dolt-data-dir hypothesis (gcf-g9j3): where do lock files sit?
+          { echo "# lock paths under $d"; find "$d" -maxdepth 9 \( -name '.init-lock*' -o -name '.gc-init-locks' -o -name '*.lock' \) 2>/dev/null; } > "$d/lock-listing.txt" 2>&1 || true
+          if pgrep -f -- "$d/" >/dev/null 2>&1; then
+            echo "reaping leaked gate processes under $d:"; pgrep -af -- "$d/" || true
+            pkill -9 -f -- "$d/" || true
+          else
+            echo "no leaked gate processes under $d"
+          fi
+      - name: Upload gate logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gcf-g9j3-gate-logs
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/gcf-g9j3-gate/**/*.log
+            ${{ runner.temp }}/gcf-g9j3-gate/**/dolt-config.yaml
+            ${{ runner.temp }}/gcf-g9j3-gate/lock-listing.txt
+          if-no-files-found: ignore
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7
         with:
