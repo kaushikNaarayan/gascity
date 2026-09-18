@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -160,21 +162,60 @@ type routeRecoveryScope struct {
 	store beads.Store
 }
 
-// routeRecoveryScopeTimeout bounds how long recoverUnroutedWorkRoutes waits on
-// a single scope's restoreCarriedWorkRoutes pass before moving on to the next
-// scope (gcf-7gcj.3). beads.Store has no context.Context parameter, so a
-// hung/slow store call cannot be canceled from here — only bounded from the
-// caller's side, the same limitation the TOCTOU-narrowing comment on
+// routeRecoveryScopeTimeoutDefault bounds how long recoverUnroutedWorkRoutes
+// waits on a single scope's restoreCarriedWorkRoutes pass before moving on to
+// the next scope (gcf-7gcj.3). beads.Store has no context.Context parameter,
+// so a hung/slow store call cannot be canceled from here — only bounded from
+// the caller's side, the same limitation the TOCTOU-narrowing comment on
 // restoreCarriedWorkRoutes already documents for the write path. This is the
 // read-path analog: a per-store failure must not block every other scope's
 // reconciliation the way it did in ga-3auv3 (one rig's route recovery ran
 // 452,154ms of a 468,013ms tick, starving an unrelated dispatcher demand for
 // over 7 minutes).
 //
-// A var, not a const, so route_recovery_test.go can shrink it and keep the
-// bounded-wait tests deterministic and fast instead of sleeping the real
-// production bound.
-var routeRecoveryScopeTimeout = 5 * time.Second
+// The default is a judgment call, not a fitted value: the only duration data
+// on hand is two failure samples (~452s each, both ga-3auv3) and one healthy
+// baseline (Dolt latency 80ms, same incident's diagnostic pass) — nowhere
+// near enough to fit a distribution. 5s sits comfortably above the one
+// healthy sample and far below both failure samples. GC_ROUTE_RECOVERY_TIMEOUT
+// overrides it for an operator who has evidence a particular fleet needs more
+// margin, mirroring GC_BD_PROBE_TIMEOUT's override/floor shape below.
+const routeRecoveryScopeTimeoutDefault = 5 * time.Second
+
+// routeRecoveryScopeTimeoutFloor is the minimum accepted
+// GC_ROUTE_RECOVERY_TIMEOUT value. Below this the bound stops doing its job:
+// a scope would report "degraded" almost every tick even against a healthy
+// store, which is noise, not signal. Deliberately much lower than
+// bdProbeTimeoutFloor (5s): an undersized probe timeout there can starve real
+// subprocess work of the time it needs to complete at all, but an undersized
+// route-recovery bound only produces extra "degraded" log lines — the
+// background probe still runs to completion and still writes regardless of
+// how short the caller's wait is (see recoverScopeRoutesBounded), so the
+// floor here exists for log-noise sanity, not correctness.
+const routeRecoveryScopeTimeoutFloor = 100 * time.Millisecond
+
+// parseRouteRecoveryScopeTimeout reads GC_ROUTE_RECOVERY_TIMEOUT and returns
+// the parsed duration. Unset or empty: returns routeRecoveryScopeTimeoutDefault
+// (5s). Invalid: logs a warning, returns the default. Below the floor (100ms):
+// logs a warning, returns the floor. Read fresh on every call (not cached at
+// startup) so both an operator override and a test's t.Setenv take effect
+// immediately — the same shape as parseBDProbeTimeout in pool.go.
+func parseRouteRecoveryScopeTimeout(stderr io.Writer) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GC_ROUTE_RECOVERY_TIMEOUT"))
+	if raw == "" {
+		return routeRecoveryScopeTimeoutDefault
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: GC_ROUTE_RECOVERY_TIMEOUT=%s invalid duration, using %s\n", raw, routeRecoveryScopeTimeoutDefault) //nolint:errcheck // best-effort stderr
+		return routeRecoveryScopeTimeoutDefault
+	}
+	if d < routeRecoveryScopeTimeoutFloor {
+		fmt.Fprintf(stderr, "gc: GC_ROUTE_RECOVERY_TIMEOUT=%s below minimum (%s), using %s\n", raw, routeRecoveryScopeTimeoutFloor, routeRecoveryScopeTimeoutFloor) //nolint:errcheck // best-effort stderr
+		return routeRecoveryScopeTimeoutFloor
+	}
+	return d
+}
 
 // recoverUnroutedWorkRoutes restores gc.routed_to from each bead's own carried
 // route across the city store and every active rig store, so ready work
@@ -234,6 +275,7 @@ func (cr *CityRuntime) recoverScopeRoutesBounded(sc routeRecoveryScope) {
 		restored, err := restoreCarriedWorkRoutes(sc.store)
 		done <- routeRecoveryResult{restored: restored, err: err}
 	}()
+	timeout := parseRouteRecoveryScopeTimeout(cr.stderr)
 	select {
 	case res := <-done:
 		if res.err != nil {
@@ -242,7 +284,7 @@ func (cr *CityRuntime) recoverScopeRoutesBounded(sc routeRecoveryScope) {
 		if res.restored > 0 {
 			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): restored gc.routed_to on %d ready bead(s) from gc.run_target\n", cr.logPrefix, sc.label, res.restored) //nolint:errcheck // best-effort stderr
 		}
-	case <-time.After(routeRecoveryScopeTimeout):
-		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): degraded — exceeded %s bound, continuing with remaining scopes; this scope's probe keeps running in the background and will be retried once it returns\n", cr.logPrefix, sc.label, routeRecoveryScopeTimeout) //nolint:errcheck // best-effort stderr
+	case <-time.After(timeout):
+		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): degraded — exceeded %s bound, continuing with remaining scopes; this scope's probe keeps running in the background and will be retried once it returns\n", cr.logPrefix, sc.label, timeout) //nolint:errcheck // best-effort stderr
 	}
 }
