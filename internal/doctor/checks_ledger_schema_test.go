@@ -132,8 +132,8 @@ func TestIsLedgerSchemaMismatch(t *testing.T) {
 		{errors.New("column widget not found in query"), false},
 		{nil, false},
 	} {
-		if got := isLedgerSchemaMismatch(tc.err); got != tc.want {
-			t.Errorf("isLedgerSchemaMismatch(%v) = %v, want %v", tc.err, got, tc.want)
+		if got := IsLedgerSchemaMismatch(tc.err); got != tc.want {
+			t.Errorf("IsLedgerSchemaMismatch(%v) = %v, want %v", tc.err, got, tc.want)
 		}
 	}
 }

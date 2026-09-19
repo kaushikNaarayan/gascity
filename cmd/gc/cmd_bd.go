@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/spf13/cobra"
 )
 
@@ -393,6 +394,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	cmd.Dir = target.ScopeRoot
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
+	// A frontier read (`ready`, `list --ready`) that exits 0 with an empty
+	// result reads as "no work". On a ledger the pinned bd cannot read it is a
+	// false green (gcf-tf22), so an empty result is verified against the ledger
+	// below. The stdout tee is skipped on a terminal so bd keeps its tty
+	// formatting; a terminal run is probed unconditionally instead.
+	frontierRead := bdRelocatedClassInvocationComputesFrontier(bdArgs)
+	var stdoutScan *headLimitedWriter
+	if frontierRead && !bdWriterIsTerminal(stdout) {
+		stdoutScan = &headLimitedWriter{limit: bdStderrScanLimit}
+		cmd.Stdout = io.MultiWriter(stdout, stdoutScan)
+	}
 	// Tee stderr through a bounded head buffer alongside the operator's
 	// pipe so we can scan it post-exec for bd's silent-fallback-to-on-disk
 	// marker. Only stderr is teed: bd writes its auto-import banner there,
@@ -445,7 +457,50 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return bdSilentFallbackExitCode
 	}
 
+	if frontierRead && (stdoutScan == nil || bdFrontierOutputIsEmpty(stdoutScan.String())) {
+		if err := bdLedgerProbe(cityPath, cfg, target); doctor.IsLedgerSchemaMismatch(err) {
+			fmt.Fprintf(stderr, "gc bd: %s\n  fix: %s\n", doctor.LedgerUnreadableMessage(scopeLabel(target), err), doctor.LedgerUnreadableFixHint) //nolint:errcheck // best-effort stderr
+			return bdLedgerUnreadableExitCode
+		}
+	}
+
 	return 0
+}
+
+// bdLedgerUnreadableExitCode is the exit code for a frontier read that came
+// back empty because the ledger schema predates the pinned bd.
+const bdLedgerUnreadableExitCode = 1
+
+// bdLedgerProbe reads the target scope's ledger through the schema-gated path
+// doctor uses. A var so tests can supply the store's answer. Only a schema
+// signature is acted on by the caller: an open or read failure of any other
+// kind must not turn a bd exit 0 into a failure.
+var bdLedgerProbe = func(cityPath string, cfg *config.City, target execStoreTarget) error {
+	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
+	if err != nil {
+		return err
+	}
+	return doctor.ProbeLedgerRead(store)
+}
+
+// bdFrontierOutputIsEmpty reports whether a frontier read's stdout carries no
+// work: nothing, an empty JSON array/null, or bd's "No ready work found" text.
+func bdFrontierOutputIsEmpty(out string) bool {
+	t := strings.TrimSpace(out)
+	if t == "" || t == "[]" || t == "null" {
+		return true
+	}
+	return strings.Contains(t, "No ready work found")
+}
+
+// bdWriterIsTerminal reports whether w is a character device (a terminal).
+func bdWriterIsTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func parseBdReleaseIfCurrentArgs(args []string) (id, expectedAssignee string, ok bool, err error) {
