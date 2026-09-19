@@ -1071,6 +1071,14 @@ fetched = "2026-04-10T00:00:00Z"
 	if !strings.Contains(err.Error(), "local worktree changes") || !strings.Contains(err.Error(), `run "gc import install"`) {
 		t.Fatalf("error = %v, want dirty-cache install hint", err)
 	}
+	// gcf-xj7b: the error must name the actual dirty cached clone and the
+	// offending relative file, with the import source only as context.
+	if !strings.Contains(err.Error(), cacheDir) || !strings.Contains(err.Error(), "(pack.toml)") {
+		t.Fatalf("error = %v, want dirty clone path %q and file pack.toml", err, cacheDir)
+	}
+	if !strings.Contains(err.Error(), "import source: "+source) {
+		t.Fatalf("error = %v, want import source %q as secondary context", err, source)
+	}
 }
 
 func TestImport_RootPackRemoteImportMissingSharedCacheFails(t *testing.T) {

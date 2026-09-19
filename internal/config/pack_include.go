@@ -507,9 +507,18 @@ func validateLockedRemoteCache(source, cacheDir, commit string) error {
 		return fmt.Errorf("checking cached import %s worktree status: %w", source, err)
 	}
 	if strings.TrimSpace(status) != "" {
-		return fmt.Errorf("cached import %s has local worktree changes; run \"gc import install\"", source)
+		return fmt.Errorf("cached clone %s has local worktree changes%s; run \"gc import install\" (import source: %s)", cacheDir, dirtyFilesSuffix(status), source)
 	}
 	return nil
+}
+
+// dirtyFilesSuffix renders the bounded dirty-file list for a cached clone's
+// porcelain status, or "" when no paths can be named.
+func dirtyFilesSuffix(status string) string {
+	if files := gitutil.DirtyFileSummary(status); files != "" {
+		return " (" + files + ")"
+	}
+	return ""
 }
 
 func defaultRunRepoCacheGit(dir string, args ...string) (string, error) {
