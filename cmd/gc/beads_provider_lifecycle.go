@@ -2466,8 +2466,21 @@ func runProviderOpWithEnvContext(parent context.Context, script string, environ 
 	if len(args) > 0 {
 		op = args[0]
 	}
-	ctx, cancel := providerLifecycleContext(parent, providerOpTimeout(op))
+	// "init" is progress-aware (gcf-6ryi): it may exceed the fixed window while
+	// its process group keeps making I/O progress, and fails fast on a stall.
+	progressAware := op == "init" && providerOpProgressSupported
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var cancelCause context.CancelCauseFunc
+	if progressAware {
+		base, baseCancel := providerLifecycleContext(parent, providerInitProgress.ceiling)
+		ctx, cancelCause = context.WithCancelCause(base)
+		cancel = func() { cancelCause(nil); baseCancel() }
+	} else {
+		ctx, cancel = providerLifecycleContext(parent, providerOpTimeout(op))
+	}
 	defer cancel()
+	started := time.Now()
 
 	cmd := exec.CommandContext(ctx, script, args...)
 	cmd.WaitDelay = 2 * time.Second
@@ -2479,9 +2492,35 @@ func runProviderOpWithEnvContext(parent context.Context, script string, environ 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		done := make(chan struct{})
+		supervisorExited := make(chan struct{})
+		if progressAware {
+			// Setpgid makes the child its own process-group leader.
+			go func(cfg providerOpProgressConfig, sample func(int) (uint64, bool), pgid int) {
+				defer close(supervisorExited)
+				superviseProviderOpProgress(op, pgid, cfg, sample, done, cancelCause)
+			}(providerInitProgress, providerOpSampleProgress, cmd.Process.Pid)
+		} else {
+			close(supervisorExited)
+		}
+		err = cmd.Wait()
+		close(done)
+		<-supervisorExited
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			if progressAware {
+				var stall *providerOpStallError
+				if errors.As(context.Cause(ctx), &stall) {
+					return fmt.Errorf("exec beads %s: %w", args[0], stall)
+				}
+				if errors.Is(ctxErr, context.DeadlineExceeded) {
+					return fmt.Errorf("exec beads %s: exceeded %s hard ceiling (elapsed %s): %w",
+						args[0], providerInitProgress.ceiling, time.Since(started).Round(time.Second), ctxErr)
+				}
+			}
 			return fmt.Errorf("exec beads %s: %w", args[0], ctxErr)
 		}
 		var exitErr *exec.ExitError
