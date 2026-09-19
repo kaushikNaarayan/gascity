@@ -346,6 +346,9 @@ jobs:
           # One `-run` regex per shard: the whole package as ONE shard is 452,085 bytes, over Linux's
           # 131,072-byte MAX_ARG_STRLEN (exec fails with 126). 6 shards is ~75 KB each, the repo's own split.
           # Keep going after a failed shard so one run reports every failing test; fail at the end.
+          # GitHub runs `bash -e {0}`, and `set -uo pipefail` does not clear -e: without `set +e` the first
+          # failing shard aborts the step and shards after it never run (seen on probe run 35431173501).
+          set +e
           set -uo pipefail
           total_start=$SECONDS
           failed=0
