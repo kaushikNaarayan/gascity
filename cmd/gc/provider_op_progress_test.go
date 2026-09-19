@@ -220,3 +220,26 @@ func TestProviderInitStubBdPast120sFullScale(t *testing.T) {
 		t.Fatalf("stall failed at %v, want ~60-75s (10s of I/O + 60s window)", took)
 	}
 }
+
+// Fast, never skipped: pins the production defaults so a drift goes red in the
+// default suite instead of only in the skipped full-scale test (qa F1). The
+// no-progress window, hard ceiling and poll interval are the shipped contract;
+// changing one is a deliberate decision that must change this test too.
+func TestProviderInitProgressProductionDefaults(t *testing.T) {
+	want := providerOpProgressConfig{stall: 60 * time.Second, ceiling: 15 * time.Minute, poll: 2 * time.Second}
+	if providerInitProgress != want {
+		t.Fatalf("providerInitProgress = %+v, want %+v", providerInitProgress, want)
+	}
+	// The window must sit inside the ceiling and above the poll interval.
+	if !(providerInitProgress.poll < providerInitProgress.stall && providerInitProgress.stall < providerInitProgress.ceiling) {
+		t.Fatalf("inconsistent defaults: %+v", providerInitProgress)
+	}
+	// Linux-only signal: elsewhere init keeps the fixed deadline.
+	if wantSupported := runtime.GOOS == "linux"; providerOpProgressSupported != wantSupported {
+		t.Fatalf("providerOpProgressSupported = %v on %s, want %v", providerOpProgressSupported, runtime.GOOS, wantSupported)
+	}
+	// The fixed fallback (non-Linux, and every non-init op) is unchanged.
+	if got := providerOpTimeout("init"); got != 120*time.Second {
+		t.Fatalf("fixed init fallback = %v, want 120s", got)
+	}
+}
