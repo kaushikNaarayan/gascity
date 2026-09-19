@@ -710,6 +710,20 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = fmt.Sprintf("store ping failed: %v", err)
 		return r
 	}
+	// Ping proves only that the connection is alive. Read through the
+	// schema-gated path too, so a ledger the pinned bd cannot read (v59 vs
+	// v66, gcf-tf22) is RED with the migration named rather than "accessible".
+	if err := probeLedgerRead(result.Store); err != nil {
+		if isLedgerSchemaMismatch(err) {
+			r.Status = StatusError
+			r.Message = ledgerSchemaMessage("the city store", err)
+			r.FixHint = ledgerSchemaFixHint
+			return r
+		}
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("store read probe failed: %v", err)
+		return r
+	}
 	if result.Diagnostic.Store == beads.BeadsStoreNameBdStore {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf(
@@ -1543,6 +1557,19 @@ func (c *RigBeadsCheck) Run(_ *CheckContext) *CheckResult {
 	if err := store.Ping(); err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("store ping failed: %v", err)
+		return r
+	}
+	// Same schema-gated read as the city store check (gcf-tf22): the rig
+	// stores were the unreadable ones on a v59 ledger while Ping stayed green.
+	if err := probeLedgerRead(store); err != nil {
+		if isLedgerSchemaMismatch(err) {
+			r.Status = StatusError
+			r.Message = ledgerSchemaMessage("rig "+c.rig.Name, err)
+			r.FixHint = ledgerSchemaFixHint
+			return r
+		}
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("store read probe failed: %v", err)
 		return r
 	}
 	r.Status = StatusOK
