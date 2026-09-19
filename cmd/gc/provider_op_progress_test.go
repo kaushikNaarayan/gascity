@@ -88,14 +88,20 @@ func TestProviderInitProgressStalledInitFailsFastAndReapsGroup(t *testing.T) {
 		t.Fatalf("child pid not recorded: %v", rerr)
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	// Poll with a ticker (not time.Sleep: the resource ledger counts fixed sleeps).
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	timeout := time.After(3 * time.Second)
+	for {
 		if syscall.Kill(pid, 0) != nil {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-tick.C:
+		case <-timeout:
+			t.Fatalf("nested child %d survived stall kill", pid)
+		}
 	}
-	t.Fatalf("nested child %d survived stall kill", pid)
 }
 
 // Progress never extends past the hard ceiling.
