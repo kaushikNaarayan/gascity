@@ -417,7 +417,7 @@ func (s *importCheckState) validateCachedGitCheckout(name, source, commit, cache
 		})
 		return false
 	}
-	dirty, err := cachedRepoDirty(cachePath)
+	status, err := cachedRepoStatus(cachePath)
 	if err != nil {
 		s.closureIncomplete = true
 		s.addIssue(CheckIssue{
@@ -431,7 +431,7 @@ func (s *importCheckState) validateCachedGitCheckout(name, source, commit, cache
 		})
 		return false
 	}
-	if dirty {
+	if strings.TrimSpace(status) != "" {
 		s.closureIncomplete = true
 		s.addIssue(CheckIssue{
 			Code:       "cache-worktree-dirty",
@@ -439,7 +439,7 @@ func (s *importCheckState) validateCachedGitCheckout(name, source, commit, cache
 			Source:     source,
 			Commit:     commit,
 			Path:       cachePath,
-			Message:    "cached repository has local worktree changes",
+			Message:    "cached repository has local worktree changes" + dirtyFilesSuffix(status),
 			RepairHint: `run "gc import install"`,
 		})
 		return false

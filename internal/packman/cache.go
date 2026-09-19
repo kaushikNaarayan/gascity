@@ -189,6 +189,11 @@ func checkoutExistingCache(cachePath, commit string) error {
 }
 
 func cachedRepoDirty(cachePath string) (bool, error) {
+	status, err := cachedRepoStatus(cachePath)
+	return strings.TrimSpace(status) != "", err
+}
+
+func cachedRepoStatus(cachePath string) (string, error) {
 	// Intentionally NOT --ignored: gitignored build artifacts written into
 	// the cache in place (e.g. Python __pycache__/*.pyc from running a cached
 	// pack's scripts, or a stray .DS_Store) are not local modifications to the
@@ -197,9 +202,9 @@ func cachedRepoDirty(cachePath string) (bool, error) {
 	// gate (vp-gny3). A reinstall's `git clean -ffdx` still clears them.
 	status, err := runGit(cachePath, "status", "--porcelain")
 	if err != nil {
-		return false, fmt.Errorf("checking cached repo worktree status: %w", err)
+		return "", fmt.Errorf("checking cached repo worktree status: %w", err)
 	}
-	return strings.TrimSpace(status) != "", nil
+	return status, nil
 }
 
 func validateCachedRepoCheckout(cachePath, commit string) error {
@@ -210,12 +215,12 @@ func validateCachedRepoCheckout(cachePath, commit string) error {
 	if !gitutil.SameCommit(head, commit) {
 		return fmt.Errorf("cached repository is checked out at %s, expected %s", strings.TrimSpace(head), commit)
 	}
-	dirty, err := cachedRepoDirty(cachePath)
+	status, err := cachedRepoStatus(cachePath)
 	if err != nil {
 		return err
 	}
-	if dirty {
-		return fmt.Errorf("cached repository has local worktree changes")
+	if strings.TrimSpace(status) != "" {
+		return fmt.Errorf("cached repository %s has local worktree changes%s", cachePath, dirtyFilesSuffix(status))
 	}
 	return nil
 }
@@ -324,4 +329,13 @@ func defaultRunNetworkGit(cityRoot, remoteURL, dir string, args ...string) (stri
 		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// dirtyFilesSuffix renders the bounded dirty-file list for a cached repo's
+// porcelain status, or "" when no paths can be named.
+func dirtyFilesSuffix(status string) string {
+	if files := gitutil.DirtyFileSummary(status); files != "" {
+		return " (" + files + ")"
+	}
+	return ""
 }
