@@ -111,13 +111,56 @@ If ANY output (untracked files, uncommitted changes):
 git add -A && git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"
 ```
 
-**2. Push to base_branch with conflict retry (up to 3 attempts):**
+**2. Push to base_branch with conflict retry (up to 3 attempts).**
+
+A direct push to a PROTECTED branch is rejected by the remote (GH006 /
+"Changes must be made through a pull request" / "protected branch hook
+declined") — this is NOT a conflict, and rebasing will never fix it. Detect
+it from the push output and switch to a PR immediately, on the FIRST
+occurrence, without spending the conflict-retry budget:
 
 ```bash
+PUSH_LOG=$(mktemp)
+is_protected_rejection() {
+    grep -qiE 'protected branch|GH006|hook declined|required status check|changes must be made through a pull request' "$1"
+}
+
+pr_fallback() {
+    echo "base_branch is protected — opening a PR instead of a direct push"
+    FEATURE_BRANCH="polecat/${WORK_BEAD_ID}"
+    git push origin "HEAD:refs/heads/${FEATURE_BRANCH}"
+    PR_URL=$(gh pr create --base {{base_branch}} --head "$FEATURE_BRANCH" \
+        --title "${WORK_BEAD_ID}: $(git log -1 --format=%s)" \
+        --body "Landed by polecat for ${WORK_BEAD_ID}. base_branch is protected; direct push was rejected." \
+        --json url -q .url)
+    if [ -z "$PR_URL" ]; then
+        echo "PR creation failed" >&2
+        gc mail send {{escalation_target}} -s "HELP: protected {{base_branch}}, PR creation failed" \
+          -m "Issue: $WORK_BEAD_ID. Direct push to {{base_branch}} was rejected as protected, and gh pr create also failed. Feature branch ${FEATURE_BRANCH} is pushed; bead left open."
+        gc runtime drain-ack
+        exit 1
+    fi
+    # A strand must not read as done: record the PR and leave the bead OPEN.
+    # Do not close the bead in this branch — closing without a landing is
+    # the exact bug this fallback exists to prevent. Someone (refinery/PM)
+    # closes once $PR_URL actually merges.
+    gc bd update "$WORK_BEAD_ID" --set-metadata pr_url="$PR_URL" \
+        --notes "base_branch is protected; opened $PR_URL instead of direct push. Left OPEN pending merge."
+    gc mail send {{escalation_target}} -s "PR opened: {{base_branch}} is protected" \
+      -m "Issue: $WORK_BEAD_ID. $PR_URL"
+    gc runtime drain-ack
+    exit 0
+}
+
 for attempt in 1 2 3; do
-    if git push origin HEAD:{{base_branch}}; then
+    if git push origin HEAD:{{base_branch}} >"$PUSH_LOG" 2>&1; then
         echo "Push succeeded on attempt $attempt"
+        rm -f "$PUSH_LOG"
         break
+    fi
+    cat "$PUSH_LOG" >&2
+    if is_protected_rejection "$PUSH_LOG"; then
+        pr_fallback
     fi
     if [ "$attempt" -eq 3 ]; then
         echo "Push failed after 3 attempts"

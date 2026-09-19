@@ -207,3 +207,55 @@ func TestCoreShippedAssetsAvoidNonexistentBDListSearchFlag(t *testing.T) {
 		t.Fatalf("walking embedded core pack: %v", err)
 	}
 }
+
+// TestMolPolecatCommitFallsBackToPRWhenBaseBranchIsProtected pins the fix
+// for gcf-q5e8: a bare `git push origin HEAD:{{base_branch}}` against a
+// PROTECTED branch is rejected by the remote (GH006 / "changes must be made
+// through a pull request"), which is not a conflict and rebase-retrying it
+// is pointless. Before this fix the step exhausted its 3 conflict retries
+// against the same rejection, mailed escalation, and exited 1 -- but the
+// step *before* it (workspace-setup) had already run, and other formulas in
+// this family close the bead unconditionally after a push loop, so a
+// protected-branch target reliably produced a stranded branch with no PR
+// and, in the closing formulas, a bead marked done anyway.
+func TestMolPolecatCommitFallsBackToPRWhenBaseBranchIsProtected(t *testing.T) {
+	step := formulaStep(t, readFormula(t, "mol-polecat-commit.toml"), "commit-and-push")
+
+	if !strings.Contains(step, "is_protected_rejection") {
+		t.Fatal("commit-and-push must detect a protected-branch push rejection distinctly from an ordinary conflict")
+	}
+	if !strings.Contains(step, "gh pr create") {
+		t.Fatal("commit-and-push must fall back to opening a PR when base_branch is protected")
+	}
+
+	// Negative control: a genuine conflict/rejection must still go through
+	// the existing fetch+rebase retry path, not be swallowed into a PR.
+	rebaseAt := strings.Index(step, "git rebase origin/{{base_branch}}")
+	if rebaseAt < 0 {
+		t.Fatal("commit-and-push must retain the fetch+rebase retry path for ordinary (non-protection) push failures")
+	}
+
+	// The PR fallback must never reach the unconditional `gc bd close` that
+	// follows in step 4 -- that unconditional close on a stranded branch is
+	// exactly the bug. Closing here would mark undone work as done.
+	fallbackAt := strings.Index(step, "pr_fallback()")
+	if fallbackAt < 0 {
+		t.Fatal("commit-and-push must define a pr_fallback that leaves the bead OPEN")
+	}
+	// Bound the search to the function body, not everything after it in the
+	// step -- step 4 (a later, separate section) legitimately calls
+	// `gc bd close` once a push succeeds normally; that must not count here.
+	bodyEnd := strings.Index(step[fallbackAt:], "\n}\n")
+	if bodyEnd < 0 {
+		t.Fatal("could not locate the end of pr_fallback()'s body")
+	}
+	fallbackBody := step[fallbackAt : fallbackAt+bodyEnd]
+	closeAt := strings.Index(fallbackBody, "gc bd close")
+	exitAt := strings.Index(fallbackBody, "exit 0")
+	if closeAt >= 0 && (exitAt < 0 || closeAt < exitAt) {
+		t.Error("pr_fallback must not call `gc bd close` before exiting -- a strand must leave the bead open, not closed")
+	}
+	if !strings.Contains(fallbackBody, "Left OPEN pending merge") && !strings.Contains(fallbackBody, `pr_url=`) {
+		t.Error("pr_fallback must record the PR URL as bead metadata so a strand is discoverable from the bead, per gcf-q5e8 AC3")
+	}
+}
