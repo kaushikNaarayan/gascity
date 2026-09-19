@@ -739,12 +739,16 @@ func buildDesiredStateWithSessionBeads(
 		// storePartial: stamping the beads that WERE collected is always
 		// correct, and any bead missed by a partial query simply gets stamped
 		// on a later tick.
+		subPhaseStart = time.Now()
 		stampRunSessionIdentity(assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
 		// Re-home work pre-assigned to a legacy bound form of a now-unbound pool
 		// agent onto the canonical identity, so the canonical session the
 		// awake/scale accounting wakes for it can actually surface and claim it
 		// (the agent-side work_query/claim path matches identities by raw string).
 		canonicalizeLegacyBoundAssignedWork(cfg, assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
+		recordDemandSubPhase(trace, "demand_snapshot.stamp_and_canonicalize_assigned", subPhaseStart, map[string]any{
+			"beads": len(assignedWorkBeads),
+		})
 		// Re-home open, unassigned work still routed to a legacy bound form of a
 		// now-unbound pool agent. This is the demand/claim half of the migration:
 		// empty-assignee open work never enters the assigned-work collection above,
@@ -856,12 +860,18 @@ func buildDesiredStateWithSessionBeads(
 		if len(scaleCheckPartialTemplates) > 0 {
 			fmt.Fprintf(stderr, "scaleCheck: PARTIAL — scale_check failed for %s, retaining affected sessions\n", strings.Join(sortedBoolMapKeys(scaleCheckPartialTemplates), ",")) //nolint:errcheck
 		}
+		subPhaseStart = time.Now()
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
 		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
 		poolDesiredStates := ComputePoolDesiredStatesWithDemandTraced(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
+		recordDemandSubPhase(trace, "demand_snapshot.compute_pool_desired", subPhaseStart, map[string]any{
+			"pools":          len(poolDesiredStates),
+			"assigned_beads": len(poolWorkBeads),
+		})
+		subPhaseStart = time.Now()
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
 			if cfgAgent == nil {
@@ -873,6 +883,9 @@ func buildDesiredStateWithSessionBeads(
 			}
 			realizePoolDesiredSessions(bp, cfgAgent, poolState, desired, stderr)
 		}
+		recordDemandSubPhase(trace, "demand_snapshot.realize_pool_sessions", subPhaseStart, map[string]any{
+			"pools": len(poolDesiredStates),
+		})
 	} else {
 		// No store — use scale_check counts directly.
 		scaleCheckCounts, _ = evaluatePendingPoolsMap(cfg, pendingPools, stderr, trace)
@@ -989,6 +1002,10 @@ func buildDesiredStateWithSessionBeads(
 			namedRoutedDemand[identity] = true
 		}
 	}
+	namedMaterializeStart := time.Now()
+	var namedResolveTotal, namedSideEffectsTotal, namedSlowest time.Duration
+	var namedSlowestIdentity string
+	namedResolved := 0
 	for identity, spec := range namedSpecs {
 		canonicalInfo, hasCanonical := findCanonicalNamedSessionInfo(bp.sessionBeads, spec)
 		if !hasCanonical {
@@ -1000,7 +1017,10 @@ func buildDesiredStateWithSessionBeads(
 			continue
 		}
 		fpExtra := buildFingerprintExtra(spec.Agent)
+		resolveStart := time.Now()
 		tp, err := resolveTemplatePrepared(bp, spec.Agent, identity, fpExtra)
+		resolveElapsed := time.Since(resolveStart)
+		namedResolveTotal += resolveElapsed
 		if err != nil {
 			fmt.Fprintf(stderr, "buildDesiredState: named session %q: %v (skipping)\n", identity, err) //nolint:errcheck
 			continue
@@ -1028,16 +1048,35 @@ func buildDesiredStateWithSessionBeads(
 				tp.SessionName = sn
 			}
 		}
+		sideEffectsStart := time.Now()
 		installAgentSideEffects(bp, spec.Agent, tp, stderr)
+		sideEffectsElapsed := time.Since(sideEffectsStart)
+		namedSideEffectsTotal += sideEffectsElapsed
+		namedResolved++
+		if total := resolveElapsed + sideEffectsElapsed; total > namedSlowest {
+			namedSlowest, namedSlowestIdentity = total, identity
+		}
 		desired[tp.SessionName] = tp
 	}
+	recordDemandSubPhase(trace, "demand_snapshot.materialize_named_sessions", namedMaterializeStart, map[string]any{
+		"specs":               len(namedSpecs),
+		"resolved":            namedResolved,
+		"resolve_ms":          namedResolveTotal.Milliseconds(),
+		"side_effects_ms":     namedSideEffectsTotal.Milliseconds(),
+		"slowest_identity":    namedSlowestIdentity,
+		"slowest_identity_ms": namedSlowest.Milliseconds(),
+	})
 
 	baseDesired := cloneDesiredState(desired)
 
 	// Phase 2: discover session beads created outside config iteration
 	// (e.g., by "gc session new"). Include them in desired state if they
 	// have a valid template and are not held/closed.
+	overlayStart := time.Now()
 	applySessionBeadDesiredOverlay(bp, cfg, desired, suspendedRigPaths, poolPartialRetentionTemplates, namedScaleCheckPartialTemplates, stderr)
+	recordDemandSubPhase(trace, "demand_snapshot.session_bead_overlay", overlayStart, map[string]any{
+		"desired": len(desired),
+	})
 
 	var continuationClaimCandidates []ContinuationClaimCandidate
 	continuationClaimQueryPartial := storePartial

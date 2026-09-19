@@ -13341,6 +13341,12 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 		"demand_snapshot.collect_assigned_work":      false,
 		"demand_snapshot.collect_unassigned_routed":  false,
 		"demand_snapshot.evaluate_pending_pools":     false,
+		// gcf-eln5: the phases that used to be dark inside load_demand_snapshot.
+		"demand_snapshot.stamp_and_canonicalize_assigned": false,
+		"demand_snapshot.compute_pool_desired":            false,
+		"demand_snapshot.realize_pool_sessions":           false,
+		"demand_snapshot.materialize_named_sessions":      false,
+		"demand_snapshot.session_bead_overlay":            false,
 	}
 	for i := range records {
 		r := &records[i]
