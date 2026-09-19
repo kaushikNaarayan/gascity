@@ -27,6 +27,9 @@ func (s *unreadableLedgerStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 }
 
 var (
+	// qa's raw wording from a real v59 ledger read by bd rc.2 (gcf-tf22 REJECT).
+	errLedgerCLI = errors.New(`bd list readability probe failed: Error: get ready work: fetch issues: get issues by IDs from issues: Error 1105 (HY000): column "storage_class" could not be found in any table in scope`)
+
 	errLedgerLeases  = errors.New(`bd list: table not found: leases`)
 	errLedgerColumns = errors.New(`bd list: table "i" does not have column "storage_class"`)
 )
@@ -127,6 +130,7 @@ func TestIsLedgerSchemaMismatch(t *testing.T) {
 	}{
 		{errLedgerLeases, true},
 		{errLedgerColumns, true},
+		{errLedgerCLI, true},
 		{errors.New("i/o timeout"), false},
 		{errors.New("connection refused"), false},
 		{errors.New("column widget not found in query"), false},
@@ -135,5 +139,42 @@ func TestIsLedgerSchemaMismatch(t *testing.T) {
 		if got := IsLedgerSchemaMismatch(tc.err); got != tc.want {
 			t.Errorf("IsLedgerSchemaMismatch(%v) = %v, want %v", tc.err, got, tc.want)
 		}
+	}
+}
+
+// qa's REJECT of 2cfc55f62 (gcf-tf22): on a real v59 ledger gc's NATIVE store
+// opens and lists fine (it knows v59); only the bd CLI fails. A probe through
+// the native store alone is a false green. These pin the real condition: a
+// readable native store plus a failing bd-CLI probe must be RED.
+func TestBeadsStoreCheck_RedWhenNativeStoreReadsButBdCLIProbeFails(t *testing.T) {
+	native := &unreadableLedgerStore{} // List succeeds, like the native store on v59
+	for _, e := range []error{errLedgerCLI, errLedgerLeases, errLedgerColumns} {
+		c := newLedgerCheck(t, native).WithLedgerProbe(func(string) error { return e })
+		r := c.Run(&CheckContext{})
+		if r.Status != StatusError || !strings.Contains(r.Message, "founder-gated") {
+			t.Fatalf("%v: status = %d msg = %q, want Error naming the migration", e, r.Status, r.Message)
+		}
+	}
+	// control: the same readable native store with a passing bd probe is green.
+	c := newLedgerCheck(t, native).WithLedgerProbe(func(string) error { return nil })
+	if r := c.Run(&CheckContext{}); r.Status != StatusOK {
+		t.Fatalf("passing bd probe: status = %d msg = %q, want OK", r.Status, r.Message)
+	}
+	// control: a non-schema bd failure warns without claiming the migration.
+	c = newLedgerCheck(t, native).WithLedgerProbe(func(string) error { return errors.New("bd list probe timed out") })
+	if r := c.Run(&CheckContext{}); r.Status != StatusWarning || strings.Contains(r.Message+r.FixHint, "founder-gated") {
+		t.Fatalf("non-schema bd failure: status = %d msg = %q", r.Status, r.Message)
+	}
+}
+
+func TestRigBeadsCheck_RedWhenNativeStoreReadsButBdCLIProbeFails(t *testing.T) {
+	native := &unreadableLedgerStore{}
+	c := newRigLedgerCheck(t, native).WithLedgerProbe(func(string) error { return errLedgerCLI })
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError || !strings.Contains(r.Message, "founder-gated") || !strings.Contains(r.Message, "gymbo") {
+		t.Fatalf("status = %d msg = %q, want Error naming the rig and the migration", r.Status, r.Message)
+	}
+	if r := newRigLedgerCheck(t, native).WithLedgerProbe(func(string) error { return nil }).Run(&CheckContext{}); r.Status != StatusOK {
+		t.Fatalf("passing bd probe: status = %d, want OK", r.Status)
 	}
 }

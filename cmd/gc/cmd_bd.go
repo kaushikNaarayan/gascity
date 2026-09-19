@@ -471,26 +471,25 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 // back empty because the ledger schema predates the pinned bd.
 const bdLedgerUnreadableExitCode = 1
 
-// bdLedgerProbe reads the target scope's ledger through the schema-gated path
-// doctor uses. A var so tests can supply the store's answer. Only a schema
-// signature is acted on by the caller: an open or read failure of any other
-// kind must not turn a bd exit 0 into a failure.
-var bdLedgerProbe = func(cityPath string, cfg *config.City, target execStoreTarget) error {
-	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
-	if err != nil {
-		return err
-	}
-	return doctor.ProbeLedgerRead(store)
-}
+// bdLedgerProbe verifies the target scope's ledger is readable by the pinned
+// bd. It reads through the bd CLI (bdCLILedgerProbe), NOT gc's native store: the
+// native store knows v59 and passes on a ledger the CLI cannot read (gcf-tf22).
+// A var so tests can supply the answer. Only a schema signature is acted on by
+// the caller: any other failure must not turn a bd exit 0 into a failure.
+var bdLedgerProbe = bdCLILedgerProbe
 
 // bdFrontierOutputIsEmpty reports whether a frontier read's stdout carries no
-// work: nothing, an empty JSON array/null, or bd's "No ready work found" text.
+// work: nothing, an empty JSON array/null, or bd's empty-result text. The
+// pinned bd prints "No open issues" (plus a tip line) for an empty `ready`
+// (captured by qa on a real ledger, gcf-tf22); older builds print "No ready
+// work found".
 func bdFrontierOutputIsEmpty(out string) bool {
 	t := strings.TrimSpace(out)
 	if t == "" || t == "[]" || t == "null" {
 		return true
 	}
-	return strings.Contains(t, "No ready work found")
+	l := strings.ToLower(t)
+	return strings.Contains(l, "no open issues") || strings.Contains(l, "no ready work found")
 }
 
 // bdWriterIsTerminal reports whether w is a character device (a terminal).

@@ -105,6 +105,7 @@ func TestGcBdReadyLedgerProbeControls(t *testing.T) {
 func TestBdFrontierOutputIsEmpty(t *testing.T) {
 	for out, want := range map[string]bool{
 		"": true, "  \n": true, "[]": true, "null\n": true, "No ready work found": true,
+		"No open issues\n\n💡 Tip: bd ready --json for agents": true, // real bd, captured by qa
 		`[{"id":"a"}]`: false, "demo-1  open  fix it": false,
 	} {
 		if got := bdFrontierOutputIsEmpty(out); got != want {

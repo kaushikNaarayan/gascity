@@ -22,13 +22,16 @@ func ProbeLedgerRead(s beads.Store) error {
 
 // IsLedgerSchemaMismatch reports whether err carries the signature of a ledger
 // whose schema predates the pinned bd (observed on a v59 ledger read by
-// bd 1.3.0-rc.2: a missing table, or a missing column on the issues table).
+// bd 1.3.0-rc.2: a missing table, or a missing column on the issues table,
+// worded by Dolt as "table not found", "does not have column" or "column ...
+// could not be found in any table in scope").
 func IsLedgerSchemaMismatch(err error) bool {
 	if err == nil {
 		return false
 	}
 	m := strings.ToLower(err.Error())
 	return strings.Contains(m, "table not found") ||
+		strings.Contains(m, "could not be found in any table") ||
 		(strings.Contains(m, "does not have column") && strings.Contains(m, "table"))
 }
 
