@@ -6,4 +6,6 @@ package main
 // providerOpTimeout deadline.
 const providerOpProgressSupported = false
 
-func sampleProcessGroupProgress(int) (uint64, bool) { return 0, false }
+func sampleProcessGroupProgress(int) (providerOpProgressSample, bool) {
+	return providerOpProgressSample{}, false
+}

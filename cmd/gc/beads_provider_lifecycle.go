@@ -2498,7 +2498,7 @@ func runProviderOpWithEnvContext(parent context.Context, script string, environ 
 		supervisorExited := make(chan struct{})
 		if progressAware {
 			// Setpgid makes the child its own process-group leader.
-			go func(cfg providerOpProgressConfig, sample func(int) (uint64, bool), pgid int) {
+			go func(cfg providerOpProgressConfig, sample func(int) (providerOpProgressSample, bool), pgid int) {
 				defer close(supervisorExited)
 				superviseProviderOpProgress(op, pgid, cfg, sample, done, cancelCause)
 			}(providerInitProgress, providerOpSampleProgress, cmd.Process.Pid)

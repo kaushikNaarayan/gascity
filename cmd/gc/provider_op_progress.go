@@ -24,25 +24,33 @@ var providerInitProgress = providerOpProgressConfig{
 	poll:    2 * time.Second,
 }
 
-// providerOpSampleProgress returns a monotonic activity counter for the
-// process group led by pgid; ok is false when unavailable on this platform.
-// A var so tests can drive progress deterministically.
+// providerOpProgressSample is a monotonic activity reading for a process
+// group: I/O bytes (rchar+wchar) and I/O syscalls (syscr+syscw). Any change in
+// either counts as progress.
+type providerOpProgressSample struct {
+	Bytes    uint64
+	Syscalls uint64
+}
+
+// providerOpSampleProgress returns the activity reading for the process group
+// led by pgid; ok is false when unavailable on this platform. A var so tests
+// can drive progress deterministically.
 var providerOpSampleProgress = sampleProcessGroupProgress
 
 // providerOpStallError is the cause attached to the op context when the
 // no-progress window elapses. It unwraps to context.DeadlineExceeded so callers
 // that test for a deadline keep working.
 type providerOpStallError struct {
-	op           string
-	elapsed      time.Duration
-	sinceLast    time.Duration
-	stall        time.Duration
-	lastActivity uint64
+	op        string
+	elapsed   time.Duration
+	sinceLast time.Duration
+	stall     time.Duration
+	last      providerOpProgressSample
 }
 
 func (e *providerOpStallError) Error() string {
-	return fmt.Sprintf("%s made no progress for %s (window %s; elapsed %s; last I/O activity counter %d)",
-		e.op, e.sinceLast.Round(time.Second), e.stall, e.elapsed.Round(time.Second), e.lastActivity)
+	return fmt.Sprintf("%s made no progress for %s (window %s; elapsed %s; last observed I/O: %d bytes, %d syscalls)",
+		e.op, e.sinceLast.Round(time.Second), e.stall, e.elapsed.Round(time.Second), e.last.Bytes, e.last.Syscalls)
 }
 
 func (e *providerOpStallError) Unwrap() error { return context.DeadlineExceeded }
@@ -50,10 +58,10 @@ func (e *providerOpStallError) Unwrap() error { return context.DeadlineExceeded 
 // superviseProviderOpProgress samples the process group every cfg.poll and
 // cancels the op with a providerOpStallError when the counter has not
 // advanced for cfg.stall. It returns when done is closed or it has canceled.
-func superviseProviderOpProgress(op string, pgid int, cfg providerOpProgressConfig, sample func(int) (uint64, bool), done <-chan struct{}, cancel context.CancelCauseFunc) {
+func superviseProviderOpProgress(op string, pgid int, cfg providerOpProgressConfig, sample func(int) (providerOpProgressSample, bool), done <-chan struct{}, cancel context.CancelCauseFunc) {
 	start := time.Now()
 	lastProgress := start
-	var last uint64
+	var last providerOpProgressSample
 	if v, ok := sample(pgid); ok {
 		last = v
 	}
@@ -69,7 +77,7 @@ func superviseProviderOpProgress(op string, pgid int, cfg providerOpProgressConf
 				lastProgress = now
 			}
 			if since := now.Sub(lastProgress); since >= cfg.stall {
-				cancel(&providerOpStallError{op: op, elapsed: now.Sub(start), sinceLast: since, stall: cfg.stall, lastActivity: last})
+				cancel(&providerOpStallError{op: op, elapsed: now.Sub(start), sinceLast: since, stall: cfg.stall, last: last})
 				return
 			}
 		}
