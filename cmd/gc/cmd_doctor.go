@@ -279,7 +279,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// Data checks.
 	if cfgErr == nil && cfg != nil {
 		register(doctor.NewBDSplitStoreCheck(cityPath))
-		register(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
+		register(newBeadsStoreDoctorCheck(cityPath, cfg, openStoreResultForCity(cityPath)))
 		register(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
 		register(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
 		register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
@@ -348,7 +348,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			register(doctor.NewRigGitCheck(rig))
 			register(doctor.NewRigRootBranchCheck(rig))
 			register(doctor.NewRigBDSplitStoreCheck(cityPath, rig))
-			register(doctor.NewRigBeadsCheck(cityPath, rig, storeFactory))
+			register(newRigBeadsDoctorCheck(cityPath, cfg, rig, storeFactory))
 			register(newDoctorRigDoltServerCheck(cityPath, rig, !rigUsesManagedBdStoreContract(cityPath, rig) || opts.SkipRigDoltChecks))
 			// Custom types check — rig store.
 			register(doctor.NewCustomTypesCheck(rig.Path, rig.Name))

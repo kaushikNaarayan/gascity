@@ -658,8 +658,18 @@ func (c *OrphanSessionsCheck) Fix(_ *CheckContext) error {
 // when the store selection silently fell back to the fork-per-op BdStore
 // (gastownhall/gascity#4245) instead of the native store.
 type BeadsStoreCheck struct {
-	cityPath string
-	newStore func(cityPath string) (beads.StoreOpenResult, error)
+	cityPath    string
+	newStore    func(cityPath string) (beads.StoreOpenResult, error)
+	ledgerProbe func(scopePath string) error
+}
+
+// WithLedgerProbe supplies the readability probe. The production wiring passes
+// a probe that reads through the bd CLI: gc's native store opens fine on a
+// ledger the pinned bd cannot read, so probing it alone is a false green
+// (gcf-tf22). Without one, the check falls back to reading the native store.
+func (c *BeadsStoreCheck) WithLedgerProbe(p func(scopePath string) error) *BeadsStoreCheck {
+	c.ledgerProbe = p
+	return c
 }
 
 // NewBeadsStoreCheck creates a check for the bead store.
@@ -710,6 +720,20 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = fmt.Sprintf("store ping failed: %v", err)
 		return r
 	}
+	// Ping proves only that the connection is alive. Read through the
+	// schema-gated path too, so a ledger the pinned bd cannot read (v59 vs
+	// v66, gcf-tf22) is RED with the migration named rather than "accessible".
+	if err := c.probeLedger(result.Store); err != nil {
+		if IsLedgerSchemaMismatch(err) {
+			r.Status = StatusError
+			r.Message = LedgerUnreadableMessage("the city store", err)
+			r.FixHint = LedgerUnreadableFixHint
+			return r
+		}
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("store read probe failed: %v", err)
+		return r
+	}
 	if result.Diagnostic.Store == beads.BeadsStoreNameBdStore {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf(
@@ -721,6 +745,13 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 	r.Status = StatusOK
 	r.Message = "store accessible"
 	return r
+}
+
+func (c *BeadsStoreCheck) probeLedger(s beads.Store) error {
+	if c.ledgerProbe != nil {
+		return c.ledgerProbe(c.cityPath)
+	}
+	return ProbeLedgerRead(s)
 }
 
 // CanFix returns false.
@@ -1494,9 +1525,16 @@ func (c *RigGitCheck) Fix(_ *CheckContext) error { return nil }
 
 // RigBeadsCheck verifies a rig's beads store is accessible.
 type RigBeadsCheck struct {
-	cityPath string
-	rig      config.Rig
-	newStore func(rigPath string) (beads.Store, error)
+	cityPath    string
+	rig         config.Rig
+	newStore    func(rigPath string) (beads.Store, error)
+	ledgerProbe func(scopePath string) error
+}
+
+// WithLedgerProbe supplies the readability probe; see BeadsStoreCheck.WithLedgerProbe.
+func (c *RigBeadsCheck) WithLedgerProbe(p func(scopePath string) error) *RigBeadsCheck {
+	c.ledgerProbe = p
+	return c
 }
 
 // NewRigBeadsCheck creates a rig beads store accessibility check.
@@ -1543,6 +1581,25 @@ func (c *RigBeadsCheck) Run(_ *CheckContext) *CheckResult {
 	if err := store.Ping(); err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("store ping failed: %v", err)
+		return r
+	}
+	// Same schema-gated read as the city store check (gcf-tf22): the rig
+	// stores were the unreadable ones on a v59 ledger while Ping stayed green.
+	var probeErr error
+	if c.ledgerProbe != nil {
+		probeErr = c.ledgerProbe(rigPath)
+	} else {
+		probeErr = ProbeLedgerRead(store)
+	}
+	if err := probeErr; err != nil {
+		if IsLedgerSchemaMismatch(err) {
+			r.Status = StatusError
+			r.Message = LedgerUnreadableMessage("rig "+c.rig.Name, err)
+			r.FixHint = LedgerUnreadableFixHint
+			return r
+		}
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("store read probe failed: %v", err)
 		return r
 	}
 	r.Status = StatusOK
