@@ -1112,6 +1112,7 @@ func TestAgentConfigFromAgentCoversPersistedFields(t *testing.T) {
 		WorkDir:                ".gc/agents/worker",
 		TmuxAlias:              "worker--{{.CityName}}",
 		Scope:                  "city",
+		BeadsScope:             "city",
 		Suspended:              true,
 		PreStart:               []string{"pre-cmd"},
 		PromptTemplate:         "prompts/worker.md",

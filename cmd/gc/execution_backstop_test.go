@@ -13,7 +13,6 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
-	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/pkg/eventexport"
 )
 
@@ -98,48 +97,6 @@ func (f *executionBackstopFixture) claimWork(t *testing.T, title string) beads.B
 		t.Fatalf("re-reading the claimed work bead: %v", err)
 	}
 	return claimed
-}
-
-// A continuation is specific to a completed Codex turn. Other providers keep
-// their established behavior; their idle in-progress work must never enter the
-// Codex continuation backstop merely because they share a pool slot shape.
-func TestExecutionBackstopSkipsNonCodexProvider(t *testing.T) {
-	f := newExecutionBackstopFixture(t)
-	if err := f.store.SetMetadata(f.session.ID, "provider", "claude"); err != nil {
-		t.Fatalf("setting provider: %v", err)
-	}
-	f.idleFor(t, 10*time.Minute)
-
-	for i := 0; i < 3; i++ {
-		f.tick(t)
-		f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
-		f.idleFor(t, 10*time.Minute)
-	}
-
-	if got := f.nudgeCount(); got != 0 {
-		t.Fatalf("non-Codex nudge count = %d, want 0", got)
-	}
-	if got := f.sessionMeta(t, executionClaimNudgeWorkKey); got != "" {
-		t.Fatalf("non-Codex marker = %q, want no marker", got)
-	}
-}
-
-func TestExecutionBackstopRecognizesWrappedCodexProvider(t *testing.T) {
-	f := newExecutionBackstopFixture(t)
-	if err := f.store.SetMetadataBatch(f.session.ID, map[string]string{
-		"provider":         "custom-seat",
-		"builtin_ancestor": "codex",
-	}); err != nil {
-		t.Fatalf("setting wrapped provider metadata: %v", err)
-	}
-	f.idleFor(t, 10*time.Minute)
-	f.tick(t)
-	if got := f.sessionMeta(t, executionClaimNudgeWorkKey); got != f.work.ID {
-		t.Fatalf("wrapped Codex marker = %q, want %q", got, f.work.ID)
-	}
-	if got := sessionpkg.ProviderFamilyFromMetadata(map[string]string{"provider": "custom-seat", "builtin_ancestor": "codex"}, ""); got != "codex" {
-		t.Fatalf("fixture provider family = %q, want codex", got)
-	}
 }
 
 // tick runs one reconcile tick of the backstop at the fixture's current clock.

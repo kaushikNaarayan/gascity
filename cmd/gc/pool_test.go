@@ -870,6 +870,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		OptionDefaults:               map[string]string{"effort": "max"},
 		BindingName:                  "gastown",
 		PackName:                     "gastown",
+		BeadsScope:                   "city",
 		AssignedWorkDeferLimit:       intPtr(3),
 	}
 

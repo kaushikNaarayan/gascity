@@ -57,7 +57,6 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
-	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // Session-bead metadata keys for the execution backstop. Persisted for the same
@@ -263,8 +262,7 @@ func (p poolExecutionBackstop) governs(s beads.Bead) bool {
 	if isManualSessionBead(s) {
 		return false
 	}
-	return (strings.TrimSpace(s.Metadata["pool_managed"]) == "true" || isNamedSessionBead(s)) &&
-		sessionpkg.ProviderFamilyFromMetadata(s.Metadata, "") == "codex"
+	return strings.TrimSpace(s.Metadata["pool_managed"]) == "true" || isNamedSessionBead(s)
 }
 
 // resolve reports an outstanding stall only when all of it holds: the session
@@ -347,7 +345,7 @@ func (p poolExecutionBackstop) content(s beads.Bead) string {
 	if claim == "" {
 		return ""
 	}
-	return "Resume from durable bead state. " + claim
+	return claim
 }
 
 // decay implements activityDecayingBackstop. An in-progress claim is what a

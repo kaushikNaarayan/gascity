@@ -61,6 +61,7 @@ type agentFile struct {
 	WorkDir                string                  `toml:"work_dir,omitempty"`
 	TmuxAlias              string                  `toml:"tmux_alias,omitempty"`
 	Scope                  string                  `toml:"scope,omitempty"`
+	BeadsScope             string                  `toml:"beads_scope,omitempty"`
 	Suspended              bool                    `toml:"suspended,omitempty"`
 	PreStart               []string                `toml:"pre_start,omitempty"`
 	Nudge                  string                  `toml:"nudge,omitempty"`
@@ -919,6 +920,7 @@ func agentConfigFromAgent(agent config.Agent) agentFile {
 		WorkDir:                agent.WorkDir,
 		TmuxAlias:              agent.TmuxAlias,
 		Scope:                  agent.Scope,
+		BeadsScope:             agent.BeadsScope,
 		Suspended:              agent.Suspended,
 		PreStart:               agent.PreStart,
 		Nudge:                  agent.Nudge,
@@ -974,6 +976,7 @@ func isZeroAgentConfig(cfg agentFile) bool {
 		cfg.WorkDir == "" &&
 		cfg.TmuxAlias == "" &&
 		cfg.Scope == "" &&
+		cfg.BeadsScope == "" &&
 		!cfg.Suspended &&
 		len(cfg.PreStart) == 0 &&
 		cfg.Nudge == "" &&
