@@ -330,6 +330,7 @@ func (c *CachingStore) runReconciliation() {
 	for _, b := range fresh {
 		freshByID[b.ID] = cloneBead(b)
 	}
+	c.revalidateDestructiveAssignmentRegressions(freshByID, startSeq, start)
 
 	confirmedClosed := c.recoverMissingFromList(freshByID)
 
@@ -353,6 +354,95 @@ func (c *CachingStore) runReconciliation() {
 		log.Print(logLine)
 	}
 	c.notifyChanges(res.notifications)
+}
+
+type destructiveAssignmentRegression struct {
+	cached Bead
+	listed Bead
+}
+
+// revalidateDestructiveAssignmentRegressions protects ownership from a
+// syntactically valid but stale full-scan row. A transition that clears an
+// assignee or reopens in-progress work is destructive enough to require an
+// authoritative point read before the cache publishes it. Point-read failure
+// is ambiguous, so the cache retains its prior row and retries next cycle.
+//
+// A confirmed transition still passes through. In particular, this does not
+// turn external assignments into leases the cache can never release.
+func (c *CachingStore) revalidateDestructiveAssignmentRegressions(
+	freshByID map[string]Bead, startSeq uint64, startedAt time.Time,
+) {
+	c.mu.RLock()
+	candidates := make(map[string]destructiveAssignmentRegression)
+	for id, listed := range freshByID {
+		cached, ok := c.beads[id]
+		if !ok || !destructivelyRegressesAssignment(cached, listed) {
+			continue
+		}
+		candidates[id] = destructiveAssignmentRegression{
+			cached: cloneBead(cached),
+			listed: cloneBead(listed),
+		}
+	}
+	c.mu.RUnlock()
+
+	for id, candidate := range candidates {
+		authoritative, err := c.backing.Get(id)
+		if err != nil {
+			freshByID[id] = candidate.cached
+			c.recordProblem(
+				"revalidate destructive assignment regression",
+				fmt.Errorf(
+					"source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q verdict=defer: %w",
+					startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+					candidate.cached.Status, candidate.cached.Assignee,
+					candidate.listed.Status, candidate.listed.Assignee, err,
+				),
+			)
+			continue
+		}
+		if authoritative.ID != id {
+			freshByID[id] = candidate.cached
+			c.recordProblem(
+				"revalidate destructive assignment regression",
+				fmt.Errorf(
+					"source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q get_id=%q verdict=defer",
+					startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+					candidate.cached.Status, candidate.cached.Assignee,
+					candidate.listed.Status, candidate.listed.Assignee,
+					authoritative.ID,
+				),
+			)
+			continue
+		}
+
+		verdict := "accept-confirmed"
+		if authoritative.Status == "closed" {
+			// The active-only scan should not contain a closed row. Remove the
+			// stale listed row and let recoverMissingFromList obtain the fresh
+			// close payload through its established close-verification path.
+			delete(freshByID, id)
+			verdict = "accept-confirmed-close"
+		} else {
+			freshByID[id] = cloneBead(authoritative)
+			if !destructivelyRegressesAssignment(candidate.cached, authoritative) {
+				verdict = "reject-stale-list"
+			}
+		}
+
+		log.Printf(
+			"beads cache: assignment regression revalidated rig=%s source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q get_status=%q get_assignee=%q verdict=%s",
+			c.idPrefix, startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+			candidate.cached.Status, candidate.cached.Assignee,
+			candidate.listed.Status, candidate.listed.Assignee,
+			authoritative.Status, authoritative.Assignee, verdict,
+		)
+	}
+}
+
+func destructivelyRegressesAssignment(cached, fresh Bead) bool {
+	return (cached.Assignee != "" && fresh.Assignee == "") ||
+		(cached.Status == "in_progress" && fresh.Status == "open")
 }
 
 // mergeAction is what the reconcile merge does with one id.
