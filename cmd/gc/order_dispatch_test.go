@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +26,37 @@ import (
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 )
+
+func TestOrderDispatchCadenceBoundsSixtySevenOrderBurst(t *testing.T) {
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:     fmt.Sprintf("scheduled-%02d", i),
+			Trigger:  "cron",
+			Schedule: "*/10 * * * *",
+		}
+	}
+
+	cadence := computeOrderDispatchCadence(aa, 2*time.Minute, defaultMaxOrderDispatchesPerTick)
+	maxLatency := time.Duration(math.Ceil(float64(len(aa))/float64(cadence.maxDispatchesPerTick))) * cadence.interval
+	if maxLatency > 10*time.Minute {
+		t.Fatalf("67-order admission bound = %s, want <= 10m", maxLatency)
+	}
+	if cadence.interval < minOrderDispatchInterval {
+		t.Fatalf("cadence interval = %s, below hard floor %s", cadence.interval, minOrderDispatchInterval)
+	}
+	if cadence.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Fatalf("per-tick admission = %d, want configured default %d", cadence.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+}
+
+func TestOrderDispatchCadenceNeverCreatesSubFloorDedicatedLoop(t *testing.T) {
+	aa := []orders.Order{{Name: "one-second", Trigger: "cooldown", Interval: "1s"}}
+	cadence := computeOrderDispatchCadence(aa, 5*time.Second, defaultMaxOrderDispatchesPerTick)
+	if cadence.interval != minOrderDispatchInterval {
+		t.Fatalf("cadence interval = %s, want hard floor %s", cadence.interval, minOrderDispatchInterval)
+	}
+}
 
 func trackingBeads(t *testing.T, store beads.Store, label string) []beads.Bead {
 	t.Helper()
@@ -1810,6 +1842,108 @@ func TestOrderDispatchBudgetRotatesAcrossAlwaysDueOrders(t *testing.T) {
 		label := fmt.Sprintf("order-run:condition-%d", i)
 		if got := len(trackingBeads(t, store, label)); got == 0 {
 			t.Fatalf("%s did not dispatch under a rotating budget", label)
+		}
+	}
+}
+
+func TestOrderDispatchBudgetRotationSurvivesRepeatedReloads(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("cooldown-%02d", i),
+			Trigger:    "cooldown",
+			Interval:   "10m",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	newDispatcher := func() *memoryOrderDispatcher {
+		ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+			return []byte("ok\n"), nil
+		}, nil)
+		m := ad.(*memoryOrderDispatcher)
+		m.maxDispatchesPerTick = 4
+		return m
+	}
+
+	m := newDispatcher()
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	for tick := 0; tick < 17; tick++ {
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(tick)*time.Second))
+		m.drain(context.Background())
+		next := newDispatcher()
+		next.carrySchedulingStateFrom(m)
+		next.carryLastRunCacheFrom(m)
+		m = next
+	}
+
+	for i := range aa {
+		label := fmt.Sprintf("order-run:cooldown-%02d", i)
+		if got := len(trackingBeads(t, store, label)); got == 0 {
+			t.Fatalf("%s never dispatched across repeated reloads", label)
+		}
+	}
+}
+
+func TestOrderDispatchStatsSeparateDueFromAdmitted(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("due-%02d", i),
+			Trigger:    "cooldown",
+			Interval:   "10m",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 4
+	m.dispatch(context.Background(), t.TempDir(), time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC))
+	m.drain(context.Background())
+
+	stats := m.lastOrderDispatchStats()
+	if stats.DueCount != 67 {
+		t.Fatalf("due count = %d, want 67", stats.DueCount)
+	}
+	if stats.AdmittedCount != 4 {
+		t.Fatalf("admitted count = %d, want 4", stats.AdmittedCount)
+	}
+	if stats.Duration < 0 {
+		t.Fatalf("dispatch duration = %s, want non-negative", stats.Duration)
+	}
+}
+
+func TestOrderDispatchCooldownDueStateSurvivesDispatcherRestart(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("restart-%02d", i),
+			Trigger:    "cooldown",
+			Interval:   "10m",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	newDispatcher := func() *memoryOrderDispatcher {
+		m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+		m.maxDispatchesPerTick = 4
+		return m
+	}
+
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	for tick := 0; tick < 17; tick++ {
+		m := newDispatcher() // no in-memory cursor/cache transfer: restart boundary
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(tick)*time.Second))
+		m.drain(context.Background())
+	}
+
+	for i := range aa {
+		label := fmt.Sprintf("order-run:restart-%02d", i)
+		if got := len(trackingBeads(t, store, label)); got == 0 {
+			t.Fatalf("%s never dispatched after repeated dispatcher restarts", label)
 		}
 	}
 }

@@ -1540,6 +1540,113 @@ type recordingOrderDispatcher struct {
 	drainCtxErr error
 }
 
+type cadenceRecordingOrderDispatcher struct {
+	*recordingOrderDispatcher
+	cadence orderDispatchCadence
+}
+
+func (r *cadenceRecordingOrderDispatcher) orderDispatchCadence() orderDispatchCadence {
+	return r.cadence
+}
+
+type blockingSessionListProvider struct {
+	*runtime.Fake
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingSessionListProvider) ListRunning(string) ([]string, error) {
+	close(p.entered)
+	<-p.release
+	return nil, nil
+}
+
+func TestOrderCadenceLoopDispatchesIndependentlyOfSupervisorLoop(t *testing.T) {
+	ticks := make(chan time.Time)
+	dispatched := make(chan struct{}, 1)
+	provider := &blockingSessionListProvider{
+		Fake:    runtime.NewFake(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	slowPhaseDone := make(chan struct{})
+	go func() {
+		defer close(slowPhaseDone)
+		var previous map[string]bool
+		cr := &CityRuntime{
+			sp: provider,
+			poolDeathHandlers: map[string]poolDeathInfo{
+				"worker-1": {},
+			},
+		}
+		cr.reconcilePoolDeaths(&previous)
+	}()
+	<-provider.entered
+	t.Cleanup(func() {
+		close(provider.release)
+		<-slowPhaseDone
+	})
+	od := &cadenceRecordingOrderDispatcher{
+		recordingOrderDispatcher: &recordingOrderDispatcher{onDispatch: func(context.Context, string, time.Time) {
+			dispatched <- struct{}{}
+		}},
+		cadence: orderDispatchCadence{interval: time.Minute, maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick},
+	}
+	cr := &CityRuntime{
+		od:     od,
+		stderr: io.Discard,
+		orderCadenceTimer: func(time.Duration) (<-chan time.Time, func()) {
+			return ticks, func() {}
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.runOrderCadenceLoop(ctx, "/city")
+	}()
+
+	ticks <- time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	select {
+	case <-dispatched:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("order cadence did not dispatch while the supervisor loop was independently occupied")
+	}
+	select {
+	case <-slowPhaseDone:
+		t.Fatal("slow supervisor phase unexpectedly completed before order admission")
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("order cadence loop did not stop after cancellation")
+	}
+}
+
+func TestOrderDispatchTraceFieldsExposeSchedulerCountsAndAges(t *testing.T) {
+	stats := orderDispatchStats{
+		Duration:      2300 * time.Millisecond,
+		DueCount:      17,
+		AdmittedCount: 4,
+		OldestDueAge:  11 * time.Minute,
+	}
+	fields := orderDispatchTraceFields(stats)
+	want := map[string]any{
+		"due_count":            17,
+		"admitted_count":       4,
+		"oldest_due_age_ms":    int64((11 * time.Minute).Milliseconds()),
+		"dispatch_duration_ms": int64(2300),
+	}
+	for key, value := range want {
+		if fields[key] != value {
+			t.Errorf("%s = %#v, want %#v", key, fields[key], value)
+		}
+	}
+}
+
 func (r *recordingOrderDispatcher) dispatch(ctx context.Context, cityRoot string, now time.Time) {
 	r.calls.Add(1)
 	r.called.Store(true)
