@@ -226,7 +226,7 @@ func (f *claimBackstopFixture) sessionMeta(t *testing.T, key string) string {
 }
 
 func (f *claimBackstopFixture) nudgeCount() int {
-	return strings.Count(f.stdout.String(), "seat-claim-nudge: nudged")
+	return strings.Count(f.stdout.String(), "seat-claim-nudge: delivered")
 }
 
 // rotations counts the probe-window rotations the lane reported on stdout. Each

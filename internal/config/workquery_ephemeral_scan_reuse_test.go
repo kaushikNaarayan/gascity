@@ -9,20 +9,19 @@ import (
 	"testing"
 )
 
-// Regression coverage for #5712.
+// Regression coverage for #5712 and gcf-uvx9.
 //
-// The two ephemeral probes emitted inside the `for id in "$GC_SESSION_ID"
-// "$GC_SESSION_NAME" "$GC_ALIAS"` identity loops each read a full-store
-// `bd query --limit=0` scan whose predicate does not mention the loop variable
-// — the identity filter is applied by jq AFTER the array comes back. The
-// generated text spells the scan once, so no golden pins the cost; the `for`
-// loop is what multiplies it, and only EXECUTING the script shows that. On the
-// store in the report each scan cost 8-12s, so three identities spent ~40s of
-// `gc hook`'s 60s work-query budget re-fetching an identical array.
+// The original probes read a full-store `bd query --limit=0` snapshot once per
+// status and filtered that array by identity in jq. gcf-uvx9 deliberately
+// replaced those unbounded scans with one server-side assignee-scoped,
+// five-row query per candidate identity. Executing the generated script is the
+// only reliable way to pin that cost: three ordinary identities mean three
+// bounded reads per status, while the legacy-control compatibility aliases
+// can mean six.
 //
-// These tests therefore run the generated shell against a fake `bd` that logs
-// every `bd query` it receives, and pin the execution count rather than the
-// spelling.
+// These tests run the generated shell against a fake `bd` and pin the bounded
+// per-identity execution count rather than accidentally restoring the old
+// unbounded shared snapshot.
 
 // fakeBdLoggingQueries returns a fake `bd` that appends each `query`
 // invocation's arguments to $GC_TEST_QUERY_LOG and serves rows verbatim.
@@ -81,28 +80,26 @@ var threeIdentities = map[string]string{
 	"GC_ALIAS":        "act/claude-1",
 }
 
-// TestEphemeralScanRunsOncePerStatusNotPerIdentity is the #5712 regression: the
-// identity-independent scan must be read once per status for the whole query,
-// not once per identity. Reverting the memo in ephemeralStatusSnapshotShell
-// fails this with inProgress=3, open=3.
-func TestEphemeralScanRunsOncePerStatusNotPerIdentity(t *testing.T) {
+// TestEphemeralScanRunsOncePerIdentity pins the bounded gcf-uvx9 shape: every
+// candidate identity gets exactly one assignee-scoped read per status.
+func TestEphemeralScanRunsOncePerIdentity(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; the work-query shell requires it")
 	}
 	script := standardAssignedWorkQueryScript(QueryTopology{}) + `printf "[]"`
 	inProgress, open, _ := scanCounts(t, script, fakeBdLoggingQueries("[]", "[]"), threeIdentities)
 
-	if inProgress != 1 {
-		t.Errorf("ephemeral in_progress scan ran %d times across three identities, want 1", inProgress)
+	if inProgress != 3 {
+		t.Errorf("ephemeral in_progress scan ran %d times across three identities, want 3", inProgress)
 	}
-	if open != 1 {
-		t.Errorf("ephemeral open scan ran %d times across three identities, want 1", open)
+	if open != 3 {
+		t.Errorf("ephemeral open scan ran %d times across three identities, want 3", open)
 	}
 }
 
-// TestLegacyControlEphemeralScanRunsOncePerStatus covers the nested
-// control-dispatcher loops, where the same scan was executed up to six times.
-func TestLegacyControlEphemeralScanRunsOncePerStatus(t *testing.T) {
+// TestLegacyControlEphemeralScanRunsOncePerCandidate covers the nested
+// control-dispatcher loops and their compatibility aliases.
+func TestLegacyControlEphemeralScanRunsOncePerCandidate(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; the work-query shell requires it")
 	}
@@ -114,20 +111,18 @@ func TestLegacyControlEphemeralScanRunsOncePerStatus(t *testing.T) {
 	}
 	inProgress, open, _ := scanCounts(t, script, fakeBdLoggingQueries("[]", "[]"), env)
 
-	if inProgress != 1 {
-		t.Errorf("legacy-control in_progress scan ran %d times, want 1", inProgress)
+	if inProgress != 6 {
+		t.Errorf("legacy-control in_progress scan ran %d times, want 6", inProgress)
 	}
-	if open != 1 {
-		t.Errorf("legacy-control open scan ran %d times, want 1", open)
+	if open != 6 {
+		t.Errorf("legacy-control open scan ran %d times, want 6", open)
 	}
 }
 
-// TestEphemeralSnapshotStillMatchesLaterIdentities is the semantics half: the
-// snapshot is taken while the FIRST identity is in scope, so a bead assigned to
-// the third identity must still be found by filtering that shared array. A memo
-// that captured the first identity's filtered result instead of the raw scan
-// would pass the count tests above and strand this bead.
-func TestEphemeralSnapshotStillMatchesLaterIdentities(t *testing.T) {
+// TestEphemeralScopedQueriesStillMatchLaterIdentities is the semantics half: a
+// bead assigned to the third identity must still be found after the first two
+// assignee-scoped queries return empty.
+func TestEphemeralScopedQueriesStillMatchLaterIdentities(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; the work-query shell requires it")
 	}
