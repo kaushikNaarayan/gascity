@@ -2604,6 +2604,42 @@ func TestReleaseOrphanedPoolAssignments_SkipsLiveModernPoolSessionWhenLiveListMi
 	}
 }
 
+func TestReleaseOrphanedPoolAssignments_PreservesUnmatchedNonEmptyHolderAcrossSweeps(t *testing.T) {
+	// A Linux-local snapshot has no authority to declare a non-empty holder on
+	// another host dead. Repeating that absence must remain fail-closed: status,
+	// assignee, and history stay untouched until a positive dead-session path
+	// releases the work.
+	store := beads.NewMemStore()
+	work, err := store.Create(beads.Bead{
+		Title:    "remote-held pool work",
+		Assignee: "mac-worker-remote-holder",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	for sweep := 1; sweep <= 2; sweep++ {
+		work, err = store.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get work before sweep %d: %v", sweep, err)
+		}
+		released := releaseOrphanedPoolAssignments(store, testPoolReleaseConfig(), "", nil, []beads.Bead{work}, []beads.Store{store}, nil, nil)
+		if len(released) != 0 {
+			t.Fatalf("sweep %d released = %v, want none", sweep, released)
+		}
+		got, err := store.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get work after sweep %d: %v", sweep, err)
+		}
+		if got.Status != "in_progress" || got.Assignee != "mac-worker-remote-holder" {
+			t.Fatalf("sweep %d work = status %q assignee %q, want in_progress/mac-worker-remote-holder", sweep, got.Status, got.Assignee)
+		}
+	}
+}
+
 func TestDirectSessionBeadIDCandidates_SkipsFlagLikeCandidates(t *testing.T) {
 	// agent.SessionNameFor encodes "/" as "--" for qualified identities, so a
 	// named-session assignee can carry a "--" pair. The suffix starting at the
