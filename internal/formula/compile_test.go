@@ -1062,6 +1062,23 @@ func TestCompileScopedWorkCarriesScopeAndCleanupMetadata(t *testing.T) {
 	if got := cleanup.Metadata["gc.original_kind"]; got != "cleanup" {
 		t.Fatalf("cleanup gc.original_kind = %q, want cleanup", got)
 	}
+	for _, stepID := range []string{
+		"mol-scoped-work.load-context.attempt.1",
+		"mol-scoped-work.workspace-setup.attempt.1",
+		"mol-scoped-work.preflight-tests.attempt.1",
+		"mol-scoped-work.implement.attempt.1",
+		"mol-scoped-work.self-review.attempt.1",
+		"mol-scoped-work.submit.attempt.1",
+		"mol-scoped-work.cleanup-worktree.attempt.1",
+	} {
+		step := recipe.StepByID(stepID)
+		if step == nil {
+			t.Fatalf("retry attempt %q missing", stepID)
+		}
+		if !strings.Contains(step.Description, "gc bd update \"$GC_BEAD_ID\"") || !strings.Contains(step.Description, "gc.outcome=pass") || !strings.Contains(step.Description, "gc.outcome=fail") || !strings.Contains(step.Description, "gc.failure_class") || !strings.Contains(step.Description, "gc.work_outcome") {
+			t.Errorf("%s lacks retry close contract: %q", stepID, step.Description)
+		}
+	}
 	scopeCheck := recipe.StepByID("mol-scoped-work.implement-scope-check")
 	if scopeCheck == nil {
 		t.Fatal("implement scope-check step missing")
