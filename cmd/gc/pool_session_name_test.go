@@ -555,13 +555,13 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeDeadPreservesGuardWhenRelea
 	}
 }
 
-func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t *testing.T) {
+func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsNeverRelease(t *testing.T) {
 	resetDetachedProbeErrorCountsForTest()
 	store := beads.NewMemStore()
 	work := createDetachedOrphanedPoolWork(t, store)
 	installFakeTmux(t, "exit 2")
 
-	for tick := 1; tick <= 2; tick++ {
+	for tick := 1; tick <= detachedProbeErrorThreshold+1; tick++ {
 		released := releaseOrphanedPoolAssignmentsFromBeads(
 			store,
 			testPoolReleaseConfig(),
@@ -573,7 +573,7 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t 
 			nil,
 		)
 		if len(released) != 0 {
-			t.Fatalf("tick %d released = %v, want none before third error", tick, released)
+			t.Fatalf("tick %d released = %v, want none for a probe error", tick, released)
 		}
 		got, err := store.Get(work.ID)
 		if err != nil {
@@ -587,31 +587,31 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t 
 		}
 	}
 
-	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store,
-		testPoolReleaseConfig(),
-		"",
-		nil,
-		[]beads.Bead{work},
-		nil,
-		nil,
-		nil,
-	)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("third tick released = %v, want [%s]", released, work.ID)
-	}
 	got, err := store.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Get work bead: %v", err)
 	}
-	if got.Status != "open" {
-		t.Fatalf("status = %q, want open", got.Status)
+	if got.Status != "in_progress" || got.Assignee != "worker-dead" {
+		t.Fatalf("work = status %q assignee %q, want in_progress/worker-dead", got.Status, got.Assignee)
 	}
-	if got.Metadata[detachedProbeMetadataKey] != "" {
-		t.Fatalf("gc.detached = %q, want cleared", got.Metadata[detachedProbeMetadataKey])
+	if got.Metadata[detachedProbeMetadataKey] != testDetachedPoolProbeSpec {
+		t.Fatalf("gc.detached = %q, want preserved", got.Metadata[detachedProbeMetadataKey])
 	}
-	if _, ok := got.Metadata["error_count"]; ok {
-		t.Fatalf("persisted error_count metadata after release: %+v", got.Metadata)
+}
+
+func TestDetachedProbeResultAllowsOrphanRelease_FailsClosedUnlessDead(t *testing.T) {
+	work := beads.Bead{ID: "work-1"}
+	for _, status := range []detachedProbeStatus{detachedProbeError, detachedProbeTimeout, detachedProbeStatus("unknown")} {
+		for sweep := 1; sweep <= 2; sweep++ {
+			allows, clear := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: status, Err: errors.New("probe unavailable")})
+			if allows || clear {
+				t.Fatalf("status %q sweep %d = allows %t clear %t, want fail-closed", status, sweep, allows, clear)
+			}
+		}
+	}
+	allows, clear := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: detachedProbeDead})
+	if !allows || !clear {
+		t.Fatalf("dead probe = allows %t clear %t, want release and clear", allows, clear)
 	}
 }
 
@@ -2613,7 +2613,7 @@ func TestReleaseOrphanedPoolAssignments_PreservesUnmatchedNonEmptyHolderAcrossSw
 	work, err := store.Create(beads.Bead{
 		Title:    "remote-held pool work",
 		Assignee: "mac-worker-remote-holder",
-		Metadata: map[string]string{"gc.routed_to": "worker"},
+		Metadata: map[string]string{"gc.routed_to": "worker", "history_marker": "unchanged"},
 	})
 	if err != nil {
 		t.Fatalf("Create work bead: %v", err)
@@ -2621,6 +2621,11 @@ func TestReleaseOrphanedPoolAssignments_PreservesUnmatchedNonEmptyHolderAcrossSw
 	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
 		t.Fatalf("Set work status: %v", err)
 	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work: %v", err)
+	}
+	before := work
 	for sweep := 1; sweep <= 2; sweep++ {
 		work, err = store.Get(work.ID)
 		if err != nil {
@@ -2636,6 +2641,9 @@ func TestReleaseOrphanedPoolAssignments_PreservesUnmatchedNonEmptyHolderAcrossSw
 		}
 		if got.Status != "in_progress" || got.Assignee != "mac-worker-remote-holder" {
 			t.Fatalf("sweep %d work = status %q assignee %q, want in_progress/mac-worker-remote-holder", sweep, got.Status, got.Assignee)
+		}
+		if got.Metadata["history_marker"] != before.Metadata["history_marker"] {
+			t.Fatalf("sweep %d history marker = %q, want %q", sweep, got.Metadata["history_marker"], before.Metadata["history_marker"])
 		}
 	}
 }
