@@ -28,8 +28,8 @@ func retryAttemptDescription(description string) string {
 		`gc bd update "$GC_BEAD_ID"`,
 		"gc.outcome=pass",
 		"gc.outcome=fail",
-		"gc.failure_class",
-		"gc.failure_reason",
+		beadmeta.FailureClassMetadataKey,
+		beadmeta.FailureReasonMetadataKey,
 		"--status=closed",
 	} {
 		if !strings.Contains(description, required) {
