@@ -241,6 +241,27 @@ func TestGateSlotsDir(t *testing.T) {
 	}
 }
 
+func TestSessionDiagnosticsDirMatchesRuntimeDirForm(t *testing.T) {
+	city := t.TempDir()
+	fromCity := SessionDiagnosticsDir(city)
+	fromRuntimeDir := SessionDiagnosticsDirForRuntimeDir(RuntimePath(city))
+	if fromCity != fromRuntimeDir {
+		t.Fatalf("session diagnostics dir disagrees by input form: city=%s runtime=%s", fromCity, fromRuntimeDir)
+	}
+	if want := filepath.Join(city, ".gc", "sessions"); fromCity != want {
+		t.Fatalf("session diagnostics dir = %s, want %s", fromCity, want)
+	}
+	if fromCity == filepath.Join(RuntimeDataDir(city), "sessions") {
+		t.Fatal("session diagnostics dir resolved under .gc/runtime")
+	}
+}
+
+func TestSessionDiagnosticsDirForRuntimeDirDisabled(t *testing.T) {
+	if got := SessionDiagnosticsDirForRuntimeDir(""); got != "" {
+		t.Fatalf("SessionDiagnosticsDirForRuntimeDir(\"\") = %q, want empty", got)
+	}
+}
+
 func TestPublicServiceMountPath(t *testing.T) {
 	tests := []struct {
 		name        string

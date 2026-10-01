@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -13,6 +14,16 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
+
+type listFailingNudgeDispatchStore struct {
+	beads.Store
+	listCalls int
+}
+
+func (s *listFailingNudgeDispatchStore) List(beads.ListQuery) ([]beads.Bead, error) {
+	s.listCalls++
+	return nil, errors.New("full session list must not run for exact fence")
+}
 
 // supervisorCfg returns a minimal *config.City wired for supervisor-mode
 // nudge dispatching. Tests use it to drive nudgeDispatcherIsSupervisor.
@@ -228,6 +239,98 @@ func TestDispatchAllQueuedNudgesDeliversAndAcks(t *testing.T) {
 	}
 	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
 		t.Fatalf("queue not drained: pending=%d inFlight=%d dead=%d", len(pending), len(inFlight), len(dead))
+	}
+}
+
+func TestNudgeDispatchSessionSnapshotExactFenceAvoidsFullList(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := &listFailingNudgeDispatchStore{Store: beads.NewMemStore()}
+	info, err := store.Create(beads.Bead{
+		Title:  "Worker",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession, "agent:worker"},
+		Metadata: map[string]string{
+			"agent_name":         "worker",
+			"continuation_epoch": "1",
+			"session_name":       "worker-session",
+			"state":              "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	if err := nudgequeue.WithState(dir, func(state *nudgequeue.State) error {
+		state.Pending = append(state.Pending, newQueuedNudgeWithOptions("worker", "Worker", "exact", time.Now().Add(-time.Second), queuedNudgeOptions{SessionID: info.ID, ContinuationEpoch: "1"}))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "worker-session", runtime.Config{}); err != nil {
+		t.Fatalf("start fake session: %v", err)
+	}
+	fake.Activity = map[string]time.Time{"worker-session": time.Now().Add(-time.Minute)}
+	cr := &CityRuntime{cityPath: dir, standaloneCityStore: store, cfg: &config.City{Daemon: config.DaemonConfig{NudgeDispatcher: "supervisor"}, Agents: []config.Agent{{Name: "worker", Provider: "codex"}}}, sp: fake}
+	old := nudgeDispatchFullSnapshot
+	t.Cleanup(func() { nudgeDispatchFullSnapshot = old })
+	nudgeDispatchFullSnapshot = func(*CityRuntime) *sessionBeadSnapshot {
+		t.Fatal("full session list touched for exact fence")
+		return nil
+	}
+	snapshot := cr.nudgeDispatchSessionSnapshot()
+	if store.listCalls != 0 {
+		t.Fatalf("full session list calls = %d, want 0 for exact fence", store.listCalls)
+	}
+	if snapshot == nil || len(snapshot.OpenInfos()) != 1 || snapshot.OpenInfos()[0].ID != info.ID {
+		t.Fatalf("exact snapshot = %#v, want %s", snapshot, info.ID)
+	}
+	cr.nudgeDispatchTick(context.Background())
+	if store.listCalls != 0 {
+		t.Fatalf("full session list calls after tick = %d, want 0", store.listCalls)
+	}
+	calls := 0
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" && strings.Contains(call.Message, "exact") {
+			calls++
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("exact fence nudge calls = %d, want 1", calls)
+	}
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil || len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("queue after tick = %d/%d/%d err=%v", len(pending), len(inFlight), len(dead), err)
+	}
+}
+
+func TestNudgeDispatchSessionSnapshotAliasFallsBackToFullList(t *testing.T) {
+	clearGCEnv(t)
+	dir := t.TempDir()
+	if err := nudgequeue.WithState(dir, func(state *nudgequeue.State) error {
+		state.Pending = append(state.Pending, newQueuedNudge("worker", "alias", time.Now().Add(-time.Second)))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	old := nudgeDispatchFullSnapshot
+	t.Cleanup(func() { nudgeDispatchFullSnapshot = old })
+	fullListCalls := 0
+	nudgeDispatchFullSnapshot = func(*CityRuntime) *sessionBeadSnapshot {
+		fullListCalls++
+		return newSessionBeadSnapshotFromInfos(nil)
+	}
+
+	cr := &CityRuntime{cityPath: dir, standaloneCityStore: beads.NewMemStore()}
+	if snapshot := cr.nudgeDispatchSessionSnapshot(); snapshot == nil {
+		t.Fatal("snapshot = nil, want alias fallback snapshot")
+	}
+	if fullListCalls != 1 {
+		t.Fatalf("full snapshot calls = %d, want 1 for alias-only queue item", fullListCalls)
 	}
 }
 

@@ -1400,6 +1400,62 @@ func (cr *CityRuntime) tick(
 	tickCompleted = true
 }
 
+var nudgeDispatchFullSnapshot = func(cr *CityRuntime) *sessionBeadSnapshot {
+	return cr.loadSessionBeadSnapshot()
+}
+
+// nudgeDispatchSessionSnapshot avoids the reconcile-wide session list on the
+// wake path when every due queue item is fenced to one concrete session ID.
+// An alias-only item deliberately falls back to the authoritative full
+// snapshot: aliases are mutable and cannot be resolved safely from a queue
+// record alone.
+func (cr *CityRuntime) nudgeDispatchSessionSnapshot() *sessionBeadSnapshot {
+	state, err := nudgequeue.LoadState(cr.cityPath)
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	ids := make(map[string]bool)
+	collect := func(item nudgequeue.Item) bool {
+		if !item.DeliverAfter.IsZero() && item.DeliverAfter.After(now) {
+			return true
+		}
+		if strings.TrimSpace(item.SessionID) == "" || strings.TrimSpace(item.ContinuationEpoch) == "" {
+			return false
+		}
+		ids[item.SessionID] = true
+		return true
+	}
+	for _, item := range state.Pending {
+		if !collect(item) {
+			return nudgeDispatchFullSnapshot(cr)
+		}
+	}
+	// An expired claim is retried by dispatchAllQueuedNudges in the same tick,
+	// so it needs the same exact-ID lookup as a due pending item.
+	for _, item := range state.InFlight {
+		if item.LeaseUntil.IsZero() || !item.LeaseUntil.Before(now) {
+			continue
+		}
+		if !collect(item) {
+			return nudgeDispatchFullSnapshot(cr)
+		}
+	}
+	if len(ids) == 0 {
+		return newSessionBeadSnapshotFromInfos(nil)
+	}
+	front := sessionFrontDoor(cr.sessionsBeadStore().Store)
+	infos := make([]sessionpkg.Info, 0, len(ids))
+	for id := range ids {
+		info, getErr := front.Get(id)
+		if getErr != nil {
+			return nudgeDispatchFullSnapshot(cr)
+		}
+		infos = append(infos, info)
+	}
+	return newSessionBeadSnapshotFromInfos(infos)
+}
+
 func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	if ctx.Err() != nil {
 		return
@@ -3141,7 +3197,7 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 	if store.Store == nil {
 		return
 	}
-	sessionBeads := cr.loadSessionBeadSnapshot()
+	sessionBeads := cr.nudgeDispatchSessionSnapshot()
 	if sessionBeads == nil {
 		return
 	}

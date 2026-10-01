@@ -5,6 +5,8 @@ package tmux
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,7 +98,8 @@ func TestNudgePokeRealTmux(t *testing.T) {
 	})
 
 	t.Run("non-claude fallback success path records a poke", func(t *testing.T) {
-		tm := NewTmuxWithConfig(Config{SocketName: "gcdogfoodnudgeb", NudgeReadyTimeout: 10 * time.Second, NudgeLockTimeout: 10 * time.Second})
+		runtimeDir := t.TempDir()
+		tm := NewTmuxWithConfig(Config{SocketName: "gcdogfoodnudgeb", NudgeReadyTimeout: 10 * time.Second, NudgeLockTimeout: 10 * time.Second, RuntimeDir: runtimeDir})
 		const sess = "dogfood-plain"
 		_, _ = tm.run("kill-server")
 		t.Cleanup(func() { _, _ = tm.run("kill-server") })
@@ -110,6 +113,10 @@ func TestNudgePokeRealTmux(t *testing.T) {
 		// (the "forgot the second return" footgun the bead calls out).
 		if err := tm.NudgeSession(sess, "# gc-nudge-plain"); err != nil {
 			t.Fatalf("NudgeSession: %v", err)
+		}
+		artifact := filepath.Join(runtimeDir, "sessions", sess, "nudge-unconfirmed.log")
+		if data, err := os.ReadFile(artifact); err != nil || !strings.Contains(string(data), "# gc-nudge-plain") {
+			t.Fatalf("fallback delivery did not leave its non-retryable artifact: data=%q err=%v", data, err)
 		}
 
 		tm.pokeMu.Lock()

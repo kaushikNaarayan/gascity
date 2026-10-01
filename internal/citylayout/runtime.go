@@ -81,6 +81,23 @@ func PublishedServicesDir(cityRoot string) string {
 	return RuntimePath(cityRoot, "services", ".published")
 }
 
+// SessionDiagnosticsRoot holds private per-session runtime diagnostics.
+const SessionDiagnosticsRoot = "sessions"
+
+// SessionDiagnosticsDir returns the canonical diagnostics directory for cityRoot.
+func SessionDiagnosticsDir(cityRoot string) string {
+	return RuntimePath(cityRoot, SessionDiagnosticsRoot)
+}
+
+// SessionDiagnosticsDirForRuntimeDir is the equivalent for a configured runtime
+// root. An empty root disables diagnostics rather than writing relative paths.
+func SessionDiagnosticsDirForRuntimeDir(runtimeDir string) string {
+	if runtimeDir == "" {
+		return ""
+	}
+	return filepath.Join(runtimeDir, SessionDiagnosticsRoot)
+}
+
 // SessionNameLocksDir returns the canonical root for explicit session-name locks.
 func SessionNameLocksDir(cityRoot string) string {
 	return RuntimePath(cityRoot, "session-name-locks")
