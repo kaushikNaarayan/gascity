@@ -849,21 +849,30 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		Delivery: delivery,
 		Source:   "session",
 	})
+	deliveredUnobserved := false
 	if err != nil {
-		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
-			if mode == nudgeDeliveryWaitIdle {
-				return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, stdout, stderr)
+		if errors.Is(err, sessiontmux.ErrNudgeSubmitDeliveredUnobserved) {
+			result.Delivered = true
+			deliveredUnobserved = true
+		} else {
+			if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
+				if mode == nudgeDeliveryWaitIdle {
+					return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, stdout, stderr)
+				}
+				if mode == nudgeDeliveryImmediate {
+					fmt.Fprintf(stderr, "gc session nudge: live ACP delivery failed for %s because this process does not own the ACP connection; retry with --delivery=wait-idle or --delivery=queue so the queued dispatcher can deliver it\n", target.agentKey()) //nolint:errcheck
+					return 1
+				}
 			}
-			if mode == nudgeDeliveryImmediate {
-				fmt.Fprintf(stderr, "gc session nudge: live ACP delivery failed for %s because this process does not own the ACP connection; retry with --delivery=wait-idle or --delivery=queue so the queued dispatcher can deliver it\n", target.agentKey()) //nolint:errcheck
-				return 1
-			}
+			fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
+			return 1
 		}
-		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
-		return 1
 	}
 	if mode == nudgeDeliveryWaitIdle && !result.Delivered {
 		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, stdout, stderr)
+	}
+	if deliveredUnobserved && store != nil {
+		stampLastNudgeDeliveredAt(sessionFrontDoor(sessStore), target.sessionID, time.Now())
 	}
 	if jsonOutput {
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc session nudge", sessionNudgeJSON{
@@ -978,6 +987,29 @@ func requestManagedNudgeWake(target nudgeTarget, sessFront *session.Store) error
 }
 
 func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.Provider) (worker.Handle, error) {
+	if store != nil && target.sessionID != "" {
+		obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
+		if err != nil {
+			return nil, err
+		}
+		matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
+		if err != nil || !matches {
+			if err != nil {
+				return nil, err
+			}
+			return nil, runtime.ErrSessionNotFound
+		}
+		if obs.Running {
+			runtimeName := strings.TrimSpace(target.sessionName)
+			if runtimeName == "" {
+				runtimeName = strings.TrimSpace(obs.SessionName)
+			}
+			if runtimeName != "" {
+				return runtimeWorkerHandleWithConfig(target.cityPath, store, sp, target.cfg, runtimeName, strings.TrimSpace(target.providerName()), strings.TrimSpace(target.sessionTransport()), nil)
+			}
+		}
+		return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
+	}
 	if target.sessionName != "" {
 		if target.sessionID != "" || target.continuationEpoch != "" {
 			obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
@@ -1014,9 +1046,6 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 			return nil, err
 		}
 	}
-	if target.sessionID != "" {
-		return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
-	}
 	return runtimeWorkerHandleWithConfig(
 		target.cityPath,
 		store,
@@ -1030,6 +1059,23 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 }
 
 func workerObserveNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.Provider) (worker.LiveObservation, error) {
+	if store != nil && target.sessionID != "" {
+		obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
+		if err != nil {
+			return worker.LiveObservation{}, err
+		}
+		matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
+		if err != nil {
+			return worker.LiveObservation{}, err
+		}
+		if !matches {
+			obs.Running = false
+			obs.Alive = false
+			obs.Attached = false
+			obs.LastActivity = nil
+		}
+		return obs, nil
+	}
 	if target.sessionName != "" {
 		obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
 		if err != nil {
@@ -1046,9 +1092,6 @@ func workerObserveNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.
 			obs.LastActivity = nil
 		}
 		return obs, nil
-	}
-	if target.sessionID != "" {
-		return workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
 	}
 	return workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
 }
@@ -1160,7 +1203,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 				Source:   "mail",
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
-			if nudgeErr == nil && result.Delivered {
+			if (nudgeErr == nil && result.Delivered) || errors.Is(nudgeErr, sessiontmux.ErrNudgeSubmitDeliveredUnobserved) {
 				telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 				var sessFront *session.Store
 				if store != nil {
@@ -1442,6 +1485,12 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 				return false, errors.Join(bookkeepErr, recErr)
 			}
 			return false, bookkeepErr
+		}
+		if errors.Is(err, sessiontmux.ErrNudgeSubmitDeliveredUnobserved) {
+			// The pane consumed the submit.  Only busy-state observation missed,
+			// so acknowledge rather than retrying and re-pasting this batch.
+			stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+			return true, errors.Join(bookkeepErr, ackQueuedNudgesWithOutcome(target.cityPath, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return"))
 		}
 		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, beads.NudgesStore{Store: deliveryStore}, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
 			return false, errors.Join(bookkeepErr, recErr)

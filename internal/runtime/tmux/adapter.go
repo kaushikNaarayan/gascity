@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/execgrace"
 	"github.com/gastownhall/gascity/internal/overlay"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -86,7 +87,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		return err
 	}
 
-	err = doStartSession(ctx, &tmuxStartOps{tm: p.tm, runtimeDir: p.cfg.RuntimeDir, setupMaxTimeout: p.cfg.SetupMaxTimeout}, name, cfg, p.cfg.SetupTimeout)
+	err = doStartSession(ctx, p.startOps(), name, cfg, p.cfg.SetupTimeout)
 	if err == nil {
 		p.cache.Invalidate()
 		return nil
@@ -221,7 +222,7 @@ func (p *Provider) cleanupFailedStart(name string, cfg runtime.Config) {
 // RunLive re-applies session_live commands to a running session.
 // Called by the reconciler when only session_live config has changed.
 func (p *Provider) RunLive(name string, cfg runtime.Config) error {
-	runSessionLive(context.Background(), &tmuxStartOps{tm: p.tm, setupMaxTimeout: p.cfg.SetupMaxTimeout}, name, cfg, os.Stderr, p.cfg.SetupTimeout)
+	runSessionLive(context.Background(), p.startOps(), name, cfg, os.Stderr, p.cfg.SetupTimeout)
 	return nil
 }
 
@@ -235,7 +236,7 @@ func (p *Provider) RunLive(name string, cfg runtime.Config) error {
 // re-stage files (those are provision-half and unchanged on a launch-only change),
 // and on failure it leaves the warm box in place rather than tearing it down.
 func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
-	if err := doRelaunchSession(ctx, &tmuxStartOps{tm: p.tm, setupMaxTimeout: p.cfg.SetupMaxTimeout}, name, cfg, p.cfg.SetupTimeout); err != nil {
+	if err := doRelaunchSession(ctx, p.startOps(), name, cfg, p.cfg.SetupTimeout); err != nil {
 		return err
 	}
 	p.cache.Invalidate()
@@ -838,7 +839,9 @@ type startOps interface {
 	hasSession(name string) (bool, error)
 	capturePane(name string, lines int) (string, error)
 	recordStartCrash(name, paneContent string) string
+	recordUnconfirmedNudge(name, message string, cause error) string
 	sendKeys(name, text string) error
+	paneBusy(name string) (bool, error)
 	setRemainOnExit(name string) error
 	disableMouseAndActivity(name string) error
 	runSetupCommand(ctx context.Context, cmd string, env map[string]string, timeout time.Duration) error
@@ -855,6 +858,10 @@ type tmuxStartOps struct {
 	// runSetupCommand replaces its fixed wall-clock deadline with
 	// "no output for `timeout`" (idle) plus this absolute ceiling.
 	setupMaxTimeout time.Duration
+}
+
+func (p *Provider) startOps() *tmuxStartOps {
+	return &tmuxStartOps{tm: p.tm, runtimeDir: p.cfg.RuntimeDir, setupMaxTimeout: p.cfg.SetupMaxTimeout}
 }
 
 const (
@@ -956,19 +963,38 @@ func (o *tmuxStartOps) recordStartCrash(name, paneContent string) string {
 		b.WriteByte('\n')
 	}
 
-	dir := filepath.Join(o.runtimeDir, "sessions", name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := writeSessionDiagnosticFile(o.runtimeDir, name, "start-stderr.log", b.String()); err != nil {
+		warnSessionDiagnosticWrite(name, "start-stderr.log", err)
 		return ""
 	}
-	path := filepath.Join(dir, "start-stderr.log")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return ""
-	}
-	return path
+	return filepath.Join(citylayout.SessionDiagnosticsDirForRuntimeDir(o.runtimeDir), name, "start-stderr.log")
 }
 
 func (o *tmuxStartOps) sendKeys(name, text string) error {
 	return o.tm.NudgeSession(name, text)
+}
+
+func (o *tmuxStartOps) recordUnconfirmedNudge(name, message string, cause error) string {
+	if o.runtimeDir == "" {
+		return ""
+	}
+	content := fmt.Sprintf("session: %s\ncause: %v\n--- startup nudge text ---\n%s\n", name, cause, message)
+	if err := writeSessionDiagnosticFile(o.runtimeDir, name, "startup-nudge-unconfirmed.log", content); err != nil {
+		warnSessionDiagnosticWrite(name, "startup-nudge-unconfirmed.log", err)
+		return ""
+	}
+	return filepath.Join(citylayout.SessionDiagnosticsDirForRuntimeDir(o.runtimeDir), name, "startup-nudge-unconfirmed.log")
+}
+
+// paneBusy reports whether the target agent pane is showing a busy or
+// processing indicator. Startup-nudge retry uses this after its backoff to
+// avoid submitting a duplicate nudge once the first submission has landed.
+func (o *tmuxStartOps) paneBusy(name string) (bool, error) {
+	target := name
+	if agentPane, err := o.tm.FindAgentPane(name); err == nil && agentPane != "" {
+		target = agentPane
+	}
+	return o.tm.paneBusy(target)
 }
 
 func (o *tmuxStartOps) setRemainOnExit(name string) error {
@@ -1359,15 +1385,25 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 		return err
 	}
 	if cfg.Nudge != "" {
-		if err := ops.sendKeys(name, cfg.Nudge); err != nil {
+		if err := sendStartupNudgeWithRetry(ctx,
+			func() error { return ops.sendKeys(name, cfg.Nudge) },
+			func(d time.Duration) { _ = sleepWithContext(ctx, d) },
+			func() (bool, error) { return ops.paneBusy(name) }); err != nil {
 			// The startup nudge has no retry-capable caller: the keystrokes
 			// reached tmux and the session is verified alive above, so an
-			// unconfirmed submit is a warning, not a start failure. Any other
-			// error still fails the start.
-			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			// unconfirmed submit is a warning after the bounded retry ladder.
+			// A delivered-but-unobserved result is also warning-only, but the
+			// helper never retries it because delivery is already known. Any
+			// other error still fails the start.
+			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) && !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) {
 				return fmt.Errorf("sending startup nudge: %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed: %v\n", name, err)
+			if errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not observed: %v\n", name, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
+				ops.recordUnconfirmedNudge(name, cfg.Nudge, err)
+			}
 		}
 	}
 
@@ -1378,6 +1414,57 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 	runSessionLive(ctx, ops, name, cfg, os.Stderr, setupTimeout)
 
 	return nil
+}
+
+// startupNudgeRetryBackoffs are the delays between resend attempts when a
+// startup nudge is submitted but its delivery is not confirmed. It is a var so
+// focused tests can shrink the ladder.
+var startupNudgeRetryBackoffs = []time.Duration{2 * time.Second, 4 * time.Second, 6 * time.Second, 8 * time.Second}
+
+// startupNudgeRetryBudgetFraction limits retries to half of the startup
+// context's remaining deadline, preserving time for the rest of startup.
+const startupNudgeRetryBudgetFraction = 0.5
+
+// startupNudgeNow is fakeable so deadline-budget tests need not sleep.
+var startupNudgeNow = time.Now
+
+// sendStartupNudgeWithRetry retries only an unconfirmed submission. A
+// delivered-but-unobserved submission is returned immediately: retrying it
+// would paste a nudge that is already known to have arrived.
+func sendStartupNudgeWithRetry(ctx context.Context, send func() error, sleep func(time.Duration), busy func() (bool, error)) error {
+	start := startupNudgeNow()
+	budget := time.Duration(-1)
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := deadline.Sub(start); remaining > 0 {
+			budget = time.Duration(float64(remaining) * startupNudgeRetryBudgetFraction)
+		} else {
+			budget = 0
+		}
+	}
+
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = send()
+		if err == nil || !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			return err
+		}
+		if attempt >= len(startupNudgeRetryBackoffs) || ctx.Err() != nil {
+			return err
+		}
+		next := startupNudgeRetryBackoffs[attempt]
+		if budget >= 0 && startupNudgeNow().Sub(start)+next > budget {
+			return err
+		}
+		sleep(next)
+		if ctx.Err() != nil {
+			return err
+		}
+		if busy != nil {
+			if isBusy, _ := busy(); isBusy {
+				return nil
+			}
+		}
+	}
 }
 
 // runSessionSetup runs session_setup commands then session_setup_script.

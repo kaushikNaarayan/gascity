@@ -17,8 +17,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
@@ -64,12 +66,10 @@ var defaultNudgeSubmitKeySequence = []string{"Enter"}
 // #4706 was filed against a k8s codex agent whose first turn never started:
 // codex's TUI buffers a send-keys burst as a paste, so a lone trailing Enter
 // is swallowed as a composer newline rather than treated as submit — codex's
-// actual submit sequence is Escape then Enter. This fork's tmux carrier does
-// not yet carry that fix; adding it here is left to a follow-up once the
-// change is exercised against a live codex TUI in this repo's own test
-// harness (it is out of scope for this claude-focused patch, but the table
-// exists precisely so that follow-up is a one-line addition, not another
-// pass through the delivery mechanics).
+// actual submit sequence is Escape then Enter, which is the Codex entry below.
+// Codex remains in providersSkippingEscapeBeforeEnter so this sequence supplies
+// the only Escape; sending both the pre-submit Escape and this sequence would
+// send Escape twice, which Codex treats as backtrack rather than submit.
 //
 // This table does NOT yet contain an entry for the claude-specific stall
 // this patch was scoped to fix (ra-oudpha finding-3 / gascity#5012, #5013's
@@ -86,7 +86,9 @@ var defaultNudgeSubmitKeySequence = []string{"Enter"}
 // traced, the fix — whatever key sequence or timing claude's TUI turns out
 // to need — is a single entry in this table plus a test, not a rewrite of
 // NudgeSession.
-var nudgeSubmitKeySequences = map[string][]string{}
+var nudgeSubmitKeySequences = map[string][]string{
+	"codex": {"Escape", "Enter"},
+}
 
 // nudgeSubmitKeySequenceForFamily returns the declared submit key sequence
 // for a provider family, or defaultNudgeSubmitKeySequence when the family
@@ -204,6 +206,10 @@ var (
 	// ga-bwm proved that treating an unconfirmed submit as a clean success is
 	// exactly what lets a stalled nudge go undetected for many minutes.
 	ErrNudgeSubmitUnconfirmed = errors.New("nudge: submit Enter delivered to tmux but not confirmed (busy state never observed)")
+	// ErrNudgeSubmitDeliveredUnobserved proves the composer drained after a
+	// submit even though no busy footer was observed; callers must acknowledge
+	// it without re-pasting the already delivered message.
+	ErrNudgeSubmitDeliveredUnobserved = errors.New("nudge: submit Enter delivered and composer drained but busy state was never observed")
 	// ErrServerDegraded indicates the tmux server bound to SocketName is
 	// reachable on the filesystem but unresponsive. Creating a new session
 	// in this state would let tmux's own (very short) liveness probe time
@@ -1990,6 +1996,142 @@ func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bo
 	return false, lastErr
 }
 
+const (
+	submitDraftRecoverySends   = 8
+	submitDraftRecoveryBackoff = time.Second
+)
+
+type stagedDraftMarker struct{ promptPrefix, marker string }
+
+var stagedDraftMarkers = map[string]stagedDraftMarker{
+	"codex": {promptPrefix: "› ", marker: "[Pasted Content "},
+}
+
+func stagedDraftMarkerForFamily(family string) (stagedDraftMarker, bool) {
+	m, ok := stagedDraftMarkers[family]
+	return m, ok
+}
+
+func (t *Tmux) stagedDraftMarkerFor(target string) (stagedDraftMarker, bool) {
+	if provider := t.providerEnv(target); provider != "" {
+		return stagedDraftMarkerForFamily(sessionlog.ProviderFamily(provider))
+	}
+	for family, marker := range stagedDraftMarkers {
+		if t.targetLooksLikeProvider(target, family) {
+			return marker, true
+		}
+	}
+	return stagedDraftMarker{}, false
+}
+
+func paneShowsStagedDraft(lines []string, marker stagedDraftMarker) bool {
+	composer := -1
+	for i, line := range lines {
+		if matchesPromptPrefix(line, marker.promptPrefix) {
+			composer = i
+		}
+	}
+	if composer < 0 {
+		return false
+	}
+	for _, line := range lines[composer:] {
+		if strings.Contains(line, marker.marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func paneShowsDrainedComposer(lines []string, sent string) bool {
+	remainder, seen := lastComposerRemainder(lines, DefaultReadyPromptPrefix)
+	if !seen {
+		return false
+	}
+	draft := firstNRunes(strings.TrimSpace(firstNonEmptyLine(sent)), 40)
+	return draft == "" || !strings.Contains(remainder, draft)
+}
+
+func lastComposerRemainder(lines []string, prefix string) (string, bool) {
+	prefix = strings.ReplaceAll(prefix, "\u00a0", " ")
+	trimmedPrefix := strings.TrimSpace(prefix)
+	var remainder string
+	found := false
+	for _, line := range lines {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "\u00a0", " "))
+		for _, candidate := range []string{line, stripLeadingBoxBorder(line)} {
+			if strings.HasPrefix(candidate, prefix) {
+				remainder, found = candidate[len(prefix):], true
+				break
+			}
+			if trimmedPrefix != "" && candidate == trimmedPrefix {
+				remainder, found = "", true
+				break
+			}
+		}
+	}
+	return remainder, found
+}
+
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func firstNRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+type paneSubmitObservation struct{ busy, drafted bool }
+
+func (t *Tmux) observeSubmit(target string, marker stagedDraftMarker) (paneSubmitObservation, error) {
+	lines, err := t.CapturePaneLines(target, promptObservationLines)
+	if err != nil {
+		return paneSubmitObservation{}, err
+	}
+	return paneSubmitObservation{busy: paneContainsBusyIndicator(lines), drafted: paneShowsStagedDraft(lines, marker)}, nil
+}
+
+type stagedDraftOutcome int
+
+const (
+	stagedDraftUnresolved stagedDraftOutcome = iota
+	stagedDraftSubmittedBusy
+	stagedDraftCleared
+)
+
+func recoverStagedDraft(sendSubmit func() error, wake func(), observe func() (paneSubmitObservation, error), sleep func(time.Duration)) stagedDraftOutcome {
+	sawDraft := false
+	for sends := 0; ; sends++ {
+		observation, err := observe()
+		if err != nil {
+			return stagedDraftUnresolved
+		}
+		if observation.busy {
+			return stagedDraftSubmittedBusy
+		}
+		if !observation.drafted {
+			if sawDraft {
+				return stagedDraftCleared
+			}
+			return stagedDraftUnresolved
+		}
+		sawDraft = true
+		if sends >= submitDraftRecoverySends || sendSubmit() != nil {
+			return stagedDraftUnresolved
+		}
+		wake()
+		sleep(submitDraftRecoveryBackoff)
+	}
+}
+
 // paneBusy reports whether the target pane shows an active processing indicator
 // (Claude's live spinner / "esc to interrupt"). Used to confirm a submitted turn.
 func (t *Tmux) paneBusy(target string) (bool, error) {
@@ -2001,14 +2143,32 @@ func (t *Tmux) paneBusy(target string) (bool, error) {
 }
 
 // submitVerifyEligible reports whether the target runs a provider whose busy
-// indicator is reliable enough to confirm a submit. Scoped to the Claude family
-// (the confirmed ga-bwm failure); other providers keep best-effort single
-// delivery so this change cannot regress them.
+// indicator is reliable enough to confirm a submit.
 func (t *Tmux) submitVerifyEligible(target string) bool {
 	if provider := t.providerEnv(target); provider != "" {
-		return sessionlog.ProviderFamily(provider) == "claude"
+		return submitVerifyEligibleFamily(sessionlog.ProviderFamily(provider))
 	}
-	return t.targetLooksLikeProvider(target, "claude")
+	for _, family := range submitVerifyEligibleFamilies {
+		if t.targetLooksLikeProvider(target, family) {
+			return true
+		}
+	}
+	return false
+}
+
+// submitVerifyEligibleFamilies are the provider families whose busy indicator
+// paneContainsBusyIndicator can read. Codex uses the same "esc to interrupt"
+// marker as Claude, so its multi-key submit is confirmed before a retry can
+// resend Escape into a newly busy pane.
+var submitVerifyEligibleFamilies = []string{"claude", "codex"}
+
+func submitVerifyEligibleFamily(family string) bool {
+	for _, eligible := range submitVerifyEligibleFamilies {
+		if family == eligible {
+			return true
+		}
+	}
+	return false
 }
 
 // nudgeSubmitKeySequence resolves target's declared submit key sequence (see
@@ -2106,16 +2266,33 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// below remains for the submit Enter.
 	t.WakePaneIfDetached(session)
 
-	// 1. Send text in literal mode with retry on transient errors
+	// 1. Clear any pending input already sitting on the line before pasting,
+	// mirroring SendKeysReplace (send-keys C-u). Without this, an earlier
+	// nudge's undelivered draft — e.g. a lost submit Enter (ga-bwm) — stays in
+	// the input box, and this paste concatenates on top of it instead of
+	// replacing it: stacked injections merge into one draft that Claude's TUI
+	// does not treat as a clean single-line submit (ra-3x46cy finding 2).
+	//
+	// Skip the clear when a client is attached: a human may be mid-keystroke,
+	// and silently wiping their in-progress input is worse than the
+	// concatenation this clear otherwise prevents (#5192).
+	if !t.IsSessionAttached(session) {
+		if _, err := t.run("send-keys", "-t", target, "C-u"); err != nil {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 2. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
 
-	// 2. Wait for paste to complete (tested, required). Kimi's TUI can take
+	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
 	// longer to accept large pasted prompts in detached panes.
 	time.Sleep(t.nudgeSubmitDebounce(target))
 
-	// 3. Send Escape only for TUIs where it's an insert-mode escape, not a
+	// 4. Send Escape only for TUIs where it's an insert-mode escape, not a
 	// semantic input key. Claude, Codex, Gemini, and OpenCode all treat
 	// Escape as a semantic control key in some busy states, so default submit
 	// must not synthesize it for them.
@@ -2125,11 +2302,11 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 4. Wake detached panes before Enter. Some TUIs accept pasted input while
+	// 5. Wake detached panes before Enter. Some TUIs accept pasted input while
 	// detached but drop the submit key until a terminal resize wakes their loop.
 	t.WakePaneIfDetached(session)
 
-	// 5. Send the provider's declared submit key sequence (see
+	// 6. Send the provider's declared submit key sequence (see
 	// nudgeSubmitKeySequences — default plain Enter) and, for providers with
 	// a reliable busy indicator, confirm the draft actually submitted —
 	// re-sending the sequence only while the pane stays idle. A lost submit
@@ -2147,6 +2324,17 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		}
 		delivered = true
 		if !confirmed {
+			if marker, ok := t.stagedDraftMarkerFor(target); ok && !t.IsSessionAttached(session) {
+				switch recoverStagedDraft(sendSubmit, wake, func() (paneSubmitObservation, error) { return t.observeSubmit(target, marker) }, time.Sleep) {
+				case stagedDraftSubmittedBusy:
+					return nil
+				case stagedDraftCleared:
+					return fmt.Errorf("%w: session %q", ErrNudgeSubmitDeliveredUnobserved, session)
+				}
+			}
+			if lines, captureErr := t.CapturePaneLines(target, promptObservationLines); captureErr == nil && paneShowsDrainedComposer(lines, message) {
+				return fmt.Errorf("%w: session %q", ErrNudgeSubmitDeliveredUnobserved, session)
+			}
 			// Do NOT collapse this to nil: a caller that treats nil as "clean
 			// delivery" would ack a queued nudge for a message that may still
 			// be sitting drafted-but-unsubmitted in the pane. Surfacing this
@@ -2168,12 +2356,84 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			lastErr = err
 			continue
 		}
-		// 6. Wake again so the submitted turn is processed promptly.
+		// 7. Wake again so the submitted turn is processed promptly.
 		wake()
 		delivered = true
+		t.recordUnconfirmedSubmit(session, message)
 		return nil
 	}
 	return fmt.Errorf("failed to send submit sequence after %d attempts: %w", submitEnterMaxSends, lastErr)
+}
+
+// recordUnconfirmedSubmit records the non-retryable fallback-family outcome
+// without changing its successful delivery contract.
+func (t *Tmux) recordUnconfirmedSubmit(session, message string) {
+	content := fmt.Sprintf("session: %s\ncause: submit delivered but not confirmed\n--- nudge text ---\n%s\n", session, message)
+	if err := writeSessionDiagnosticFile(t.cfg.RuntimeDir, session, "nudge-unconfirmed.log", content); err != nil {
+		warnSessionDiagnosticWrite(session, "nudge-unconfirmed.log", err)
+	}
+}
+
+var sessionDiagnosticWarningf = func(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+func warnSessionDiagnosticWrite(session, filename string, err error) {
+	sessionDiagnosticWarningf("warning: session %q diagnostic %s not written: %v\n", session, filename, err)
+}
+
+var sessionDiagnosticOwner = func(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Getuid())
+}
+
+func writeSessionDiagnosticFile(runtimeDir, session, filename, content string) error {
+	root := citylayout.SessionDiagnosticsDirForRuntimeDir(runtimeDir)
+	if root == "" {
+		return nil
+	}
+	if session == "" || session == "." || session == ".." || filename == "." || filename == ".." || session != filepath.Base(session) || filename != filepath.Base(filename) {
+		return fmt.Errorf("invalid diagnostic path")
+	}
+	dir := filepath.Join(root, session)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("diagnostic directory is not a real directory")
+	}
+	if !sessionDiagnosticOwner(info) {
+		return fmt.Errorf("diagnostic directory is not owned by current user")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, filename)
+	tmp, err := os.CreateTemp(dir, "."+filename+".*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 // NudgePane sends a message to a specific pane reliably.
