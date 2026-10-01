@@ -201,6 +201,76 @@ func TestCookedScopedWorkNoOpLoadContextReleasesWorkspaceSetup(t *testing.T) {
 	t.Fatalf("workspace setup attempt %s was not released after no-op load-context pass; ready=%+v", workspaceAttemptID, ready)
 }
 
+func TestCookedRetryWithoutSourceContractSpawnsAttemptWithGeneratedContract(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "retry-contract.toml"), []byte(`
+formula = "retry-contract"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "review"
+title = "Review"
+description = "Inspect the diff and report findings."
+type = "task"
+
+[steps.retry]
+max_attempts = 2
+`), 0o644); err != nil {
+		t.Fatalf("write formula: %v", err)
+	}
+	store := beads.NewMemStore()
+	result, err := molecule.Cook(context.Background(), store, "retry-contract", []string{dir}, molecule.Options{})
+	if err != nil {
+		t.Fatalf("Cook: %v", err)
+	}
+	controlID := result.IDMapping["retry-contract.review"]
+	attempt1ID := result.IDMapping["retry-contract.review.attempt.1"]
+	if controlID == "" || attempt1ID == "" {
+		t.Fatalf("missing cooked retry ids: control=%q attempt1=%q", controlID, attempt1ID)
+	}
+	attempt1 := mustGet(t, store, attempt1ID)
+	for _, required := range []string{"Inspect the diff and report findings.", `gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass`, "gc.outcome=fail", "gc.failure_class", "gc.failure_reason", "gc.work_outcome"} {
+		if !strings.Contains(attempt1.Description, required) {
+			t.Fatalf("attempt1 description missing %q:\n%s", required, attempt1.Description)
+		}
+	}
+	if err := store.SetMetadataBatch(attempt1ID, map[string]string{
+		"gc.outcome":        "fail",
+		"gc.failure_class":  "transient",
+		"gc.failure_reason": "rate_limited",
+	}); err != nil {
+		t.Fatalf("stamp transient attempt failure: %v", err)
+	}
+	mustClose(t, store, attempt1ID)
+	resultControl, err := ProcessControl(store, mustGet(t, store, controlID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if !resultControl.Processed || resultControl.Action != "retry" {
+		t.Fatalf("control result = %+v, want processed retry", resultControl)
+	}
+
+	var attempt2 beads.Bead
+	open, err := store.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen: %v", err)
+	}
+	for _, bead := range open {
+		if bead.Metadata["gc.step_ref"] == "retry-contract.review.attempt.2" {
+			attempt2 = bead
+			break
+		}
+	}
+	if attempt2.ID == "" {
+		t.Fatal("missing spawned retry attempt 2")
+	}
+	if attempt2.Description != attempt1.Description {
+		t.Fatalf("attempt2 description = %q, want initial generated contract %q", attempt2.Description, attempt1.Description)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // processAttemptControl shared-loop tests (fake evaluator)
 // ---------------------------------------------------------------------------
