@@ -3,9 +3,41 @@ package formula
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 )
+
+const retryCloseContract = "\n\nBefore leaving this retry-managed attempt, atomically close this attempt bead:\n\n" +
+	"```bash\n" +
+	"# success, including read-only/no-op work\n" +
+	"gc bd update \"$GC_BEAD_ID\" --set-metadata gc.outcome=pass --status=closed\n" +
+	"# transient failure (use gc.failure_class=hard for non-retryable failure)\n" +
+	"gc bd update \"$GC_BEAD_ID\" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=transient --set-metadata \"gc.failure_reason=rate_limited\" --status=closed\n" +
+	"```\n\n" +
+	"`gc.work_outcome` records the separate work disposition; it does not replace\n" +
+	"`gc.outcome`.\n"
+
+// retryAttemptDescription preserves a formula author's task prose while adding
+// the control-plane close contract every retry attempt requires. A hand-written
+// contract is retained only when it carries every required control-plane field,
+// so a partial success-only instruction cannot suppress the generated failure
+// path.
+func retryAttemptDescription(description string) string {
+	for _, required := range []string{
+		`gc bd update "$GC_BEAD_ID"`,
+		"gc.outcome=pass",
+		"gc.outcome=fail",
+		"gc.failure_class",
+		"gc.failure_reason",
+		"--status=closed",
+	} {
+		if !strings.Contains(description, required) {
+			return description + retryCloseContract
+		}
+	}
+	return description
+}
 
 // ApplyRetries expands inline retry-managed steps into control + attempt beads.
 //
@@ -57,7 +89,14 @@ func expandRetry(step *Step) ([]*Step, error) {
 		onExhausted = "hard_fail"
 	}
 
-	specStep, err := newSourceSpecStep(step)
+	// The control owns orchestration, not worker instructions. Derive a
+	// retry-attempt source snapshot so the first attempt and the spec used for
+	// controller-spawned attempts share one executable close contract without
+	// changing the author-facing logical control description.
+	attemptSource := cloneStep(step)
+	attemptSource.Description = retryAttemptDescription(step.Description)
+
+	specStep, err := newSourceSpecStep(attemptSource)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +120,7 @@ func expandRetry(step *Step) ([]*Step, error) {
 	control.WaitsFor = ""
 
 	// First attempt — the actual work bead, tagged as attempt 1.
-	run := cloneStep(step)
+	run := cloneStep(attemptSource)
 	run.ID = attemptID
 	run.Retry = nil
 	run.OnComplete = nil

@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/molecule"
 )
 
@@ -84,6 +85,189 @@ func TestProcessRetryControlPass(t *testing.T) {
 		after.Metadata["gc.controller_error_class"] != "" ||
 		after.Metadata["gc.controller_retryable"] != "" {
 		t.Fatalf("stale controller retry metadata was not cleared: %v", after.Metadata)
+	}
+}
+
+// A work-record no-op records what happened to the work item, while
+// gc.outcome records the retry controller's result. A read-only attempt must
+// therefore be able to pass without changing its no-op disposition.
+func TestProcessRetryControlPassesNoOpWorkOutcome(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "load context",
+		Metadata: map[string]string{
+			"gc.kind":             "retry",
+			"gc.root_bead_id":     root.ID,
+			"gc.step_ref":         "mol-test.load-context",
+			"gc.step_id":          "load-context",
+			"gc.max_attempts":     "3",
+			"gc.on_exhausted":     "hard_fail",
+			"gc.source_step_spec": `{"id":"load-context","title":"Load context","type":"task","retry":{"max_attempts":3}}`,
+			"gc.control_epoch":    "1",
+		},
+	})
+	attempt := mustCreate(t, store, beads.Bead{
+		Title: "load context attempt 1",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.load-context.attempt.1",
+			"gc.attempt":      "1",
+			"gc.outcome":      "pass",
+			"gc.work_outcome": "no-op",
+		},
+	})
+	mustClose(t, store, attempt.ID)
+	mustDep(t, store, control.ID, attempt.ID, "blocks")
+
+	result, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRetryControl: %v", err)
+	}
+	if !result.Processed || result.Action != "pass" {
+		t.Fatalf("result = %+v, want processed pass", result)
+	}
+	if got := mustGet(t, store, control.ID).Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("control gc.outcome = %q, want pass", got)
+	}
+	afterAttempt := mustGet(t, store, attempt.ID)
+	if got := afterAttempt.Metadata["gc.work_outcome"]; got != "no-op" {
+		t.Fatalf("attempt gc.work_outcome = %q, want no-op", got)
+	}
+	if got := afterAttempt.Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("attempt gc.outcome = %q, want pass", got)
+	}
+}
+
+// This is the cooked graph.v2 regression for the production incident: a
+// read-only load-context attempt may be no-op work, but its explicit
+// control-plane pass must release workspace setup without retry repair.
+func TestCookedScopedWorkNoOpLoadContextReleasesWorkspaceSetup(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	formulaDir := filepath.Join(filepath.Clean(filepath.Join(cwd, "..", "..")), "internal", "bootstrap", "packs", "core", "formulas")
+	store := beads.NewMemStore()
+	result, err := molecule.Cook(context.Background(), store, "mol-scoped-work", []string{formulaDir}, molecule.Options{})
+	if err != nil {
+		t.Fatalf("Cook mol-scoped-work: %v", err)
+	}
+
+	loadControlID := result.IDMapping["mol-scoped-work.load-context"]
+	loadAttemptID := result.IDMapping["mol-scoped-work.load-context.attempt.1"]
+	workspaceAttemptID := result.IDMapping["mol-scoped-work.workspace-setup.attempt.1"]
+	if loadControlID == "" || loadAttemptID == "" || workspaceAttemptID == "" {
+		t.Fatalf("missing cooked retry ids: load control=%q attempt=%q workspace attempt=%q", loadControlID, loadAttemptID, workspaceAttemptID)
+	}
+	if err := store.SetMetadataBatch(loadAttemptID, map[string]string{
+		"gc.outcome":      "pass",
+		"gc.work_outcome": "no-op",
+	}); err != nil {
+		t.Fatalf("stamp load-context outcome: %v", err)
+	}
+	mustClose(t, store, loadAttemptID)
+
+	controlResult, err := ProcessControl(store, mustGet(t, store, loadControlID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(load-context): %v", err)
+	}
+	if !controlResult.Processed || controlResult.Action != "pass" {
+		t.Fatalf("load-context control result = %+v, want processed pass", controlResult)
+	}
+	if got := mustGet(t, store, loadControlID).Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("load-context control gc.outcome = %q, want pass", got)
+	}
+	if got := mustGet(t, store, loadAttemptID).Metadata["gc.work_outcome"]; got != "no-op" {
+		t.Fatalf("load-context attempt gc.work_outcome = %q, want no-op", got)
+	}
+
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	for _, bead := range ready {
+		if bead.ID == workspaceAttemptID {
+			return
+		}
+	}
+	t.Fatalf("workspace setup attempt %s was not released after no-op load-context pass; ready=%+v", workspaceAttemptID, ready)
+}
+
+func TestCookedRetryWithoutSourceContractSpawnsAttemptWithGeneratedContract(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "retry-contract.toml"), []byte(`
+formula = "retry-contract"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "review"
+title = "Review"
+description = "Inspect the diff and report findings."
+type = "task"
+
+[steps.retry]
+max_attempts = 2
+`), 0o644); err != nil {
+		t.Fatalf("write formula: %v", err)
+	}
+	store := beads.NewMemStore()
+	result, err := molecule.Cook(context.Background(), store, "retry-contract", []string{dir}, molecule.Options{})
+	if err != nil {
+		t.Fatalf("Cook: %v", err)
+	}
+	controlID := result.IDMapping["retry-contract.review"]
+	attempt1ID := result.IDMapping["retry-contract.review.attempt.1"]
+	if controlID == "" || attempt1ID == "" {
+		t.Fatalf("missing cooked retry ids: control=%q attempt1=%q", controlID, attempt1ID)
+	}
+	attempt1 := mustGet(t, store, attempt1ID)
+	for _, required := range []string{"Inspect the diff and report findings.", `gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass`, "gc.outcome=fail", "gc.failure_class", "gc.failure_reason", "gc.work_outcome"} {
+		if !strings.Contains(attempt1.Description, required) {
+			t.Fatalf("attempt1 description missing %q:\n%s", required, attempt1.Description)
+		}
+	}
+	if err := store.SetMetadataBatch(attempt1ID, map[string]string{
+		"gc.outcome":        "fail",
+		"gc.failure_class":  "transient",
+		"gc.failure_reason": "rate_limited",
+	}); err != nil {
+		t.Fatalf("stamp transient attempt failure: %v", err)
+	}
+	mustClose(t, store, attempt1ID)
+	resultControl, err := ProcessControl(store, mustGet(t, store, controlID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if !resultControl.Processed || resultControl.Action != "retry" {
+		t.Fatalf("control result = %+v, want processed retry", resultControl)
+	}
+
+	var attempt2 beads.Bead
+	open, err := store.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen: %v", err)
+	}
+	for _, bead := range open {
+		if bead.Metadata["gc.step_ref"] == "retry-contract.review.attempt.2" {
+			attempt2 = bead
+			break
+		}
+	}
+	if attempt2.ID == "" {
+		t.Fatal("missing spawned retry attempt 2")
+	}
+	if attempt2.Description != attempt1.Description {
+		t.Fatalf("attempt2 description = %q, want initial generated contract %q", attempt2.Description, attempt1.Description)
 	}
 }
 
@@ -355,7 +539,7 @@ func TestProcessRetryControlRetriesPassMissingRequiredArtifact(t *testing.T) {
 			"gc.step_id":          "review",
 			"gc.max_attempts":     "3",
 			"gc.on_exhausted":     "hard_fail",
-			"gc.source_step_spec": fmt.Sprintf(`{"id":"review","title":"Review","type":"task","metadata":{"gc.required_artifact":%q},"retry":{"max_attempts":3}}`, missingReview),
+			"gc.source_step_spec": fmt.Sprintf(`{"id":"review","title":"Review","description":"Run the review, then close with gc.outcome=pass.","type":"task","metadata":{"gc.required_artifact":%q},"retry":{"max_attempts":3}}`, missingReview),
 			"gc.control_epoch":    "1",
 		},
 	})
@@ -404,6 +588,9 @@ func TestProcessRetryControlRetriesPassMissingRequiredArtifact(t *testing.T) {
 	}
 	if got := attempt2.Metadata["gc.required_artifact"]; got != missingReview {
 		t.Fatalf("attempt2 gc.required_artifact = %q, want %q", got, missingReview)
+	}
+	if got, want := attempt2.Description, "Run the review, then close with gc.outcome=pass."; got != want {
+		t.Fatalf("attempt2 description = %q, want source retry contract %q", got, want)
 	}
 
 	if err := store.SetMetadata(attempt2.ID, "gc.outcome", "pass"); err != nil {
@@ -2392,11 +2579,12 @@ func TestBuildAttemptRecipeSimpleRetry(t *testing.T) {
 	t.Parallel()
 
 	step := &formula.Step{
-		ID:     "review",
-		Title:  "Review code",
-		Type:   "task",
-		Labels: []string{"pool:polecat"},
-		Retry:  &formula.RetrySpec{MaxAttempts: 3},
+		ID:          "review",
+		Title:       "Review code",
+		Description: "Complete the review, then atomically close this attempt with gc.outcome=pass.",
+		Type:        "task",
+		Labels:      []string{"pool:polecat"},
+		Retry:       &formula.RetrySpec{MaxAttempts: 3},
 	}
 
 	control := beads.Bead{
@@ -2433,6 +2621,9 @@ func TestBuildAttemptRecipeSimpleRetry(t *testing.T) {
 	}
 	if !rootStep.IsRoot {
 		t.Error("root step should have IsRoot=true")
+	}
+	if rootStep.Description != step.Description {
+		t.Errorf("retry attempt description = %q, want source contract %q", rootStep.Description, step.Description)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,6 +115,90 @@ func TestApplyRetriesBasic(t *testing.T) {
 		t.Fatalf("attempt gc.step_ref = %q, want empty (molecule.Instantiate fills it)",
 			attempt.Metadata["gc.step_ref"])
 	}
+}
+
+func TestApplyRetriesAddsCloseContractToAttemptAndFrozenSpec(t *testing.T) {
+	const sourceDescription = "Inspect the change and report what you find."
+	got, err := ApplyRetries([]*Step{{
+		ID:          "review",
+		Title:       "Review change",
+		Description: sourceDescription,
+		Type:        "task",
+		Retry:       &RetrySpec{MaxAttempts: 2},
+	}})
+	if err != nil {
+		t.Fatalf("ApplyRetries: %v", err)
+	}
+	control := findGraphStepByID(got, "review")
+	attempt := findGraphStepByID(got, "review.attempt.1")
+	spec := findGraphStepByID(got, "review.spec")
+	if control == nil || attempt == nil || spec == nil {
+		t.Fatalf("missing retry expansion: control=%t attempt=%t spec=%t", control != nil, attempt != nil, spec != nil)
+	}
+	if control.Description != sourceDescription {
+		t.Fatalf("control description = %q, want unmodified source prose %q", control.Description, sourceDescription)
+	}
+	for _, required := range []string{sourceDescription, `gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass`, "gc.outcome=fail", "gc.failure_class", "gc.failure_reason", "gc.work_outcome"} {
+		if !strings.Contains(attempt.Description, required) {
+			t.Fatalf("initial retry attempt description missing %q:\n%s", required, attempt.Description)
+		}
+	}
+	assertFrozenSpecStep(t, spec, "review", func(frozen Step) {
+		if frozen.Description != attempt.Description {
+			t.Fatalf("frozen source spec description = %q, want generated attempt contract %q", frozen.Description, attempt.Description)
+		}
+	})
+}
+
+func TestRetryAttemptDescriptionAddsContractToPartialSourceAndAvoidsDuplicates(t *testing.T) {
+	partial := `Close with gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed.`
+	withContract := retryAttemptDescription(partial)
+	if !strings.Contains(withContract, "gc.outcome=fail") || !strings.Contains(withContract, "gc.failure_class") || !strings.Contains(withContract, "gc.failure_reason") {
+		t.Fatalf("partial description did not receive complete contract:\n%s", withContract)
+	}
+	if got := retryAttemptDescription(withContract); got != withContract {
+		t.Fatalf("complete contract was duplicated:\n%s", got)
+	}
+}
+
+func TestApplyRetriesDoesNotDuplicateCanonicalCloseContract(t *testing.T) {
+	const marker = "Before leaving this retry-managed attempt, atomically close this attempt bead:"
+	sourceDescription := "Inspect the change and report what you find." + retryCloseContract
+	got, err := ApplyRetries([]*Step{{
+		ID:          "review",
+		Title:       "Review change",
+		Description: sourceDescription,
+		Type:        "task",
+		Retry:       &RetrySpec{MaxAttempts: 2},
+	}})
+	if err != nil {
+		t.Fatalf("ApplyRetries: %v", err)
+	}
+	control := findGraphStepByID(got, "review")
+	attempt := findGraphStepByID(got, "review.attempt.1")
+	spec := findGraphStepByID(got, "review.spec")
+	if control == nil || attempt == nil || spec == nil {
+		t.Fatalf("missing retry expansion: control=%t attempt=%t spec=%t", control != nil, attempt != nil, spec != nil)
+	}
+	if control.Description != sourceDescription {
+		t.Fatalf("control description changed:\nwant %q\n got %q", sourceDescription, control.Description)
+	}
+	assertOneContract := func(label, description string) {
+		t.Helper()
+		if got := strings.Count(description, marker); got != 1 {
+			t.Fatalf("%s canonical contract markers = %d, want 1:\n%s", label, got, description)
+		}
+		if got := strings.Count(description, "gc.outcome=pass"); got != 1 {
+			t.Fatalf("%s pass instructions = %d, want 1:\n%s", label, got, description)
+		}
+	}
+	assertOneContract("attempt", attempt.Description)
+	assertFrozenSpecStep(t, spec, "review", func(frozen Step) {
+		assertOneContract("frozen spec", frozen.Description)
+		if frozen.Description != sourceDescription {
+			t.Fatalf("frozen spec description changed:\nwant %q\n got %q", sourceDescription, frozen.Description)
+		}
+	})
 }
 
 func TestCompileRetryManagedStepBlocksWorkflowOnLogicalBead(t *testing.T) {
