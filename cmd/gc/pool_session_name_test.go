@@ -734,15 +734,15 @@ func TestDetachedProbeResultAllowsOrphanRelease_FailsClosedUnlessDead(t *testing
 	work := beads.Bead{ID: "work-1"}
 	for _, status := range []detachedProbeStatus{detachedProbeError, detachedProbeTimeout, detachedProbeStatus("unknown")} {
 		for sweep := 1; sweep <= 2; sweep++ {
-			allows, clear := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: status, Err: errors.New("probe unavailable")})
-			if allows || clear {
-				t.Fatalf("status %q sweep %d = allows %t clear %t, want fail-closed", status, sweep, allows, clear)
+			allows, clearMetadata := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: status, Err: errors.New("probe unavailable")})
+			if allows || clearMetadata {
+				t.Fatalf("status %q sweep %d = allows %t clear %t, want fail-closed", status, sweep, allows, clearMetadata)
 			}
 		}
 	}
-	allows, clear := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: detachedProbeDead})
-	if !allows || !clear {
-		t.Fatalf("dead probe = allows %t clear %t, want release and clear", allows, clear)
+	allows, clearMetadata := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: detachedProbeDead})
+	if !allows || !clearMetadata {
+		t.Fatalf("dead probe = allows %t clear %t, want release and clear", allows, clearMetadata)
 	}
 }
 
