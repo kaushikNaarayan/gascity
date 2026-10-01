@@ -653,6 +653,7 @@ func TestReleaseOrphanedPoolAssignmentsWhenSnapshotsComplete_PartialSkipsComplet
 		t.Fatalf("mark work in_progress: %v", err)
 	}
 	work.Status = inProgress
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	released := releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(
 		store,

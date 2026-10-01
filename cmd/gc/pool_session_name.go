@@ -200,14 +200,17 @@ func releaseOrphanedPoolAssignments(
 				continue
 			}
 			// An absent local session is not evidence that a non-empty holder on
-			// another host is dead.  Reclaim an assigned work bead only when its
-			// detached probe positively confirms death; errors and unknown probe
-			// states deliberately leave the claim untouched.
+			// another host is dead. Reclaim an assigned work bead only when a
+			// durable closed session bead or its detached probe positively confirms
+			// death; errors and unknown probe states deliberately leave the claim
+			// untouched.
+			confirmedSessionDead := closedSessionAssignmentExists(store, assignee) ||
+				(ownerStore != nil && ownerStore != store && closedSessionAssignmentExists(ownerStore, assignee))
 			allowsRelease, confirmedDetachedDead := detachedProbeAllowsOrphanRelease(wb)
-			if !allowsRelease || !confirmedDetachedDead {
+			if !allowsRelease || (!confirmedSessionDead && !confirmedDetachedDead) {
 				continue
 			}
-			clearDetached = true
+			clearDetached = confirmedDetachedDead
 		}
 
 		if ownerStore == nil {
@@ -617,6 +620,28 @@ func liveSessionBeadExistsByIdentity(store beads.Store, assignee string) bool {
 		}
 		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
 			if assignee == candidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// closedSessionAssignmentExists reports a direct, durable proof that assignee
+// belonged to a session bead which is now closed. A lookup miss or error is
+// deliberately inconclusive: another host can own a session that this store
+// cannot observe, so callers must preserve the assignment in that case.
+func closedSessionAssignmentExists(store beads.Store, assignee string) bool {
+	if store == nil {
+		return false
+	}
+	for _, id := range directSessionBeadIDCandidates(assignee) {
+		sb, err := store.Get(id)
+		if err != nil || sb.Status != "closed" || !isSessionBead(sb) {
+			continue
+		}
+		for _, identity := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == identity {
 				return true
 			}
 		}
