@@ -425,6 +425,16 @@ func (t *Tmux) run(args ...string) (string, error) {
 	return t.runCtx(context.Background(), args...)
 }
 
+// runForAttach prevents observational and attach commands from starting or
+// rebinding a configured named server when its socket is unavailable. The
+// default socket retains tmux's existing behavior.
+func (t *Tmux) runForAttach(args ...string) (string, error) {
+	if t.cfg.SocketName == "" {
+		return t.run(args...)
+	}
+	return t.run(append([]string{"-N"}, args...)...)
+}
+
 // wrapError wraps tmux errors with context.
 func wrapError(err error, stderr string, args []string) error {
 	stderr = strings.TrimSpace(stderr)
@@ -511,6 +521,33 @@ func (t *Tmux) probeServerAlive() error {
 	// Timeout, fork failure, or any other unrecognized error: server is in
 	// an indeterminate state. Refuse to proceed rather than let tmux silently
 	// fork into a parallel server.
+	return fmt.Errorf("%w (socket=%s): %w", ErrServerDegraded, t.cfg.SocketName, err)
+}
+
+// probeServerAliveForAttach checks that a named tmux server answers immediately
+// before attach. Both this probe and the final attach use tmux -N, so neither
+// command can start or rebind a server when the socket disappears.
+func (t *Tmux) probeServerAliveForAttach() error {
+	if t.cfg.SocketName == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), newSessionProbeTimeout)
+	defer cancel()
+	_, err := t.runCtx(ctx, "-N", "has-session", "-t", "="+probeSessionName)
+	if err == nil || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoCurrentTarget) {
+		return nil
+	}
+	if errors.Is(err, ErrNoServer) {
+		observer := t.serverSocketObserver
+		if observer == nil {
+			observer = observeNamedSocket
+		}
+		path := namedSocketPath(t.cfg.SocketName)
+		if observationErr := observer(ctx, path); observationErr != nil {
+			return fmt.Errorf("%w: protocol=no-server path=%s observation=%w", ErrServerDegraded, path, observationErr)
+		}
+		return fmt.Errorf("%w: protocol=no-server path=%s observation=socket absent or stale", ErrServerDegraded, path)
+	}
 	return fmt.Errorf("%w (socket=%s): %w", ErrServerDegraded, t.cfg.SocketName, err)
 }
 
@@ -1328,6 +1365,17 @@ func (t *Tmux) HasSession(name string) (bool, error) {
 	return true, nil
 }
 
+func (t *Tmux) hasSessionForAttach(name string) (bool, error) {
+	_, err := t.runForAttach("has-session", "-t", "="+name)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // listSessionNames returns all session names, propagating ErrNoServer so
 // callers that must distinguish an unreachable server from a genuinely empty
 // session list can do so. [Tmux.ListSessions] absorbs ErrNoServer into an
@@ -1663,6 +1711,11 @@ func (t *Tmux) IsSessionAttached(target string) bool {
 	return err == nil && attached == "1"
 }
 
+func (t *Tmux) isSessionAttachedForAttach(target string) bool {
+	attached, err := t.runForAttach("display-message", "-t", target, "-p", "#{session_attached}")
+	return err == nil && attached == "1"
+}
+
 // WakePane triggers a SIGWINCH in a pane by resizing it slightly then restoring.
 // This wakes up Claude Code's event loop by simulating a terminal resize.
 //
@@ -1710,8 +1763,11 @@ func (t *Tmux) requiresHiddenAttachedInterrupt(target string) bool {
 }
 
 func (t *Tmux) ensureHiddenAttachedClient(target string) error {
-	if t.IsSessionAttached(target) {
+	if t.isSessionAttachedForAttach(target) {
 		return nil
+	}
+	if err := t.probeServerAliveForAttach(); err != nil {
+		return err
 	}
 
 	t.hiddenAttachMu.Lock()
@@ -1723,7 +1779,7 @@ func (t *Tmux) ensureHiddenAttachedClient(target string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), hiddenAttachMaxLifetime)
 	cmdArgs := []string{"-u"}
 	if t.cfg.SocketName != "" {
-		cmdArgs = append(cmdArgs, "-L", t.cfg.SocketName)
+		cmdArgs = append(cmdArgs, "-N", "-L", t.cfg.SocketName)
 	}
 	cmdArgs = append(cmdArgs, "attach-session", "-t", target)
 	cmd := exec.CommandContext(ctx, "script", hiddenAttachScriptArgs(goruntime.GOOS, cmdArgs)...)
@@ -3003,8 +3059,20 @@ func (t *Tmux) capturePaneProcessKillPlan(target string, exclude map[int]bool) (
 // pane remains visible (for example because remain-on-exit is enabled).
 // When target is a session name, pane 0 is queried explicitly.
 func (t *Tmux) IsPaneDead(target string) (bool, error) {
+	return t.isPaneDead(target, false)
+}
+
+func (t *Tmux) isPaneDeadForAttach(target string) (bool, error) {
+	return t.isPaneDead(target, true)
+}
+
+func (t *Tmux) isPaneDead(target string, noStart bool) (bool, error) {
 	tmuxTarget := primaryPaneTarget(target)
-	out, err := t.run("display-message", "-t", tmuxTarget, "-p", "#{pane_dead}")
+	run := t.run
+	if noStart {
+		run = t.runForAttach
+	}
+	out, err := run("display-message", "-t", tmuxTarget, "-p", "#{pane_dead}")
 	if err != nil {
 		return false, err
 	}
@@ -3442,7 +3510,10 @@ func (t *Tmux) CapturePaneLines(session string, lines int) ([]string, error) {
 // AttachSession attaches to an existing session.
 // Note: This replaces the current process with tmux attach.
 func (t *Tmux) AttachSession(session string) error {
-	_, err := t.run("attach-session", "-t", session)
+	if err := t.probeServerAliveForAttach(); err != nil {
+		return err
+	}
+	_, err := t.runForAttach("attach-session", "-t", session)
 	return err
 }
 

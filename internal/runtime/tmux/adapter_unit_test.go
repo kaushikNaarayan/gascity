@@ -2,6 +2,9 @@ package tmux
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -168,5 +171,52 @@ func TestProviderAttachReportsHasSessionError(t *testing.T) {
 		if strings.Contains(strings.Join(call, " "), "attach-session") {
 			t.Fatalf("Attach attempted tmux attach-session after has-session error: %v", fe.calls)
 		}
+	}
+}
+
+func TestAttachSessionNamedSocketNeverStartsServer(t *testing.T) {
+	fe := &fakeExecutor{errs: []error{ErrSessionNotFound, nil}}
+	tm := &Tmux{cfg: Config{SocketName: "city-socket"}, exec: fe}
+
+	if err := tm.AttachSession("runner"); err != nil {
+		t.Fatalf("AttachSession: %v", err)
+	}
+	want := [][]string{
+		{"-u", "-L", "city-socket", "-N", "has-session", "-t", "=" + probeSessionName},
+		{"-u", "-L", "city-socket", "-N", "attach-session", "-t", "runner"},
+	}
+	if !reflect.DeepEqual(fe.calls, want) {
+		t.Fatalf("tmux calls = %#v, want %#v", fe.calls, want)
+	}
+}
+
+func TestProviderAttachNamedSocketNeverStartsServer(t *testing.T) {
+	binDir := t.TempDir()
+	invocations := filepath.Join(binDir, "tmux-invocations")
+	fakeTmux := filepath.Join(binDir, "tmux")
+	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+invocations+"\n"), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	p := NewProviderWithConfig(Config{SocketName: "city-socket"})
+	p.tm.exec = &fakeExecutor{outs: []string{"", "0"}}
+	if err := p.Attach("runner"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	wantChecks := [][]string{
+		{"-u", "-L", "city-socket", "-N", "has-session", "-t", "=runner"},
+		{"-u", "-L", "city-socket", "-N", "display-message", "-t", "runner:^.0", "-p", "#{pane_dead}"},
+		{"-u", "-L", "city-socket", "-N", "has-session", "-t", "=" + probeSessionName},
+	}
+	if got := p.tm.exec.(*fakeExecutor).calls; !reflect.DeepEqual(got, wantChecks) {
+		t.Fatalf("provider attach checks = %#v, want %#v", got, wantChecks)
+	}
+	output, err := os.ReadFile(invocations)
+	if err != nil {
+		t.Fatalf("read fake tmux invocations: %v", err)
+	}
+	if got, want := string(output), "-u -N -L city-socket attach-session -t runner\n"; got != want {
+		t.Fatalf("provider attach argv = %q, want %q", got, want)
 	}
 }

@@ -786,20 +786,23 @@ func (p *Provider) CopyTo(name, src, relDst string) error {
 // refuses to attach to tmux remain-on-exit dead panes with a tmux-specific
 // message-only error. Pane-state query failures fall through to tmux attach.
 func (p *Provider) Attach(name string) error {
-	has, err := p.tm.HasSession(name)
+	has, err := p.tm.hasSessionForAttach(name)
 	if err != nil {
 		return fmt.Errorf("checking tmux session before attach: %w", err)
 	}
 	if !has {
 		return fmt.Errorf("%w: %w: %s", runtime.ErrSessionNotFound, ErrSessionNotFound, name)
 	}
-	dead, err := p.tm.IsPaneDead(name)
+	dead, err := p.tm.isPaneDeadForAttach(name)
 	if err == nil && dead {
 		return fmt.Errorf("refusing to attach to dead pane for session %q", name)
 	}
+	if err := p.tm.probeServerAliveForAttach(); err != nil {
+		return fmt.Errorf("checking tmux server before attach: %w", err)
+	}
 	args := []string{"-u"}
 	if p.cfg.SocketName != "" {
-		args = append(args, "-L", p.cfg.SocketName)
+		args = append(args, "-N", "-L", p.cfg.SocketName)
 	}
 	args = append(args, "attach-session", "-t", name)
 	cmd := exec.Command("tmux", args...)

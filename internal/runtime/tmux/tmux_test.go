@@ -510,12 +510,12 @@ func TestHiddenAttachedClientCanSendText(t *testing.T) {
 }
 
 func TestHiddenAttachScriptArgsArePlatformSpecific(t *testing.T) {
-	tmuxArgs := []string{"-u", "-L", "socket", "attach-session", "-t", "target"}
+	tmuxArgs := []string{"-u", "-N", "-L", "socket", "attach-session", "-t", "target"}
 
-	if got, want := hiddenAttachScriptArgs("darwin", tmuxArgs), []string{"-q", "/dev/null", "tmux", "-u", "-L", "socket", "attach-session", "-t", "target"}; !reflect.DeepEqual(got, want) {
+	if got, want := hiddenAttachScriptArgs("darwin", tmuxArgs), []string{"-q", "/dev/null", "tmux", "-u", "-N", "-L", "socket", "attach-session", "-t", "target"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("darwin script args = %#v, want %#v", got, want)
 	}
-	if got, want := hiddenAttachScriptArgs("linux", tmuxArgs), []string{"-qfc", "tmux -u -L socket attach-session -t target", "/dev/null"}; !reflect.DeepEqual(got, want) {
+	if got, want := hiddenAttachScriptArgs("linux", tmuxArgs), []string{"-qfc", "tmux -u -N -L socket attach-session -t target", "/dev/null"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("linux script args = %#v, want %#v", got, want)
 	}
 }
