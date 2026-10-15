@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +26,37 @@ import (
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 )
+
+func TestOrderDispatchCadenceBoundsSixtySevenOrderBurst(t *testing.T) {
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:     fmt.Sprintf("scheduled-%02d", i),
+			Trigger:  "cron",
+			Schedule: "*/10 * * * *",
+		}
+	}
+
+	cadence := computeOrderDispatchCadence(aa, 2*time.Minute, defaultMaxOrderDispatchesPerTick)
+	maxLatency := time.Duration(math.Ceil(float64(len(aa))/float64(cadence.maxDispatchesPerTick))) * cadence.interval
+	if maxLatency > 10*time.Minute {
+		t.Fatalf("67-order admission bound = %s, want <= 10m", maxLatency)
+	}
+	if cadence.interval < minOrderDispatchInterval {
+		t.Fatalf("cadence interval = %s, below hard floor %s", cadence.interval, minOrderDispatchInterval)
+	}
+	if cadence.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Fatalf("per-tick admission = %d, want configured default %d", cadence.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+}
+
+func TestOrderDispatchCadenceNeverCreatesSubFloorDedicatedLoop(t *testing.T) {
+	aa := []orders.Order{{Name: "one-second", Trigger: "cooldown", Interval: "1s"}}
+	cadence := computeOrderDispatchCadence(aa, 5*time.Second, defaultMaxOrderDispatchesPerTick)
+	if cadence.interval != minOrderDispatchInterval {
+		t.Fatalf("cadence interval = %s, want hard floor %s", cadence.interval, minOrderDispatchInterval)
+	}
+}
 
 func trackingBeads(t *testing.T, store beads.Store, label string) []beads.Bead {
 	t.Helper()
@@ -1740,6 +1772,191 @@ func TestOrderDispatchBudgetRotatesAcrossAlwaysDueOrders(t *testing.T) {
 		if got := len(trackingBeads(t, store, label)); got == 0 {
 			t.Fatalf("%s did not dispatch under a rotating budget", label)
 		}
+	}
+}
+
+func TestOrderDispatchBudgetRotationSurvivesRepeatedReloads(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("always-due-%02d", i),
+			Trigger:    "condition",
+			Check:      "true",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	newDispatcher := func() *memoryOrderDispatcher {
+		ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+			return []byte("ok\n"), nil
+		}, nil)
+		m := ad.(*memoryOrderDispatcher)
+		m.maxDispatchesPerTick = 4
+		return m
+	}
+
+	cr := &CityRuntime{od: newDispatcher(), stderr: io.Discard}
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	for tick := 0; tick < 17; tick++ {
+		m := cr.od.(*memoryOrderDispatcher)
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(tick)*time.Second))
+		m.drain(context.Background())
+		// Exercise the production reload/rescan replacement owner. Removing
+		// carrySchedulingStateFrom from CityRuntime makes tail admissions fail.
+		cr.replaceOrderDispatcher(newDispatcher())
+	}
+
+	for i := range aa {
+		label := fmt.Sprintf("order-run:always-due-%02d", i)
+		if got := len(trackingBeads(t, store, label)); got == 0 {
+			t.Fatalf("%s never dispatched across repeated reloads", label)
+		}
+	}
+}
+
+// Negative control: recreating the dispatcher without carrying its cursor
+// biases every bounded pass to the first four always-due orders. This is the
+// starvation shape that reload/rescan state transfer must prevent.
+func TestOrderDispatchForcedCursorResetStarvesTail(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{Name: fmt.Sprintf("always-due-%02d", i), Trigger: "condition", Check: "true", Exec: "true", NoWorkGate: true}
+	}
+	newDispatcher := func() *memoryOrderDispatcher {
+		m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+		m.maxDispatchesPerTick = 4
+		return m
+	}
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	for tick := 0; tick < 17; tick++ {
+		m := newDispatcher() // intentionally omit carrySchedulingStateFrom
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(tick)*time.Second))
+		m.drain(context.Background())
+	}
+	if got := len(trackingBeads(t, store, "order-run:always-due-56")); got != 0 {
+		t.Fatalf("forced cursor reset admitted tail order 56 %d times, want starvation", got)
+	}
+	if got := len(trackingBeads(t, store, "order-run:always-due-00")); got == 0 {
+		t.Fatal("forced cursor reset did not admit the biased head order")
+	}
+}
+
+func TestOrderDispatchStatsSeparateBoundedDueFromAdmitted(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("due-%02d", i),
+			Trigger:    "cooldown",
+			Interval:   "10m",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 4
+	m.dispatch(context.Background(), t.TempDir(), time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC))
+	m.drain(context.Background())
+
+	stats := m.lastOrderDispatchStats()
+	if stats.DueCount != 4 {
+		t.Fatalf("due count = %d, want bounded scan count 4", stats.DueCount)
+	}
+	if stats.AdmittedCount != 4 {
+		t.Fatalf("admitted count = %d, want 4", stats.AdmittedCount)
+	}
+	if stats.Duration < 0 {
+		t.Fatalf("dispatch duration = %s, want non-negative", stats.Duration)
+	}
+}
+
+func TestOrderDispatchBudgetSkipsFailingTailConditionCheck(t *testing.T) {
+	store := beads.NewMemStore()
+	marker := filepath.Join(t.TempDir(), "tail-condition-ran")
+	aa := make([]orders.Order, 5)
+	for i := 0; i < 4; i++ {
+		aa[i] = orders.Order{Name: fmt.Sprintf("head-%d", i), Trigger: "condition", Check: "true", Exec: "true", NoWorkGate: true}
+	}
+	aa[4] = orders.Order{
+		Name: "failing-tail", Trigger: "condition",
+		Check: fmt.Sprintf("printf tail > %q; exit 1", marker), Exec: "true", NoWorkGate: true,
+	}
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 4
+	m.dispatch(context.Background(), t.TempDir(), time.Now())
+	m.drain(context.Background())
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tail failing condition ran after admission budget: stat err=%v", err)
+	}
+	if stats := m.lastOrderDispatchStats(); stats.AdmittedCount != 4 || stats.DueCount != 4 {
+		t.Fatalf("dispatch stats = %+v, want exactly four bounded admissions/checks", stats)
+	}
+}
+
+func TestOrderDispatchCooldownDueStateSurvivesDispatcherRestart(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{
+			Name:       fmt.Sprintf("restart-%02d", i),
+			Trigger:    "cooldown",
+			Interval:   "10m",
+			Exec:       "true",
+			NoWorkGate: true,
+		}
+	}
+	newDispatcher := func() *memoryOrderDispatcher {
+		m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+		m.maxDispatchesPerTick = 4
+		return m
+	}
+
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	for tick := 0; tick < 17; tick++ {
+		m := newDispatcher() // no in-memory cursor/cache transfer: restart boundary
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(tick)*time.Second))
+		m.drain(context.Background())
+	}
+
+	for i := range aa {
+		label := fmt.Sprintf("order-run:restart-%02d", i)
+		if got := len(trackingBeads(t, store, label)); got == 0 {
+			t.Fatalf("%s never dispatched after repeated dispatcher restarts", label)
+		}
+	}
+}
+
+// TestOrderDispatchCronCatchesUpDroppedSlotsExactlyOnce is the drop case for
+// gcf-lo5u: two cron slots elapsed while no dispatch evaluated the order (a
+// starved supervisor cycle or a night-guard suspension). The first evaluation
+// afterwards must fire exactly once (catch-up once, not once per missed slot),
+// and later evaluations must not fire again for the same missed slots.
+func TestOrderDispatchCronCatchesUpDroppedSlotsExactlyOnce(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Minute)
+	slotA, slotB := now.Add(-5*time.Hour), now.Add(-3*time.Hour)
+	aa := []orders.Order{{
+		Name:       "pipeline-report",
+		Trigger:    "cron",
+		Schedule:   fmt.Sprintf("%d %d,%d * * *", slotB.Minute(), slotA.Hour(), slotB.Hour()),
+		Exec:       "true",
+		NoWorkGate: true,
+	}}
+	store := beads.NewMemStore()
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+
+	m.dispatch(context.Background(), t.TempDir(), now)
+	m.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got != 1 {
+		t.Fatalf("runs after first evaluation past two missed slots = %d, want exactly 1", got)
+	}
+	for i := 1; i <= 3; i++ {
+		m.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(i)*time.Minute))
+		m.drain(context.Background())
+	}
+	if got := countOrderTrackingRuns(t, store); got != 1 {
+		t.Fatalf("runs after later evaluations = %d, want still 1 (missed slots must not re-fire)", got)
 	}
 }
 

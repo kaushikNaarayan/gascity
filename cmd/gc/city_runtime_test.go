@@ -1472,6 +1472,422 @@ type recordingOrderDispatcher struct {
 	drainCtxErr error
 }
 
+type cadenceRecordingOrderDispatcher struct {
+	*recordingOrderDispatcher
+	cadence orderDispatchCadence
+}
+
+func (r *cadenceRecordingOrderDispatcher) orderDispatchCadence() orderDispatchCadence {
+	return r.cadence
+}
+
+// boundedBurstOrderDispatcher is a deterministic admission seam for the
+// cadence lane: every call admits exactly the next bounded slice. It keeps the
+// supervisor test focused on deadline ownership, while order_dispatch_test
+// covers trigger evaluation and persisted tracking runs.
+type boundedBurstOrderDispatcher struct {
+	mu        sync.Mutex
+	names     []string
+	cursor    int
+	admitted  []string
+	inFlight  int
+	maxFlight int
+	entered   chan struct{}
+	enterOnce sync.Once
+	entries   chan struct{}
+	block     chan struct{}
+}
+
+func (d *boundedBurstOrderDispatcher) orderDispatchCadence() orderDispatchCadence {
+	return orderDispatchCadence{interval: minOrderDispatchInterval, maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick}
+}
+
+func (d *boundedBurstOrderDispatcher) dispatch(context.Context, string, time.Time) {
+	d.mu.Lock()
+	d.inFlight++
+	if d.inFlight > d.maxFlight {
+		d.maxFlight = d.inFlight
+	}
+	for n := 0; n < defaultMaxOrderDispatchesPerTick && d.cursor < len(d.names); n++ {
+		d.admitted = append(d.admitted, d.names[d.cursor])
+		d.cursor++
+	}
+	block := d.block
+	if d.entered != nil {
+		d.enterOnce.Do(func() { close(d.entered) })
+	}
+	if d.entries != nil {
+		d.entries <- struct{}{}
+	}
+	d.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	d.mu.Lock()
+	d.inFlight--
+	d.mu.Unlock()
+}
+
+func (d *boundedBurstOrderDispatcher) drain(context.Context) bool { return true }
+
+func (d *boundedBurstOrderDispatcher) lastOrderDispatchStats() orderDispatchStats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return orderDispatchStats{DueCount: len(d.names) - d.cursor + len(d.admitted), AdmittedCount: len(d.admitted)}
+}
+
+type traceStatsOrderDispatcher struct{ stats orderDispatchStats }
+
+func (d *traceStatsOrderDispatcher) dispatch(context.Context, string, time.Time) {}
+func (d *traceStatsOrderDispatcher) drain(context.Context) bool                  { return true }
+func (d *traceStatsOrderDispatcher) lastOrderDispatchStats() orderDispatchStats  { return d.stats }
+
+type acknowledgingOrderDispatcher struct {
+	*memoryOrderDispatcher
+	completed chan<- struct{}
+}
+
+func (d *acknowledgingOrderDispatcher) dispatch(ctx context.Context, cityRoot string, now time.Time) {
+	d.memoryOrderDispatcher.dispatch(ctx, cityRoot, now)
+	d.completed <- struct{}{}
+}
+
+type blockingSessionListProvider struct {
+	*runtime.Fake
+	entered chan struct{}
+	release chan struct{}
+}
+
+// markCadenceFixtureMaintenanceCurrent keeps cadence tests focused on dispatch
+// admission. Migration and maintenance watchdog behavior has separate owners;
+// leaving their zero values here can open managed stores as a side effect of
+// dispatchOrdersLocked.
+func markCadenceFixtureMaintenanceCurrent(cr *CityRuntime) {
+	now := time.Now()
+	cr.wispIndexMigrationApplied = true
+	cr.orderSweepWatchdogLast = now
+	cr.orderTrackingRetentionWatchdogLast = now
+	cr.nudgeMailSweepWatchdogLast = now
+}
+
+func (p *blockingSessionListProvider) ListRunning(string) ([]string, error) {
+	close(p.entered)
+	<-p.release
+	return nil, nil
+}
+
+func TestOrderCadenceLoopDispatchesIndependentlyOfSupervisorLoop(t *testing.T) {
+	ticks := make(chan time.Time)
+	dispatched := make(chan struct{}, 1)
+	provider := &blockingSessionListProvider{
+		Fake:    runtime.NewFake(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	slowPhaseDone := make(chan struct{})
+	go func() {
+		defer close(slowPhaseDone)
+		var previous map[string]bool
+		cr := &CityRuntime{
+			sp: provider,
+			poolDeathHandlers: map[string]poolDeathInfo{
+				"worker-1": {},
+			},
+		}
+		cr.reconcilePoolDeaths(&previous)
+	}()
+	<-provider.entered
+	t.Cleanup(func() {
+		close(provider.release)
+		<-slowPhaseDone
+	})
+	od := &cadenceRecordingOrderDispatcher{
+		recordingOrderDispatcher: &recordingOrderDispatcher{onDispatch: func(context.Context, string, time.Time) {
+			dispatched <- struct{}{}
+		}},
+		cadence: orderDispatchCadence{interval: time.Minute, maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick},
+	}
+	cr := &CityRuntime{
+		od:     od,
+		stderr: io.Discard,
+		orderCadenceTimer: func(time.Duration) (<-chan time.Time, func()) {
+			return ticks, func() {}
+		},
+	}
+	markCadenceFixtureMaintenanceCurrent(cr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.runOrderCadenceLoop(ctx, "/city")
+	}()
+
+	ticks <- time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	select {
+	case <-dispatched:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("order cadence did not dispatch while the supervisor loop was independently occupied")
+	}
+	select {
+	case <-slowPhaseDone:
+		t.Fatal("slow supervisor phase unexpectedly completed before order admission")
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("order cadence loop did not stop after cancellation")
+	}
+}
+
+func TestOrderCadenceAdmitsNamedBurstWhileSupervisorBlocked(t *testing.T) {
+	ticks := make(chan time.Time)
+	aa := make([]orders.Order, 67)
+	for i := range aa {
+		aa[i] = orders.Order{Name: fmt.Sprintf("scheduled-%02d", i), Trigger: "cooldown", Interval: "10m", Exec: "true", NoWorkGate: true}
+	}
+	aa[56].Name = "mac-queue-waker"
+	aa[58].Name = "linux-queue-waker"
+	aa[66].Name = "watchdog-local-monitors"
+	store := beads.NewMemStore()
+	memoryOD := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	memoryOD.maxDispatchesPerTick = 4
+	memoryOD.cadence = orderDispatchCadence{interval: minOrderDispatchInterval, maxDispatchesPerTick: 4}
+	completed := make(chan struct{}, 17)
+	od := &acknowledgingOrderDispatcher{memoryOrderDispatcher: memoryOD, completed: completed}
+	provider := &blockingSessionListProvider{Fake: runtime.NewFake(), entered: make(chan struct{}), release: make(chan struct{})}
+	cr := &CityRuntime{
+		od: od, sp: provider, stderr: io.Discard,
+		poolDeathHandlers: map[string]poolDeathInfo{"worker-1": {}},
+		orderCadenceTimer: func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} },
+	}
+	markCadenceFixtureMaintenanceCurrent(cr)
+
+	// Block this exact runtime's reconciliation seam. The cadence loop below
+	// must drain the entire burst before ListRunning is allowed to return.
+	supervisorDone := make(chan struct{})
+	go func() {
+		defer close(supervisorDone)
+		var previous map[string]bool
+		cr.reconcilePoolDeaths(&previous)
+	}()
+	var releaseOnce sync.Once
+	releaseSupervisor := func() {
+		releaseOnce.Do(func() {
+			close(provider.release)
+			<-supervisorDone
+		})
+	}
+	t.Cleanup(releaseSupervisor)
+	select {
+	case <-provider.entered:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("supervisor reconcile did not enter its blocking seam")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); cr.runOrderCadenceLoop(ctx, "/city") }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(testutil.GoroutineRaceTimeout):
+			t.Error("cadence loop did not stop during cleanup")
+		}
+	})
+	for i := 0; i < 17; i++ {
+		ticks <- time.Date(2026, 10, 3, 22, 0, i, 0, time.UTC)
+		select {
+		case <-completed:
+		case <-time.After(testutil.GoroutineRaceTimeout):
+			t.Fatalf("cadence pass %d did not complete", i+1)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("cadence loop did not stop")
+	}
+	releaseSupervisor()
+
+	od.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got != len(aa) {
+		t.Fatalf("admitted %d orders, want all %d within %s", got, len(aa), 17*minOrderDispatchInterval)
+	}
+	for _, want := range []string{"mac-queue-waker", "linux-queue-waker", "watchdog-local-monitors"} {
+		if got := len(trackingBeads(t, store, "order-run:"+want)); got != 1 {
+			t.Errorf("named due order %q runs = %d, want one persisted admission", want, got)
+		}
+	}
+}
+
+func TestConcurrentCadenceAndSupervisorDispatchAreSingleFlight(t *testing.T) {
+	od := &boundedBurstOrderDispatcher{names: []string{"only-order"}, block: make(chan struct{})}
+	lockAcquired := make(chan struct{}, 2)
+	secondAttempted := make(chan struct{})
+	allowSecondLock := make(chan struct{})
+	var attempts atomic.Int32
+	cr := &CityRuntime{
+		od: od, stderr: io.Discard,
+		orderDispatchLockAttempted: func() {
+			if attempts.Add(1) == 2 {
+				close(secondAttempted)
+				<-allowSecondLock
+			}
+		},
+		orderDispatchLockAcquired: func() { lockAcquired <- struct{}{} },
+	}
+	markCadenceFixtureMaintenanceCurrent(cr)
+	first := make(chan struct{})
+	go func() { cr.dispatchOrders(context.Background(), "/city"); close(first) }()
+	select {
+	case <-lockAcquired:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("supervisor dispatch did not acquire order lane")
+	}
+	second := make(chan struct{})
+	go func() {
+		cr.orderCadenceTick(context.Background(), "/city")
+		close(second)
+	}()
+	select {
+	case <-secondAttempted:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("cadence dispatch did not attempt the order lane")
+	}
+	close(allowSecondLock)
+	select {
+	case <-lockAcquired:
+		t.Fatal("cadence acquired the lane before supervisor dispatch released it")
+	case <-time.After(testutil.GoroutineRaceTimeout / 4):
+	}
+	close(od.block)
+	select {
+	case <-first:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("supervisor dispatch did not release")
+	}
+	select {
+	case <-second:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("cadence dispatch did not release")
+	}
+	// Honest negative control: the dispatcher itself permits two overlapping
+	// calls; the single-flight property comes from CityRuntime's lane mutex.
+	control := &boundedBurstOrderDispatcher{names: []string{"a", "b"}, entries: make(chan struct{}, 2), block: make(chan struct{})}
+	controlDone := make(chan struct{}, 2)
+	go func() { control.dispatch(context.Background(), "/city", time.Now()); controlDone <- struct{}{} }()
+	go func() { control.dispatch(context.Background(), "/city", time.Now()); controlDone <- struct{}{} }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-control.entries:
+		case <-time.After(testutil.GoroutineRaceTimeout):
+			t.Fatal("negative control did not overlap direct dispatcher calls")
+		}
+	}
+	control.mu.Lock()
+	observed := control.maxFlight
+	control.mu.Unlock()
+	if observed != 2 {
+		t.Fatalf("negative control concurrent dispatches = %d, want 2", observed)
+	}
+	close(control.block)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-controlDone:
+		case <-time.After(testutil.GoroutineRaceTimeout):
+			t.Fatal("negative-control dispatcher did not release")
+		}
+	}
+}
+
+func TestOrderDispatchTraceFieldsExposeSchedulerCountsAndAges(t *testing.T) {
+	stats := orderDispatchStats{
+		Duration:      2300 * time.Millisecond,
+		DueCount:      17,
+		AdmittedCount: 4,
+		OldestDueAge:  11 * time.Minute,
+	}
+	fields := orderDispatchTraceFields(stats)
+	want := map[string]any{
+		"due_count":            17,
+		"admitted_count":       4,
+		"oldest_due_age_ms":    int64((11 * time.Minute).Milliseconds()),
+		"dispatch_duration_ms": int64(2300),
+	}
+	for key, value := range want {
+		if fields[key] != value {
+			t.Errorf("%s = %#v, want %#v", key, fields[key], value)
+		}
+	}
+}
+
+func TestOrderCadenceEmitsSchedulerTraceFields(t *testing.T) {
+	cityPath := t.TempDir()
+	od := &traceStatsOrderDispatcher{stats: orderDispatchStats{
+		Duration: 2300 * time.Millisecond, DueCount: 67, AdmittedCount: 4, OldestDueAge: 11 * time.Minute,
+	}}
+	cr := &CityRuntime{
+		cityPath: cityPath, cityName: "trace-town", cfg: &config.City{}, od: od, stderr: io.Discard,
+		trace: newSessionReconcilerTraceManager(cityPath, "trace-town", io.Discard),
+	}
+	markCadenceFixtureMaintenanceCurrent(cr)
+	cr.orderCadenceTick(context.Background(), cityPath)
+	records, err := ReadTraceRecords(traceCityRuntimeDir(cityPath), TraceFilter{})
+	if err != nil {
+		t.Fatalf("read emitted cadence trace: %v", err)
+	}
+	for _, rec := range records {
+		if rec.RecordType != TraceRecordOperation || rec.SiteCode != TraceSiteOrderDispatch {
+			continue
+		}
+		if traceFieldInt(rec.Fields["due_count"]) != 67 ||
+			traceFieldInt(rec.Fields["admitted_count"]) != 4 ||
+			traceFieldInt(rec.Fields["oldest_due_age_ms"]) != int((11*time.Minute).Milliseconds()) ||
+			traceFieldInt(rec.Fields["dispatch_duration_ms"]) != 2300 {
+			t.Fatalf("emitted scheduler fields = %#v", rec.Fields)
+		}
+		return
+	}
+	t.Fatal("order-cadence dispatch trace operation missing")
+}
+
+func TestTraceConfigSnapshotStaysRevisionConsistentDuringReloadWrite(t *testing.T) {
+	cfgA, cfgB := &config.City{}, &config.City{}
+	cr := &CityRuntime{cfg: cfgA, configRev: "revision-a"}
+	start := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		<-start
+		for i := 0; i < 1000; i++ {
+			cr.serviceStateMu.Lock()
+			if i%2 == 0 {
+				cr.cfg, cr.configRev = cfgB, "revision-b"
+			} else {
+				cr.cfg, cr.configRev = cfgA, "revision-a"
+			}
+			cr.serviceStateMu.Unlock()
+		}
+	}()
+	close(start)
+	for i := 0; i < 1000; i++ {
+		cfg, revision := cr.traceConfigSnapshot()
+		if (cfg == cfgA && revision != "revision-a") || (cfg == cfgB && revision != "revision-b") {
+			t.Fatalf("trace snapshot mixed config %p with revision %q", cfg, revision)
+		}
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("reload writer did not finish")
+	}
+}
+
 func (r *recordingOrderDispatcher) dispatch(ctx context.Context, cityRoot string, now time.Time) {
 	r.calls.Add(1)
 	r.called.Store(true)
@@ -1775,6 +2191,81 @@ func TestCityRuntimeRunDispatchesOrdersBeforeStartupReconcile(t *testing.T) {
 	if got := od.calls.Load(); got != 1 {
 		t.Fatalf("order dispatch calls = %d, want 1", got)
 	}
+}
+
+func TestCityRuntimeRunStartsPostReadyOrderCadence(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	ticks := make(chan time.Time)
+	dispatched := make(chan struct{}, 2)
+	od := &cadenceRecordingOrderDispatcher{
+		recordingOrderDispatcher: &recordingOrderDispatcher{onDispatch: func(context.Context, string, time.Time) {
+			dispatched <- struct{}{}
+		}},
+		cadence: orderDispatchCadence{interval: minOrderDispatchInterval, maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick},
+	}
+	started := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cr, runtimeErr := newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath, Cfg: cfg, SP: sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops: newDrainOps(sp), Rec: events.Discard,
+		OnStarted: func() { close(started) }, Stdout: io.Discard, Stderr: io.Discard,
+	})
+	if runtimeErr != nil {
+		cancel()
+		t.Fatalf("building city runtime: %v", runtimeErr)
+	}
+	cr.od = od
+	markCadenceFixtureMaintenanceCurrent(cr)
+	cr.orderCadenceTimer = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	done := make(chan struct{})
+	go func() { defer close(done); cr.run(ctx) }()
+	var stopOnce sync.Once
+	stopRun := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(testutil.GoroutineRaceTimeout):
+				t.Error("run did not stop after cancellation")
+			}
+		})
+	}
+	t.Cleanup(stopRun)
+	select {
+	case <-started:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("run did not report startup readiness")
+	}
+	select {
+	case <-dispatched: // startup dispatch
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("startup order dispatch did not complete")
+	}
+	select {
+	case ticks <- time.Now():
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("post-ready cadence loop did not accept timer tick")
+	}
+	select {
+	case <-dispatched: // must come from the goroutine started after readiness
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("post-ready cadence tick did not dispatch")
+	}
+	stopRun()
 }
 
 func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
