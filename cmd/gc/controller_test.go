@@ -2178,3 +2178,28 @@ func TestTryReloadConfig_IncludesBuiltinPackOrders(t *testing.T) {
 }
 
 func (osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(name, mode) }
+
+// watchConfigTargets must not read the package-level debounceDelay from its
+// event goroutine (gcf-tlrzz). Tests overwrite debounceDelay (see
+// TestControllerReloadsConfig) while a watcher started by an EARLIER test may
+// still be running; reading the variable per event raced with that write under
+// -race. Production never writes it, so this was a test-only race, but it made
+// the -race run of this package fail. The watcher now captures the delay once at
+// start. Run with -race: before the capture, this test reports a data race.
+func TestWatchConfigTargetsDoesNotReadDebounceDelayFromEventGoroutine(t *testing.T) {
+	old := debounceDelay
+	t.Cleanup(func() { debounceDelay = old })
+
+	dir := t.TempDir()
+	var dirty atomic.Bool
+	cleanup := watchConfigTargets([]config.WatchTarget{{Path: dir}}, &dirty, nil, &bytes.Buffer{})
+	t.Cleanup(cleanup)
+
+	// A later test overwrites the global while this watcher is still alive.
+	debounceDelay = 5 * time.Millisecond
+
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte("x = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	awaitCond(t, dirty.Load, "watcher marking the config dirty after a file event")
+}
