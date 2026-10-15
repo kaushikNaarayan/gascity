@@ -594,6 +594,11 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		if !hasDispatchBudget() {
 			return
 		}
+		// A canceled pass (shutdown, or a reload/rescan handoff preempting the
+		// lane) stops scanning; the next tick resumes from the carried cursor.
+		if ctx.Err() != nil {
+			return
+		}
 		idx := (start + offset) % total
 		a := m.aa[idx]
 		// Skip orders targeting suspended rigs.
@@ -722,11 +727,6 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			continue
 		}
 		stats.DueCount++
-		if !result.LastRun.IsZero() && now.After(result.LastRun) {
-			if age := now.Sub(result.LastRun); age > stats.OldestDueAge {
-				stats.OldestDueAge = age
-			}
-		}
 		if lastRunFromCache && orderTriggerUsesLastRun(a) {
 			refreshedLastRun, err := baseLastRunFn(a.ScopedName())
 			if err != nil {
@@ -742,6 +742,16 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				if !result.Due {
 					continue
 				}
+			}
+		}
+
+		// Lateness = now - the scheduled fire time that was missed (cron: the
+		// matched/caught-up minute; cooldown: last run + interval), NOT time
+		// since the last run: this is the "tick N minutes late / dropped"
+		// signal. Computed from the final (possibly re-checked) result.
+		if !result.ScheduledAt.IsZero() && now.After(result.ScheduledAt) {
+			if age := now.Sub(result.ScheduledAt); age > stats.OldestDueAge {
+				stats.OldestDueAge = age
 			}
 		}
 

@@ -1816,7 +1816,7 @@ func TestOrderDispatchTraceFieldsExposeSchedulerCountsAndAges(t *testing.T) {
 	want := map[string]any{
 		"due_count":            17,
 		"admitted_count":       4,
-		"oldest_due_age_ms":    int64((11 * time.Minute).Milliseconds()),
+		"oldest_due_age_ms":    (11 * time.Minute).Milliseconds(),
 		"dispatch_duration_ms": int64(2300),
 	}
 	for key, value := range want {
@@ -7907,5 +7907,64 @@ func TestWarnIfClosedOrderTrackingBacklogLarge_CountsStoresTogether(t *testing.T
 	}
 	if strings.Count(got, "gc start:") != 1 {
 		t.Fatalf("warning = %q, want one advisory line for the city", got)
+	}
+}
+
+// A slow condition subprocess must not hold reload/rescan/replace for its whole
+// check_timeout (gcf-lo5u.1): the handoff cancels the in-flight pass, the check
+// is killed, and the lane frees within seconds instead of ~60s.
+func TestOrderLaneHandoffPreemptsSlowConditionCheck(t *testing.T) {
+	store := beads.NewMemStore()
+	dir := t.TempDir()
+	started := filepath.Join(dir, "check-started")
+	slow := []orders.Order{{
+		Name:         "slow-condition",
+		Trigger:      "condition",
+		Check:        fmt.Sprintf("touch %q; sleep 60", started),
+		CheckTimeout: "120s",
+		Exec:         "true",
+		NoWorkGate:   true,
+	}}
+	od := buildOrderDispatcherFromListExec(slow, store, nil, successfulExec, nil)
+	cr := &CityRuntime{od: od, stderr: io.Discard}
+	markCadenceFixtureMaintenanceCurrent(cr)
+
+	passDone := make(chan struct{})
+	go func() { cr.dispatchOrders(context.Background(), dir); close(passDone) }()
+	deadline := time.Now().Add(testutil.GoroutineRaceTimeout)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slow condition check never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Negative control: the lane really is held for the duration of the check.
+	if cr.orderDispatchMu.TryLock() {
+		cr.orderDispatchMu.Unlock()
+		t.Fatal("order lane free while the slow condition runs; test does not model the starvation")
+	}
+
+	handoff := make(chan struct{})
+	start := time.Now()
+	go func() {
+		cr.replaceOrderDispatcher(buildOrderDispatcherFromListExec(nil, store, nil, successfulExec, nil))
+		close(handoff)
+	}()
+	select {
+	case <-handoff:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatalf("handoff still blocked %s behind a 60s condition check", time.Since(start))
+	}
+	select {
+	case <-passDone:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("interrupted dispatch pass did not return")
+	}
+	if e := time.Since(start); e > 30*time.Second {
+		t.Fatalf("handoff took %s, want well under the 60s check", e)
 	}
 }

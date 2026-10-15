@@ -124,6 +124,12 @@ type CityRuntime struct {
 	adt             assignedWorkDeferTracker
 	wg              wispGC
 	orderDispatchMu sync.Mutex
+	// orderPassMu guards orderPassCancel, the cancel func of the dispatch pass
+	// currently holding orderDispatchMu. Handoff paths (reload, rescan, replace)
+	// call it before waiting for the lane so a slow condition subprocess cannot
+	// hold them for its whole check_timeout (gcf-lo5u.1).
+	orderPassMu     sync.Mutex
+	orderPassCancel context.CancelFunc
 	// orderDispatchLockAcquired is a test seam for proving cadence and patrol
 	// dispatch share one lane. Production leaves it nil.
 	orderDispatchLockAttempted func()
@@ -1552,7 +1558,37 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) orde
 	if cr.orderDispatchLockAcquired != nil {
 		cr.orderDispatchLockAcquired()
 	}
-	return cr.dispatchOrdersLocked(ctx, cityRoot)
+	// The pass runs under a cancelable child context so a handoff waiting on
+	// the lane (lockOrderLaneForHandoff) can interrupt a slow condition check
+	// instead of waiting out its check_timeout.
+	passCtx, cancel := context.WithCancel(ctx)
+	cr.orderPassMu.Lock()
+	cr.orderPassCancel = cancel
+	cr.orderPassMu.Unlock()
+	defer func() {
+		cr.orderPassMu.Lock()
+		cr.orderPassCancel = nil
+		cr.orderPassMu.Unlock()
+		cancel()
+	}()
+	return cr.dispatchOrdersLocked(passCtx, cityRoot)
+}
+
+// lockOrderLaneForHandoff takes orderDispatchMu for a reload, rescan, or
+// dispatcher replacement. It first cancels the in-flight dispatch pass (if
+// any): a handoff changes the order set the pass is scanning, so finishing
+// the pass is worth nothing, while waiting on it would block the caller (the
+// reload runs on the supervisor tick goroutine) behind every condition
+// subprocess in the pass. The interrupted pass resumes on the next tick. Plain
+// dispatch-vs-dispatch serialization is unchanged.
+func (cr *CityRuntime) lockOrderLaneForHandoff() {
+	cr.orderPassMu.Lock()
+	cancel := cr.orderPassCancel
+	cr.orderPassMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	cr.orderDispatchMu.Lock()
 }
 
 func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string) orderDispatchStats {
@@ -1600,7 +1636,7 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 // so a rebuild (reload or rescan) reuses them instead of cold-starting (#3201).
 // Call after draining the outgoing dispatcher.
 func (cr *CityRuntime) replaceOrderDispatcher(next orderDispatcher) {
-	cr.orderDispatchMu.Lock()
+	cr.lockOrderLaneForHandoff()
 	defer cr.orderDispatchMu.Unlock()
 	cr.replaceOrderDispatcherLocked(next)
 }
@@ -1617,7 +1653,7 @@ func (cr *CityRuntime) replaceOrderDispatcherLocked(next orderDispatcher) {
 }
 
 func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
-	cr.orderDispatchMu.Lock()
+	cr.lockOrderLaneForHandoff()
 	defer cr.orderDispatchMu.Unlock()
 	return cr.rescanOrderDispatcherLocked(ctx, cityRoot, cfg, cmdName, now)
 }
@@ -2315,7 +2351,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// Build before taking the lane lock: filesystem scanning must not pause
 	// admission. The final drain and handoff are serialized with dispatch.
 	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
-	cr.orderDispatchMu.Lock()
+	cr.lockOrderLaneForHandoff()
 	// Drain the outgoing dispatcher before replacing it so in-flight
 	// dispatchOne goroutines persist their tracking-bead outcomes against
 	// the store they were scheduled against. Reload runs on the same

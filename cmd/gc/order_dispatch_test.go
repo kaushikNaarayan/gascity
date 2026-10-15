@@ -10490,3 +10490,51 @@ func TestCountClosedOrderTrackingRetentionEligible(t *testing.T) {
 		}
 	})
 }
+
+// oldest_due_age is LATENESS: a cron due at 04:00 and first evaluated at 04:20
+// reports 20m, the "tick N minutes late" signal this lane exists to expose
+// (gcf-lo5u.1), not time since the order last ran.
+func TestOrderDispatchOldestDueAgeIsLatenessAgainstScheduledFire(t *testing.T) {
+	store := beads.NewMemStore()
+	aa := []orders.Order{{
+		Name:       "late-cron",
+		Trigger:    "cron",
+		Schedule:   "0 */4 * * *",
+		Exec:       "true",
+		NoWorkGate: true,
+	}}
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	dir := t.TempDir()
+	// Tracking beads are stamped with the real clock, so run the scenario on a
+	// future UTC day: the real-clock bead time then always precedes the slots.
+	day := time.Now().UTC().Truncate(24 * time.Hour).Add(48 * time.Hour)
+	// Seed a real last run on the 00:00 slot (on time: <1 minute late).
+	m.dispatch(context.Background(), dir, day.Add(30*time.Second))
+	m.drain(context.Background())
+	if age := m.lastOrderDispatchStats().OldestDueAge; age != 30*time.Second {
+		t.Fatalf("on-time slot OldestDueAge = %s, want 30s (within its scheduled minute)", age)
+	}
+	// Tracking beads carry the real wall clock, so pin the cached last run to the
+	// fake 00:00 slot the first dispatch represents.
+	m.cacheMu.Lock()
+	if len(m.lastRunCache) == 0 {
+		m.cacheMu.Unlock()
+		t.Fatal("first dispatch left no cached last run to pin")
+	}
+	for k := range m.lastRunCache {
+		m.lastRunCache[k] = day.Add(30 * time.Second)
+	}
+	m.cacheMu.Unlock()
+	// The 04:00 slot is first evaluated at 04:20: 20m late. Time since the last
+	// run would read 4h20m; lateness is what must be reported.
+	m.dispatch(context.Background(), dir, day.Add(4*time.Hour+20*time.Minute))
+	m.drain(context.Background())
+
+	stats := m.lastOrderDispatchStats()
+	if stats.DueCount != 1 {
+		t.Fatalf("due count = %d, want 1", stats.DueCount)
+	}
+	if stats.OldestDueAge != 20*time.Minute {
+		t.Fatalf("OldestDueAge = %s, want 20m (now - missed 04:00 fire)", stats.OldestDueAge)
+	}
+}
