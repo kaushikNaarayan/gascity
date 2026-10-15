@@ -10538,3 +10538,64 @@ func TestOrderDispatchOldestDueAgeIsLatenessAgainstScheduledFire(t *testing.T) {
 		t.Fatalf("OldestDueAge = %s, want 20m (now - missed 04:00 fire)", stats.OldestDueAge)
 	}
 }
+
+// Reload storm (gcf-lo5u.3 O1): a slow condition order sits at the rotation
+// cursor and a handoff preempts every pass while its check runs. The cursor must
+// advance past the preempted order so an order behind it still fires within two
+// passes, instead of every pass restarting on the same slow order forever.
+func TestOrderDispatchPreemptedConditionAdvancesCursorPastSlowOrder(t *testing.T) {
+	store := beads.NewMemStore()
+	dir := t.TempDir()
+	started := filepath.Join(dir, "slow-check-started")
+	aa := []orders.Order{
+		{
+			Name:         "slow-condition",
+			Trigger:      "condition",
+			Check:        fmt.Sprintf("touch %q; sleep 60", started),
+			CheckTimeout: "120s",
+			Exec:         "true",
+			NoWorkGate:   true,
+		},
+		{Name: "behind-it", Trigger: "cooldown", Interval: "10m", Exec: "true", NoWorkGate: true},
+	}
+	m := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil).(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 4
+
+	// preemptedPass runs one dispatch pass and cancels it as soon as the slow
+	// order's check has started, the way a handoff would.
+	preemptedPass := func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				if _, err := os.Stat(started); err == nil {
+					_ = os.Remove(started)
+					cancel()
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			cancel()
+		}()
+		m.dispatch(ctx, dir, time.Now())
+		m.drain(context.Background())
+	}
+
+	start := time.Now()
+	for pass := 1; pass <= 2; pass++ {
+		preemptedPass()
+		if got := len(trackingBeads(t, store, "order-run:behind-it")); got > 0 {
+			break
+		}
+	}
+	if e := time.Since(start); e > 30*time.Second {
+		t.Fatalf("two preempted passes took %s; the slow check was not killed by the cancel", e)
+	}
+	if got := len(trackingBeads(t, store, "order-run:behind-it")); got != 1 {
+		t.Fatalf("order behind the preempted slow condition fired %d times within 2 passes, want 1 (cursor stuck on the slow order)", got)
+	}
+	if got := len(trackingBeads(t, store, "order-run:slow-condition")); got != 0 {
+		t.Fatalf("preempted slow condition admitted %d runs, want 0 (its check was killed, proves nothing)", got)
+	}
+}

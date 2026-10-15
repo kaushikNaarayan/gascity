@@ -1581,6 +1581,12 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) orde
 // reload runs on the supervisor tick goroutine) behind every condition
 // subprocess in the pass. The interrupted pass resumes on the next tick. Plain
 // dispatch-vs-dispatch serialization is unchanged.
+//
+// Known, accepted window (gcf-lo5u.3 O2): orderPassCancel is published just
+// after the pass takes orderDispatchMu, so a handoff that reads it in that gap
+// finds no pass to cancel and waits the pass out. The wait is bounded by the
+// pass's own condition-check deadline (check_timeout), self-corrects on the
+// next handoff, and cannot deadlock.
 func (cr *CityRuntime) lockOrderLaneForHandoff() {
 	cr.orderPassMu.Lock()
 	cancel := cr.orderPassCancel

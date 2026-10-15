@@ -711,6 +711,20 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		// instead of waiting out its (now operator-configurable) check_timeout.
 		triggerOpts.ConditionCtx = ctx
 		result := orders.CheckTriggerWithOptions(a, now, lastRunFn, m.ep, cursorFn, triggerOpts)
+		if ctx.Err() != nil && !result.Due && a.Trigger == "condition" {
+			// The pass was canceled (a reload/rescan handoff preempting the lane,
+			// or shutdown) while this condition check was running, so the check
+			// was killed and proves nothing. Move the rotation cursor past this
+			// order before stopping: a cut-short pass must still make progress,
+			// otherwise a slow condition sitting at the cursor plus reloads that
+			// arrive faster than its check time would restart every pass on the
+			// same order and starve everything behind it (gcf-lo5u.3 O1). The
+			// order is re-evaluated when the rotation comes back around.
+			if m.maxDispatchesPerTick > 0 {
+				m.nextDispatchStart = (idx + 1) % total
+			}
+			return
+		}
 		if lastRunErr != nil {
 			logDispatchError(m.stderr, "gc: order dispatch: reading last run for %s: %v", a.ScopedName(), lastRunErr)
 			continue
