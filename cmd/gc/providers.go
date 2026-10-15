@@ -46,7 +46,7 @@ func loadSessionProviderContext() sessionProviderContext {
 		providerName: os.Getenv("GC_SESSION"),
 	}
 	if cp, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cp, io.Discard); err == nil {
+		if cfg, err := loadCityConfigShared(cp); err == nil {
 			return sessionProviderContextForCity(cfg, cp, ctx.providerName)
 		}
 	}
