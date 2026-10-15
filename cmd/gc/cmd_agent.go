@@ -37,20 +37,28 @@ func loadCityConfig(cityPath string, warningWriter ...io.Writer) (*config.City, 
 // filesystem implementation. Used by functions that take an fsys.FS parameter
 // for unit testing.
 func loadCityConfigFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) {
+	cfg, _, err := loadCityConfigFSWithProvenance(fs, tomlPath, warningWriter...)
+	return cfg, err
+}
+
+// loadCityConfigFSWithProvenance is loadCityConfigFS that also returns the
+// load's Provenance (the config source files it read), for callers that need to
+// know which files a loaded config depends on.
+func loadCityConfigFSWithProvenance(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, *config.Provenance, error) {
 	if err := ensureBuiltinPacksForConfigLoad(fs, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	emitLoadCityConfigWarnings(resolveLoadCityConfigWarningWriter(warningWriter...), prov)
 	warnMissingRequiredBuiltinImports(fs, cfg, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...))
 	if err := validatePackRuntimeRegistrations(cfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	applyFeatureFlags(cfg)
-	return cfg, nil
+	return cfg, prov, nil
 }
 
 // loadCityConfigWithoutBuiltinPackRefreshFS loads config using builtin packs
@@ -623,6 +631,7 @@ func cmdAgentAdd(name, promptTemplate, dir string, suspended bool, stdout, stder
 // checks for duplicates, and writes a v2 agent scaffold under agents/<name>/.
 // Accepts an injected FS for testability.
 func doAgentAdd(fs fsys.FS, cityPath, name, promptTemplate, dir string, suspended bool, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	packPath := filepath.Join(cityPath, "pack.toml")
 	if _, err := fs.Stat(packPath); err != nil {
@@ -898,6 +907,7 @@ func doAgentResume(fs fsys.FS, cityPath, name string, stdout, stderr io.Writer) 
 //   - Pack-declared [[agent]] (city.toml or pack.toml): tell the user
 //     to use [[patches]].
 func doAgentSuspendOrResume(fs fsys.FS, cityPath, name string, suspended bool, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	verb, past := "suspend", "Suspended"
 	if !suspended {
 		verb, past = "resume", "Resumed"

@@ -637,6 +637,7 @@ func importSvcDeps() importsvc.Deps {
 
 //nolint:unparam // keep fs injectable for parity with the other import helpers and direct tests.
 func doImportAdd(fs fsys.FS, cityPath, source, nameOverride, versionFlag string, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	res, err := importsvc.AddImportWith(fs, cityPath, source, nameOverride, versionFlag, importSvcDeps())
 	if err != nil {
 		fmt.Fprintln(stderr, importAddErrorLine(source, nameOverride, err)) //nolint:errcheck
@@ -674,6 +675,7 @@ func importAddErrorLine(source, nameOverride string, err error) string {
 
 //nolint:unparam // FS seam is intentional for command tests and symmetry with doImportAdd.
 func doImportRemove(fs fsys.FS, cityPath, name string, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	res, err := importsvc.RemoveImportWith(fs, cityPath, name, importSvcDeps())
 	if err != nil {
 		// Failures during the lock-sync/save tail carry the name; earlier scope
@@ -690,6 +692,7 @@ func doImportRemove(fs fsys.FS, cityPath, name string, stdout, stderr io.Writer)
 }
 
 func doImportInstall(cityPath string, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	allImports, err := collectAllImportsFS(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc import install: %v\n", err) //nolint:errcheck
@@ -763,6 +766,7 @@ func writeImportCheckIssues(w io.Writer, issues []packman.CheckIssue) {
 }
 
 func doImportUpgrade(cityPath, target string, stdout, stderr io.Writer) int {
+	defer invalidateSharedCityConfig(cityPath)
 	scope, err := loadImportScopeFS(fsys.OSFS{}, cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc import upgrade: %v\n", err) //nolint:errcheck
