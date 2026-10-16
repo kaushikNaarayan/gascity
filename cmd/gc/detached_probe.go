@@ -98,16 +98,6 @@ func probeDetachedWorkWithTimeout(ctx context.Context, spec string, timeout time
 	return detachedProbeResult{Status: detachedProbeAlive, Spec: parsed}
 }
 
-func incrementDetachedProbeErrorCount(id string) int {
-	detachedProbeErrorCounts.Lock()
-	defer detachedProbeErrorCounts.Unlock()
-	if detachedProbeErrorCounts.byBead == nil {
-		detachedProbeErrorCounts.byBead = make(map[string]int)
-	}
-	detachedProbeErrorCounts.byBead[id]++
-	return detachedProbeErrorCounts.byBead[id]
-}
-
 func clearDetachedProbeErrorCount(id string) {
 	detachedProbeErrorCounts.Lock()
 	defer detachedProbeErrorCounts.Unlock()

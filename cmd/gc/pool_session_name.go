@@ -169,6 +169,7 @@ func releaseOrphanedPoolAssignments(
 		// probe below reads the same store; the missing-store report stays where
 		// it was, so a bead skipped by a liveness gate never reaches it.
 		ownerStore := assignedWorkOwnerStore(cfg, store, rigStores, assignedWorkStores, i, wb)
+		clearDetached := false
 		if assignee == "" {
 			if wb.Status != "in_progress" {
 				continue
@@ -198,6 +199,18 @@ func releaseOrphanedPoolAssignments(
 			if ownerStore != nil && liveOpenSessionAssignmentExists(ownerStore, assignee) {
 				continue
 			}
+			// An absent local session is not evidence that a non-empty holder on
+			// another host is dead. Reclaim an assigned work bead only when a
+			// durable closed session bead or its detached probe positively confirms
+			// death; errors and unknown probe states deliberately leave the claim
+			// untouched.
+			confirmedSessionDead := closedSessionAssignmentExists(store, assignee) ||
+				(ownerStore != nil && ownerStore != store && closedSessionAssignmentExists(ownerStore, assignee))
+			allowsRelease, confirmedDetachedDead := detachedProbeAllowsOrphanRelease(wb)
+			if !allowsRelease || (!confirmedSessionDead && !confirmedDetachedDead) {
+				continue
+			}
+			clearDetached = confirmedDetachedDead
 		}
 
 		if ownerStore == nil {
@@ -209,9 +222,12 @@ func releaseOrphanedPoolAssignments(
 		if !liveWorkAssignmentStillReleasable(ownerStore, wb.ID, wb.Status, assignee) {
 			continue
 		}
-		allowsRelease, clearDetached := detachedProbeAllowsOrphanRelease(wb)
-		if !allowsRelease {
-			continue
+		if assignee == "" {
+			allowsRelease, detachedDead := detachedProbeAllowsOrphanRelease(wb)
+			if !allowsRelease {
+				continue
+			}
+			clearDetached = detachedDead
 		}
 		if !releaseOrphanedPoolAssignment(ownerStore, wb, clearDetached) {
 			continue
@@ -243,7 +259,14 @@ func detachedProbeAllowsOrphanRelease(wb beads.Bead) (bool, bool) {
 		return true, false
 	}
 
-	result := probeDetachedWork(context.Background(), spec)
+	return detachedProbeResultAllowsOrphanRelease(wb, spec, probeDetachedWork(context.Background(), spec))
+}
+
+// detachedProbeResultAllowsOrphanRelease accepts only an affirmative dead
+// result. Probe failures are intentionally fail-closed forever: a broken or
+// unknown remote probe must never be promoted into evidence that its holder
+// has stopped.
+func detachedProbeResultAllowsOrphanRelease(wb beads.Bead, spec string, result detachedProbeResult) (bool, bool) {
 	switch result.Status {
 	case detachedProbeAlive:
 		clearDetachedProbeErrorCount(wb.ID)
@@ -254,22 +277,13 @@ func detachedProbeAllowsOrphanRelease(wb beads.Bead) (bool, bool) {
 		log.Printf("releaseOrphanedPoolAssignments: releasing %s: detached probe dead: %s", wb.ID, spec)
 		return true, true
 	case detachedProbeError, detachedProbeTimeout:
-		count := incrementDetachedProbeErrorCount(wb.ID)
-		if count < detachedProbeErrorThreshold {
-			log.Printf("releaseOrphanedPoolAssignments: detached probe %s for %s: %v (error %d/%d)", result.Status, wb.ID, result.Err, count, detachedProbeErrorThreshold)
-			return false, false
-		}
 		clearDetachedProbeErrorCount(wb.ID)
-		log.Printf("releaseOrphanedPoolAssignments: releasing %s: detached probe %s after %d errors: %v", wb.ID, result.Status, count, result.Err)
-		return true, true
+		log.Printf("releaseOrphanedPoolAssignments: skipping release: detached probe %s for %s: %v", result.Status, wb.ID, result.Err)
+		return false, false
 	default:
-		count := incrementDetachedProbeErrorCount(wb.ID)
-		if count < detachedProbeErrorThreshold {
-			log.Printf("releaseOrphanedPoolAssignments: detached probe unknown result for %s: %q (error %d/%d)", wb.ID, result.Status, count, detachedProbeErrorThreshold)
-			return false, false
-		}
 		clearDetachedProbeErrorCount(wb.ID)
-		return true, true
+		log.Printf("releaseOrphanedPoolAssignments: skipping release: detached probe unknown result for %s: %q", wb.ID, result.Status)
+		return false, false
 	}
 }
 
@@ -606,6 +620,28 @@ func liveSessionBeadExistsByIdentity(store beads.Store, assignee string) bool {
 		}
 		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
 			if assignee == candidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// closedSessionAssignmentExists reports a direct, durable proof that assignee
+// belonged to a session bead which is now closed. A lookup miss or error is
+// deliberately inconclusive: another host can own a session that this store
+// cannot observe, so callers must preserve the assignment in that case.
+func closedSessionAssignmentExists(store beads.Store, assignee string) bool {
+	if store == nil {
+		return false
+	}
+	for _, id := range directSessionBeadIDCandidates(assignee) {
+		sb, err := store.Get(id)
+		if err != nil || sb.Status != "closed" || !isSessionBead(sb) {
+			continue
+		}
+		for _, identity := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == identity {
 				return true
 			}
 		}

@@ -125,6 +125,7 @@ func TestReleaseOrphanedPoolAssignmentsReleasesWhenNoStoreHoldsTheSession(t *tes
 	if work, err = ownerStore.Get(work.ID); err != nil {
 		t.Fatalf("reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, ownerStore, work)
 
 	released := releaseOrphanedPoolAssignments(
 		primaryStore,
