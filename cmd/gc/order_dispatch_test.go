@@ -10546,12 +10546,12 @@ func TestOrderDispatchOldestDueAgeIsLatenessAgainstScheduledFire(t *testing.T) {
 func TestOrderDispatchPreemptedConditionAdvancesCursorPastSlowOrder(t *testing.T) {
 	store := beads.NewMemStore()
 	dir := t.TempDir()
-	started := filepath.Join(dir, "slow-check-started")
+	started := newCheckStartedSignal(t, dir, "slow-check-started")
 	aa := []orders.Order{
 		{
 			Name:         "slow-condition",
 			Trigger:      "condition",
-			Check:        fmt.Sprintf("touch %q; sleep 60", started),
+			Check:        started.shell() + "; sleep 60",
 			CheckTimeout: "120s",
 			Exec:         "true",
 			NoWorkGate:   true,
@@ -10567,15 +10567,7 @@ func TestOrderDispatchPreemptedConditionAdvancesCursorPastSlowOrder(t *testing.T
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go func() {
-			deadline := time.Now().Add(10 * time.Second)
-			for time.Now().Before(deadline) {
-				if _, err := os.Stat(started); err == nil {
-					_ = os.Remove(started)
-					cancel()
-					return
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
+			started.wait(10 * time.Second)
 			cancel()
 		}()
 		m.dispatch(ctx, dir, time.Now())

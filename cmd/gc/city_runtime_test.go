@@ -7916,11 +7916,11 @@ func TestWarnIfClosedOrderTrackingBacklogLarge_CountsStoresTogether(t *testing.T
 func TestOrderLaneHandoffPreemptsSlowConditionCheck(t *testing.T) {
 	store := beads.NewMemStore()
 	dir := t.TempDir()
-	started := filepath.Join(dir, "check-started")
+	started := newCheckStartedSignal(t, dir, "check-started")
 	slow := []orders.Order{{
 		Name:         "slow-condition",
 		Trigger:      "condition",
-		Check:        fmt.Sprintf("touch %q; sleep 60", started),
+		Check:        started.shell() + "; sleep 60",
 		CheckTimeout: "120s",
 		Exec:         "true",
 		NoWorkGate:   true,
@@ -7931,15 +7931,8 @@ func TestOrderLaneHandoffPreemptsSlowConditionCheck(t *testing.T) {
 
 	passDone := make(chan struct{})
 	go func() { cr.dispatchOrders(context.Background(), dir); close(passDone) }()
-	deadline := time.Now().Add(testutil.GoroutineRaceTimeout)
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("slow condition check never started")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if !started.wait(testutil.GoroutineRaceTimeout) {
+		t.Fatal("slow condition check never started")
 	}
 
 	// Negative control: the lane really is held for the duration of the check.
