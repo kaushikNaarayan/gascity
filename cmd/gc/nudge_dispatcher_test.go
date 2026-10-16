@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -663,5 +664,174 @@ func TestEnqueuePingsWakeSocket(t *testing.T) {
 	case <-wakeCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("wakeCh not signaled after enqueue")
+	}
+}
+
+// blockingIsRunningProvider wraps the fake provider and blocks IsRunning for
+// one session until released, simulating a wedged pane (gcf-eln5).
+type blockingIsRunningProvider struct {
+	*runtime.Fake
+	blockName string
+	release   chan struct{}
+	entered   chan struct{}
+	returned  chan struct{} // receives one value each time the blocked probe returns
+}
+
+func (p *blockingIsRunningProvider) IsRunning(name string) bool {
+	if name == p.blockName {
+		select {
+		case p.entered <- struct{}{}:
+		default:
+		}
+		<-p.release
+		running := p.Fake.IsRunning(name)
+		select {
+		case p.returned <- struct{}{}:
+		default:
+		}
+		return running
+	}
+	return p.Fake.IsRunning(name)
+}
+
+func startNudgeTestSession(t *testing.T, dir string, mgr *session.Manager, template string) session.Info {
+	t.Helper()
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: template, Title: template, Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create %s: %v", template, err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start %s: %v", template, err)
+	}
+	return info
+}
+
+// A wedged target must not hold the dispatcher pass: the healthy target is
+// still delivered within the bound, the wedged one is reported "timeout", and
+// a later tick skips it as "in-flight" instead of launching a second
+// concurrent pane call (gcf-eln5).
+func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT", "1s")
+	t.Setenv("GC_DEBUG", "1")
+	dir := t.TempDir()
+
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store.Store, fake, nil)
+	slow := startNudgeTestSession(t, dir, mgr, "slow")
+	fast := startNudgeTestSession(t, dir, mgr, "fast")
+	fake.Activity = map[string]time.Time{
+		slow.SessionName: time.Now().Add(-10 * time.Second),
+		fast.SessionName: time.Now().Add(-10 * time.Second),
+	}
+	for _, agent := range []string{"slow", "fast"} {
+		if err := enqueueQueuedNudge(dir, newQueuedNudge(agent, "ping "+agent, time.Now().Add(-time.Minute))); err != nil {
+			t.Fatalf("enqueueQueuedNudge %s: %v", agent, err)
+		}
+	}
+	snapshot, err := loadSessionBeadSnapshot(store.Store)
+	if err != nil {
+		t.Fatalf("loadSessionBeadSnapshot: %v", err)
+	}
+	sp := &blockingIsRunningProvider{Fake: fake, blockName: slow.SessionName, release: make(chan struct{}), entered: make(chan struct{}, 4), returned: make(chan struct{}, 4)}
+	released := false
+	releaseSlow := func() {
+		if !released {
+			released = true
+			close(sp.release)
+		}
+	}
+	t.Cleanup(releaseSlow)
+
+	var out strings.Builder
+	start := time.Now()
+	delivered, _ := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, sp, snapshot, &out)
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("pass took %s with one wedged target; want it bounded near the 1s target timeout", elapsed)
+	}
+	if delivered != 1 {
+		t.Fatalf("delivered = %d, want 1 (healthy target served despite the wedged one); out=%q slow=%s fast=%s", delivered, out.String(), slow.SessionName, fast.SessionName)
+	}
+	if !strings.Contains(out.String(), "timeout") {
+		t.Fatalf("debug output %q lacks a timeout skip for the wedged target", out.String())
+	}
+
+	// Second tick: the wedged probe is still running, so it must be skipped
+	// outright (single-flight) and return immediately.
+	out.Reset()
+	start = time.Now()
+	_, _ = dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, sp, snapshot, &out)
+	if e := time.Since(start); e > 100*time.Millisecond {
+		t.Fatalf("second pass took %s; want an immediate in-flight skip", e)
+	}
+	if !strings.Contains(out.String(), "in-flight") {
+		t.Fatalf("second pass output %q lacks in-flight skip", out.String())
+	}
+	if n := len(sp.entered); n != 1 {
+		t.Fatalf("wedged target entered %d times, want exactly 1 concurrent call", n)
+	}
+
+	// Late completion delivers and frees the flight: eventual convergence.
+	releaseSlow()
+	select {
+	case <-sp.returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wedged probe never returned after release")
+	}
+	// The dispatcher drops the flight right after the probe returns; yield
+	// (no sleep) until that lands.
+	deadline := time.Now().Add(5 * time.Second)
+	freed := false
+	for time.Now().Before(deadline) {
+		if acquireProbeFlight("nudge-dispatch:" + slow.SessionName) {
+			releaseProbeFlight("nudge-dispatch:" + slow.SessionName)
+			freed = true
+			break
+		}
+		goruntime.Gosched()
+	}
+	if !freed {
+		t.Fatal("flight for the wedged target was never released after it returned")
+	}
+
+	// No duplicate delivery (gcf-3jul): across the timeout tick, the in-flight
+	// tick and the late completion, the wedged target's nudge is delivered
+	// exactly once and the healthy target's exactly once.
+	nudges := map[string]int{}
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" {
+			nudges[call.Name]++
+		}
+	}
+	if nudges[fast.SessionName] != 1 {
+		t.Fatalf("healthy target nudged %d times, want 1 (calls: %v)", nudges[fast.SessionName], nudges)
+	}
+	if nudges[slow.SessionName] > 1 {
+		t.Fatalf("wedged target nudged %d times, want at most 1 (no re-delivery while a prior attempt is unconfirmed)", nudges[slow.SessionName])
+	}
+}
+
+func TestParseNudgeDispatchTargetTimeout(t *testing.T) {
+	var buf strings.Builder
+	t.Setenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT", "")
+	if got := parseNudgeDispatchTargetTimeout(&buf); got != nudgeDispatchTargetTimeoutDefault {
+		t.Fatalf("unset = %s, want default", got)
+	}
+	t.Setenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT", "2s")
+	if got := parseNudgeDispatchTargetTimeout(&buf); got != 2*time.Second {
+		t.Fatalf("valid = %s, want 2s", got)
+	}
+	t.Setenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT", "1ms")
+	if got := parseNudgeDispatchTargetTimeout(&buf); got != nudgeDispatchTargetTimeoutFloor {
+		t.Fatalf("below floor = %s, want floor", got)
+	}
+	t.Setenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT", "bogus")
+	if got := parseNudgeDispatchTargetTimeout(&buf); got != nudgeDispatchTargetTimeoutDefault {
+		t.Fatalf("invalid = %s, want default", got)
 	}
 }
