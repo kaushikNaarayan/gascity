@@ -24,6 +24,14 @@ type TriggerResult struct {
 	Reason string
 	// LastRun is the last execution time (zero if never run).
 	LastRun time.Time
+	// ScheduledAt is the instant this trigger was scheduled to fire, set only
+	// when Due and the trigger has a schedule: cooldown (LastRun+interval) and
+	// cron (the matched or oldest caught-up minute). now-ScheduledAt is how
+	// LATE the order is, which is what scheduler-health metrics must report
+	// (not time since the last run). Zero for triggers with no schedule
+	// (condition, event), for a never-run cooldown, and for a never-run cron's
+	// first catch-up (nothing was missed on a fresh order).
+	ScheduledAt time.Time
 }
 
 // LastRunFunc returns the last run time for a named order.
@@ -116,9 +124,10 @@ func checkCooldown(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult 
 	elapsed := now.Sub(last)
 	if elapsed >= interval {
 		return TriggerResult{
-			Due:     true,
-			Reason:  fmt.Sprintf("elapsed %s >= interval %s", elapsed.Round(time.Second), interval),
-			LastRun: last,
+			Due:         true,
+			Reason:      fmt.Sprintf("elapsed %s >= interval %s", elapsed.Round(time.Second), interval),
+			LastRun:     last,
+			ScheduledAt: last.Add(interval),
 		}
 	}
 
@@ -220,7 +229,7 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		if !last.IsZero() && sameWallMinute(last, now) {
 			return TriggerResult{Due: false, Reason: "cron: already run this minute", LastRun: last}
 		}
-		return TriggerResult{Due: true, Reason: "cron: schedule matched", LastRun: last}
+		return TriggerResult{Due: true, Reason: "cron: schedule matched", LastRun: last, ScheduledAt: now.Truncate(time.Minute)}
 	}
 
 	// (b) Catch-up: the current minute does not match, but a scheduled minute
@@ -258,10 +267,17 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		_, prevOff := prev.Zone()
 		_, tOff := t.Zone()
 		if tOff > prevOff && matchesInWallGap(matchesAt, prev, t) {
-			return TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
+			return TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last, ScheduledAt: t}
 		}
 		if matchesAt(t) && !sameWallMinute(last, t) {
-			return TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
+			res := TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last, ScheduledAt: t}
+			if last.IsZero() {
+				// A never-run order missed nothing: the 25h lookback exists only
+				// so a fresh narrow-window order can fire once. Reporting that
+				// occurrence as "late" would show up to a day of fake lateness.
+				res.ScheduledAt = time.Time{}
+			}
+			return res
 		}
 		prev = t
 	}

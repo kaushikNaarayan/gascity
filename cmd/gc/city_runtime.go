@@ -117,19 +117,31 @@ type CityRuntime struct {
 	buildFn                 func(*config.City, runtime.Provider, beads.Store) DesiredStateResult
 	buildFnWithSessionBeads func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult
 
-	dops                    drainOps
-	ct                      crashTracker
-	it                      idleTracker
-	mat                     maxSessionAgeTracker
-	adt                     assignedWorkDeferTracker
-	wg                      wispGC
-	od                      orderDispatcher
-	retiredOrderDispatchers []orderDispatcher
-	orderSet                []orders.Order
-	orderSetSignature       string
-	orderRescanEnabled      bool
-	orderRescanLast         time.Time
-	trace                   *sessionReconcilerTraceManager
+	dops            drainOps
+	ct              crashTracker
+	it              idleTracker
+	mat             maxSessionAgeTracker
+	adt             assignedWorkDeferTracker
+	wg              wispGC
+	orderDispatchMu sync.Mutex
+	// orderPassMu guards orderPassCancel, the cancel func of the dispatch pass
+	// currently holding orderDispatchMu. Handoff paths (reload, rescan, replace)
+	// call it before waiting for the lane so a slow condition subprocess cannot
+	// hold them for its whole check_timeout (gcf-lo5u.1).
+	orderPassMu     sync.Mutex
+	orderPassCancel context.CancelFunc
+	// orderDispatchLockAcquired is a test seam for proving cadence and patrol
+	// dispatch share one lane. Production leaves it nil.
+	orderDispatchLockAttempted func()
+	orderDispatchLockAcquired  func()
+	od                         orderDispatcher
+	retiredOrderDispatchers    []orderDispatcher
+	orderSet                   []orders.Order
+	orderSetSignature          string
+	orderRescanEnabled         bool
+	orderRescanLast            time.Time
+	orderCadenceTimer          func(time.Duration) (<-chan time.Time, func())
+	trace                      *sessionReconcilerTraceManager
 
 	orderSweepWatchdogLast             time.Time
 	orderTrackingRetentionWatchdogLast time.Time
@@ -733,6 +745,12 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	orderCadenceDone := make(chan struct{})
+	go func() {
+		defer close(orderCadenceDone)
+		cr.runOrderCadenceLoop(ctx, cityRoot)
+	}()
+	defer func() { <-orderCadenceDone }()
 	// Track pool instance liveness for death detection.
 	var prevPoolRunning map[string]bool
 	runTick := func(trigger string) {
@@ -849,6 +867,73 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+type orderCadencedDispatcher interface {
+	orderDispatchCadence() orderDispatchCadence
+}
+
+func dedicatedOrderDispatchInterval(od orderDispatcher) time.Duration {
+	cadenced, ok := od.(orderCadencedDispatcher)
+	if !ok {
+		return 0
+	}
+	return cadenced.orderDispatchCadence().interval
+}
+
+func realOrderCadenceTimer(delay time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(delay)
+	return timer.C, func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+}
+
+// runOrderCadenceLoop is independent of the supervisor select loop: a long
+// reconciliation cannot consume or coalesce its deadline. dispatchOrders is
+// serialized with reload/rescan by orderDispatchMu.
+func (cr *CityRuntime) runOrderCadenceLoop(ctx context.Context, cityRoot string) {
+	timerFn := cr.orderCadenceTimer
+	if timerFn == nil {
+		timerFn = realOrderCadenceTimer
+	}
+	for {
+		cr.orderDispatchMu.Lock()
+		interval := dedicatedOrderDispatchInterval(cr.od)
+		cr.orderDispatchMu.Unlock()
+		wait := interval
+		if wait <= 0 {
+			wait = minOrderDispatchInterval
+		}
+		tick, stop := timerFn(wait)
+		select {
+		case <-ctx.Done():
+			stop()
+			return
+		case <-tick:
+			stop()
+			if interval > 0 {
+				cr.safeTick(func() { cr.orderCadenceTick(ctx, cityRoot) }, "order-cadence")
+			}
+		}
+	}
+}
+
+func (cr *CityRuntime) orderCadenceTick(ctx context.Context, cityRoot string) {
+	if ctx.Err() != nil {
+		return
+	}
+	trace := cr.beginTraceCycle("order-cadence", "dedicated_order_scheduler", nil)
+	started := time.Now()
+	stats := cr.dispatchOrders(ctx, cityRoot)
+	if trace != nil {
+		trace.RecordControllerOperation(TraceSiteOrderDispatch, TraceReasonRetained, TraceOutcomeComplete, "dispatch_orders", time.Since(started), orderDispatchTraceFields(stats))
+		trace.end(TraceCompletionCompleted, traceRecordPayload{"phase": "order-cadence"})
 	}
 }
 
@@ -1177,8 +1262,8 @@ func (cr *CityRuntime) tick(
 	// but after the pressure gate and managed-Dolt preflight so skipped or
 	// endpoint-repair ticks do not add tracking writes first.
 	phaseStart = time.Now()
-	cr.dispatchOrders(ctx, cityRoot)
-	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, nil)
+	orderStats := cr.dispatchOrders(ctx, cityRoot)
+	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, orderDispatchTraceFields(orderStats))
 	if ctx.Err() != nil {
 		return
 	}
@@ -1456,32 +1541,97 @@ func (cr *CityRuntime) nudgeDispatchSessionSnapshot() *sessionBeadSnapshot {
 	return newSessionBeadSnapshotFromInfos(infos)
 }
 
-func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
+func orderDispatchTraceFields(stats orderDispatchStats) map[string]any {
+	return map[string]any{
+		"due_count": stats.DueCount, "admitted_count": stats.AdmittedCount,
+		"oldest_due_age_ms":    stats.OldestDueAge.Milliseconds(),
+		"dispatch_duration_ms": stats.Duration.Milliseconds(),
+	}
+}
+
+func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) orderDispatchStats {
+	if cr.orderDispatchLockAttempted != nil {
+		cr.orderDispatchLockAttempted()
+	}
+	cr.orderDispatchMu.Lock()
+	defer cr.orderDispatchMu.Unlock()
+	if cr.orderDispatchLockAcquired != nil {
+		cr.orderDispatchLockAcquired()
+	}
+	// The pass runs under a cancelable child context so a handoff waiting on
+	// the lane (lockOrderLaneForHandoff) can interrupt a slow condition check
+	// instead of waiting out its check_timeout.
+	passCtx, cancel := context.WithCancel(ctx)
+	cr.orderPassMu.Lock()
+	cr.orderPassCancel = cancel
+	cr.orderPassMu.Unlock()
+	defer func() {
+		cr.orderPassMu.Lock()
+		cr.orderPassCancel = nil
+		cr.orderPassMu.Unlock()
+		cancel()
+	}()
+	return cr.dispatchOrdersLocked(passCtx, cityRoot)
+}
+
+// lockOrderLaneForHandoff takes orderDispatchMu for a reload, rescan, or
+// dispatcher replacement. It first cancels the in-flight dispatch pass (if
+// any): a handoff changes the order set the pass is scanning, so finishing
+// the pass is worth nothing, while waiting on it would block the caller (the
+// reload runs on the supervisor tick goroutine) behind every condition
+// subprocess in the pass. The interrupted pass resumes on the next tick. Plain
+// dispatch-vs-dispatch serialization is unchanged.
+//
+// Known, accepted window (gcf-lo5u.3 O2): orderPassCancel is published just
+// after the pass takes orderDispatchMu, so a handoff that reads it in that gap
+// finds no pass to cancel and waits the pass out. The wait is bounded by the
+// pass's own condition-check deadline (check_timeout), self-corrects on the
+// next handoff, and cannot deadlock.
+func (cr *CityRuntime) lockOrderLaneForHandoff() {
+	cr.orderPassMu.Lock()
+	cancel := cr.orderPassCancel
+	cr.orderPassMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	cr.orderDispatchMu.Lock()
+}
+
+func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string) orderDispatchStats {
 	if ctx.Err() != nil {
-		return
+		return orderDispatchStats{}
 	}
 	now := time.Now()
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cr.serviceStateMu.RUnlock()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
 		cr.applyWispQueryIndexes(ctx)
 	}
-	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
+	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now, cfg)
 	cr.runOrderTrackingSweepWatchdog(now)
 	cr.runOrderTrackingRetentionWatchdog(now)
 	cr.runNudgeMailSweepWatchdog(now)
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
+		if observed, ok := cr.od.(interface{ lastOrderDispatchStats() orderDispatchStats }); ok {
+			return observed.lastOrderDispatchStats()
+		}
 	}
+	return orderDispatchStats{}
 }
 
-func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot string, now time.Time) {
+func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot string, now time.Time, cfg *config.City) {
 	if !cr.orderRescanEnabled || cr.tomlPath == "" || strings.TrimSpace(cityRoot) == "" {
 		return
 	}
 	if !cr.orderRescanLast.IsZero() && now.Sub(cr.orderRescanLast) < orderRescanInterval {
 		return
 	}
-	if _, _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cr.cfg, "gc patrol: order scan", now); err != nil {
+	// dispatchOrdersLocked owns orderDispatchMu, so rescan through the locked
+	// helper rather than recursively acquiring the non-reentrant mutex.
+	if _, _, err := cr.rescanOrderDispatcherLocked(ctx, cityRoot, cfg, "gc patrol: order scan", now); err != nil {
 		cr.orderRescanLast = now
 		logDispatchError(cr.stderr, "%s: order rescan: %v", cr.logPrefix, err)
 	}
@@ -1492,8 +1642,15 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 // so a rebuild (reload or rescan) reuses them instead of cold-starting (#3201).
 // Call after draining the outgoing dispatcher.
 func (cr *CityRuntime) replaceOrderDispatcher(next orderDispatcher) {
+	cr.lockOrderLaneForHandoff()
+	defer cr.orderDispatchMu.Unlock()
+	cr.replaceOrderDispatcherLocked(next)
+}
+
+func (cr *CityRuntime) replaceOrderDispatcherLocked(next orderDispatcher) {
 	if prev, ok := cr.od.(*memoryOrderDispatcher); ok {
 		if nextMem, ok := next.(*memoryOrderDispatcher); ok {
+			nextMem.carrySchedulingStateFrom(prev)
 			nextMem.carryLastRunCacheFrom(prev)
 			nextMem.carryGateBackoffFrom(prev, time.Now())
 		}
@@ -1502,6 +1659,12 @@ func (cr *CityRuntime) replaceOrderDispatcher(next orderDispatcher) {
 }
 
 func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
+	cr.lockOrderLaneForHandoff()
+	defer cr.orderDispatchMu.Unlock()
+	return cr.rescanOrderDispatcherLocked(ctx, cityRoot, cfg, cmdName, now)
+}
+
+func (cr *CityRuntime) rescanOrderDispatcherLocked(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1520,7 +1683,7 @@ func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot strin
 		cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
 		drainCancel()
 	}
-	cr.replaceOrderDispatcher(buildOrderDispatcherFromOrderSet(cr.storageRoutes, cityRoot, cfg, snapshot.Orders, cr.rec, cr.stderr))
+	cr.replaceOrderDispatcherLocked(buildOrderDispatcherFromOrderSet(cr.storageRoutes, cityRoot, cfg, snapshot.Orders, cr.rec, cr.stderr))
 	cr.orderSet = snapshot.Orders
 	cr.orderSetSignature = snapshot.Signature
 	if summary != "unchanged" {
@@ -2191,6 +2354,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	cr.wg = newWispGCForConfig(nextCfg)
 
+	// Build before taking the lane lock: filesystem scanning must not pause
+	// admission. The final drain and handoff are serialized with dispatch.
+	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
+	cr.lockOrderLaneForHandoff()
 	// Drain the outgoing dispatcher before replacing it so in-flight
 	// dispatchOne goroutines persist their tracking-bead outcomes against
 	// the store they were scheduled against. Reload runs on the same
@@ -2206,18 +2373,19 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
 		drainCancel()
 	}
-	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
 	orderSummary := orderSetChangeSummary(cr.orderSet, orderSnapshot.Orders)
-	cr.replaceOrderDispatcher(nextOD)
+	cr.replaceOrderDispatcherLocked(nextOD)
 	cr.orderSet = orderSnapshot.Orders
 	cr.orderSetSignature = orderSnapshot.Signature
 	cr.orderRescanLast = time.Now()
+	cr.orderDispatchMu.Unlock()
 	if orderSummary != "unchanged" {
 		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, orderSummary) //nolint:errcheck // best-effort stderr
 	}
 
 	cr.serviceStateMu.Lock()
 	cr.cfg = nextCfg
+	cr.configRev = result.Revision
 	cr.sp = nextSp
 	cr.dops = nextDops
 	cr.serviceStateMu.Unlock()
@@ -2256,7 +2424,6 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.sessionDrains = newDrainTracker()
 		cr.providerHealthGate = newProviderHealthGate()
 	}
-	cr.configRev = result.Revision
 	cr.watchTargets = config.WatchTargets(result.Prov, nextCfg, cityRoot)
 	cr.restartConfigWatcher()
 	if trace != nil {
@@ -3781,13 +3948,23 @@ func (cr *CityRuntime) beginTraceCycle(trigger, detail string, sessionBeads *ses
 	if cr.trace == nil {
 		return nil
 	}
+	// Cadence dispatch runs concurrently with reload. Snapshot the config and
+	// revision under the same lock used by reload so a trace never combines a
+	// new config with an old revision (and so -race sees no unsynchronized read).
+	cfg, revision := cr.traceConfigSnapshot()
 	info := sessionReconcilerTraceCycleInfo{
 		TickTrigger:    trigger,
 		TriggerDetail:  detail,
 		CityPath:       cr.cityPath,
-		ConfigRevision: cr.configRev,
+		ConfigRevision: revision,
 	}
-	return cr.trace.beginCycle(info, cr.cfg, sessionBeads)
+	return cr.trace.beginCycle(info, cfg, sessionBeads)
+}
+
+func (cr *CityRuntime) traceConfigSnapshot() (*config.City, string) {
+	cr.serviceStateMu.RLock()
+	defer cr.serviceStateMu.RUnlock()
+	return cr.cfg, cr.configRev
 }
 
 func (cr *CityRuntime) drainOutgoingOrderDispatcher(ctx context.Context, od orderDispatcher) {
