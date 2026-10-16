@@ -2499,7 +2499,13 @@ func (s *BdStore) List(query ListQuery) ([]Bead, error) {
 		return nil, fmt.Errorf("bd list: %w", ErrQueryRequiresScan)
 	}
 
-	found, err := s.listByTier(query)
+	var found []Bead
+	var err error
+	if query.Assignee == "" && len(query.Assignees) > 1 {
+		found, err = s.listPerAssignee(query)
+	} else {
+		found, err = s.listByTier(query)
+	}
 	// An unfiltered scan that came back empty is the one List shape whose
 	// emptiness is a claim about the STORE rather than about a predicate, so it
 	// is the only one that can reach the unread-store notice. The result is
@@ -2509,6 +2515,69 @@ func (s *BdStore) List(query ListQuery) ([]Bead, error) {
 		s.noticeIfStoreCannotSeeItsLedger("bd list")
 	}
 	return found, err
+}
+
+// listPerAssignee serves a multi-identity query (GC_SESSION_ID / GC_SESSION_NAME
+// / GC_ALIAS) with one server-side-filtered query per identity, merged by ID.
+// Passing several assignees to bd would force an unbounded whole-ledger list
+// filtered client-side (see bdServerQueryForAssignees); each sub-query here
+// carries --assignee so bd only returns that identity's rows. Every sub-query
+// keeps the caller's Limit and Sort, so the global first-N is contained in the
+// union of the per-identity first-N.
+func (s *BdStore) listPerAssignee(query ListQuery) ([]Bead, error) {
+	merged := make([]Bead, 0)
+	seen := make(map[string]struct{})
+	var errs []error
+	succeeded := 0
+	for _, assignee := range dedupeAssignees(query.Assignees) {
+		sub := query
+		sub.Assignee = assignee
+		sub.Assignees = nil
+		rows, err := s.listByTier(sub)
+		if err != nil {
+			errs = append(errs, err)
+			var partial *PartialResultError
+			if !errors.As(err, &partial) {
+				continue
+			}
+		}
+		succeeded++
+		for _, b := range rows {
+			if _, dup := seen[b.ID]; dup {
+				continue
+			}
+			seen[b.ID] = struct{}{}
+			merged = append(merged, b)
+		}
+	}
+	sortBeadsForQuery(merged, query.Sort)
+	if query.Limit > 0 && len(merged) > query.Limit {
+		merged = merged[:query.Limit]
+	}
+	switch {
+	case len(errs) == 0:
+		return merged, nil
+	case succeeded == 0:
+		return nil, errors.Join(errs...)
+	default:
+		return merged, &PartialResultError{Op: "bd list", Err: errors.Join(errs...)}
+	}
+}
+
+func dedupeAssignees(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, a := range in {
+		if a == "" {
+			continue
+		}
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out
 }
 
 // listByTier runs the query against bd. It is the body List wraps, so the

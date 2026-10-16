@@ -4500,37 +4500,58 @@ func TestBdStoreListAssigneesSingleUsesAssigneeFlag(t *testing.T) {
 	}
 }
 
-func TestBdStoreListAssigneesMultipleFallsBackToClientFilter(t *testing.T) {
-	var gotCmd string
+func TestBdStoreListAssigneesMultipleQueriesEachIdentityServerSide(t *testing.T) {
+	var cmds []string
 	runner := func(_, name string, args ...string) ([]byte, error) {
-		gotCmd = name + " " + strings.Join(args, " ")
-		if strings.Contains(gotCmd, "--assignee=") {
-			t.Fatalf("cmd = %q, multi-route Assignees must not emit a single --assignee", gotCmd)
+		cmd := name + " " + strings.Join(args, " ")
+		cmds = append(cmds, cmd)
+		if !strings.Contains(cmd, "--assignee=") {
+			t.Fatalf("cmd = %q, multi-identity List must not run a whole-ledger list", cmd)
 		}
-		if strings.Contains(gotCmd, "--limit 1") {
-			return []byte(`[{"id":"bd-route-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z"}]`), nil
+		switch {
+		case strings.Contains(cmd, "--assignee=route-a"):
+			return []byte(`[{"id":"bd-route-a","title":"m","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z"}]`), nil
+		case strings.Contains(cmd, "--assignee=route-b"):
+			return []byte(`[{"id":"bd-route-b","title":"m","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z"}]`), nil
 		}
-		return []byte(`[
-			{"id":"bd-route-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z"},
-			{"id":"bd-route-b","title":"message","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z"},
-			{"id":"bd-route-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z"}
-		]`), nil
+		t.Fatalf("cmd = %q, want a per-identity --assignee query", cmd)
+		return nil, nil
 	}
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.List(beads.ListQuery{
-		Assignees: []string{"route-a", "route-b"},
+		Assignees: []string{"route-a", "route-b", "route-a"},
 		Type:      "message",
 		Status:    "open",
 		Limit:     1,
+		Sort:      beads.SortCreatedAsc,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(gotCmd, "--limit 0") {
-		t.Fatalf("cmd = %q, want unlimited server query before multi-Assignees client filtering", gotCmd)
+	if len(cmds) != 2 {
+		t.Fatalf("cmds = %q, want exactly one query per distinct identity", cmds)
 	}
 	if len(got) != 1 || got[0].ID != "bd-route-b" {
-		t.Fatalf("got = %+v, want first matching route after client filter", got)
+		t.Fatalf("got = %+v, want the earliest-created match across identities, trimmed to Limit", got)
+	}
+}
+
+func TestBdStoreListAssigneesMultipleOneIdentityFailsReturnsPartial(t *testing.T) {
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		cmd := name + " " + strings.Join(args, " ")
+		if strings.Contains(cmd, "--assignee=route-a") {
+			return nil, errors.New("boom")
+		}
+		return []byte(`[{"id":"bd-route-b","title":"m","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z"}]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Assignees: []string{"route-a", "route-b"}, Status: "open"})
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("err = %v, want PartialResultError", err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-route-b" {
+		t.Fatalf("got = %+v, want the surviving identity's rows", got)
 	}
 }
 
@@ -4555,21 +4576,19 @@ func TestBdStoreListWispsAssigneesSingleUsesAssigneeClause(t *testing.T) {
 	}
 }
 
-func TestBdStoreListWispsAssigneesMultipleFallsBackToClientFilter(t *testing.T) {
-	var gotCmd string
+func TestBdStoreListWispsAssigneesMultipleQueriesEachIdentity(t *testing.T) {
+	var calls []string
 	runner := func(_, name string, args ...string) ([]byte, error) {
-		gotCmd = name + " " + strings.Join(args, " ")
-		if strings.Contains(gotCmd, "--assignee=") {
-			t.Fatalf("cmd = %q, multi-route Assignees must not emit one --assignee", gotCmd)
+		cmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, cmd)
+		switch {
+		case strings.Contains(cmd, "route-a"):
+			return []byte(`[{"id":"bd-wisp-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z","ephemeral":true}]`), nil
+		case strings.Contains(cmd, "route-b"):
+			return []byte(`[{"id":"bd-wisp-b","title":"message","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z","ephemeral":true}]`), nil
 		}
-		if strings.Contains(gotCmd, "--limit 1") {
-			return []byte(`[{"id":"bd-wisp-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z","ephemeral":true}]`), nil
-		}
-		return []byte(`[
-			{"id":"bd-wisp-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
-			{"id":"bd-wisp-b","title":"message","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z","ephemeral":true},
-			{"id":"bd-wisp-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z","ephemeral":true}
-		]`), nil
+		t.Fatalf("cmd = %q, want a per-identity query", cmd)
+		return nil, nil
 	}
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.List(beads.ListQuery{
@@ -4577,16 +4596,14 @@ func TestBdStoreListWispsAssigneesMultipleFallsBackToClientFilter(t *testing.T) 
 		Type:      "message",
 		Status:    "open",
 		Limit:     1,
+		Sort:      beads.SortCreatedAsc,
 		TierMode:  beads.TierWisps,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(gotCmd, "--limit 0") {
-		t.Fatalf("cmd = %q, want unlimited server query before multi-Assignees client filtering", gotCmd)
-	}
 	if len(got) != 1 || got[0].ID != "bd-wisp-b" {
-		t.Fatalf("got = %+v, want first matching wisp after client filter", got)
+		t.Fatalf("got = %+v, want earliest-created wisp across identities, trimmed to Limit", got)
 	}
 }
 
