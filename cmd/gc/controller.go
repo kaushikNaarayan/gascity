@@ -779,6 +779,13 @@ func watchConfigTargets(targets []config.WatchTarget, dirty *atomic.Bool, pokeCh
 	}
 	registrar := newConfigWatchRegistrar(watcher, stderr)
 
+	// Capture the coalesce window once, here, rather than reading the package
+	// variable from the event goroutine on every event: tests overwrite
+	// debounceDelay while a watcher from an earlier test can still be running,
+	// which raced under -race (gcf-tlrzz). Production never writes the variable,
+	// so behavior there is unchanged.
+	debounce := debounceDelay
+
 	markDirty := func() {
 		dirty.Store(true)
 		if pokeCh != nil {
@@ -831,10 +838,10 @@ func watchConfigTargets(targets []config.WatchTarget, dirty *atomic.Bool, pokeCh
 	}
 	go func() {
 		defer close(eventLoopDone)
-		var debounce *time.Timer
+		var debounceTimer *time.Timer
 		defer func() {
-			if debounce != nil {
-				debounce.Stop()
+			if debounceTimer != nil {
+				debounceTimer.Stop()
 			}
 		}()
 		for {
@@ -859,10 +866,10 @@ func watchConfigTargets(targets []config.WatchTarget, dirty *atomic.Bool, pokeCh
 					}
 				}
 				// Debounce: reset timer on each event, fire after quiet period.
-				if debounce != nil {
-					debounce.Stop()
+				if debounceTimer != nil {
+					debounceTimer.Stop()
 				}
-				debounce = time.AfterFunc(debounceDelay, func() {
+				debounceTimer = time.AfterFunc(debounce, func() {
 					markDirty()
 				})
 			case _, ok := <-watcher.Errors:
