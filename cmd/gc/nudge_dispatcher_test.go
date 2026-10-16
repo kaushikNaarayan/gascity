@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -673,6 +674,7 @@ type blockingIsRunningProvider struct {
 	blockName string
 	release   chan struct{}
 	entered   chan struct{}
+	returned  chan struct{} // receives one value each time the blocked probe returns
 }
 
 func (p *blockingIsRunningProvider) IsRunning(name string) bool {
@@ -682,6 +684,12 @@ func (p *blockingIsRunningProvider) IsRunning(name string) bool {
 		default:
 		}
 		<-p.release
+		running := p.Fake.IsRunning(name)
+		select {
+		case p.returned <- struct{}{}:
+		default:
+		}
+		return running
 	}
 	return p.Fake.IsRunning(name)
 }
@@ -729,7 +737,7 @@ func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSessionBeadSnapshot: %v", err)
 	}
-	sp := &blockingIsRunningProvider{Fake: fake, blockName: slow.SessionName, release: make(chan struct{}), entered: make(chan struct{}, 4)}
+	sp := &blockingIsRunningProvider{Fake: fake, blockName: slow.SessionName, release: make(chan struct{}), entered: make(chan struct{}, 4), returned: make(chan struct{}, 4)}
 	released := false
 	releaseSlow := func() {
 		if !released {
@@ -770,6 +778,13 @@ func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
 
 	// Late completion delivers and frees the flight: eventual convergence.
 	releaseSlow()
+	select {
+	case <-sp.returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wedged probe never returned after release")
+	}
+	// The dispatcher drops the flight right after the probe returns; yield
+	// (no sleep) until that lands.
 	deadline := time.Now().Add(5 * time.Second)
 	freed := false
 	for time.Now().Before(deadline) {
@@ -778,7 +793,7 @@ func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
 			freed = true
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		goruntime.Gosched()
 	}
 	if !freed {
 		t.Fatal("flight for the wedged target was never released after it returned")
