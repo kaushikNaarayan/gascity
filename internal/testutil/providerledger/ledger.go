@@ -326,7 +326,9 @@ func provedRuntimeScoped(constructor SymbolRef, file, test, scope string, allowe
 
 // runtimeWaiverExpiry dates every remaining runtime.Provider waiver owned by
 // runtimeContractWaiverOwner. This is the THIRD lapse-and-renewal, not the
-// second: 2026-08-12, then 2026-08-26, and now this one. Each gap was
+// second: 2026-08-12, then 2026-08-26, then 2026-10-06, and now 2026-11-15
+// (Kaushik via mayor, 16 Oct 2026: renew with a deadline, then retire; the
+// retire bead is gcf-mgwb7, owned by gascity pm, due before 2026-11-10). Each gap was
 // re-checked against cmd/gc/runtime_registry.go: all eight constructors are
 // still live registrations (exec and ssh register via
 // RegisterPrefix("exec:"/"ssh:", ...) rather than by bare name — a plain name
@@ -346,7 +348,7 @@ func provedRuntimeScoped(constructor SymbolRef, file, test, scope string, allowe
 // can be retired instead of renewed a fourth time, and making the owner
 // routable with a pre-expiry warning (gcf-a4o8) so the next lapse reaches
 // someone before it reds main. Escalate to those, not to another renewal.
-var runtimeWaiverExpiry = time.Date(2026, time.October, 6, 0, 0, 0, 0, time.UTC)
+var runtimeWaiverExpiry = time.Date(2026, time.November, 15, 0, 0, 0, 0, time.UTC)
 
 func waivedRuntime(constructor SymbolRef, reason string) ContractClaim {
 	return ContractClaim{
