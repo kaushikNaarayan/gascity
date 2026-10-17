@@ -205,6 +205,9 @@ type CityRuntime struct {
 	pokeCh              chan struct{}                // non-blocking signal to trigger immediate reconciler tick
 	controlDispatcherCh chan struct{}                // non-blocking signal for control-dispatcher-only reconcile
 	nudgeWakeCh         chan struct{}                // signal to dispatch queued nudges; fed by wake socket listener
+	nudgeRetryMu        sync.Mutex                   // guards nudgeRetryTimer and nudgeRetryDelay
+	nudgeRetryTimer     *time.Timer                  // pending re-arm of the nudge dispatcher (gcf-adu3i)
+	nudgeRetryDelay     time.Duration                // current retry backoff; 0 = not retrying
 	reloadMu            sync.Mutex                   // guards activeReload
 	activeReload        *reloadRequest
 	onStarted           func()
@@ -763,9 +766,16 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		// previous value on exit so nested ticks don't lose context.
 		prev := beads.SetReconcilerTickTrigger(trigger)
 		defer beads.RestoreReconcilerTickTrigger(prev)
+		tickStart := time.Now()
 		cr.safeTick(func() {
 			cr.tick(ctx, dirty, &lastProviderName, cityRoot, &prevPoolRunning, trigger)
 		}, trigger)
+		// A long tick blocks this select loop, so every wake (nudge dispatch included)
+		// waits behind it. Surface that (gcf-adu3i: is the loop starved by patrol ticks?).
+		if d := time.Since(tickStart); d > slowTickLogThreshold {
+			fmt.Fprintf(cr.stderr, "%s: slow tick trigger=%s elapsed=%s (event loop blocked)\n", //nolint:errcheck // best-effort stderr
+				cr.logPrefix, trigger, d.Round(time.Millisecond))
+		}
 	}
 	if dirty.Load() {
 		runTick("startup-poke")
@@ -936,6 +946,10 @@ func (cr *CityRuntime) orderCadenceTick(ctx context.Context, cityRoot string) {
 		trace.end(TraceCompletionCompleted, traceRecordPayload{"phase": "order-cadence"})
 	}
 }
+
+// slowTickLogThreshold is the tick duration above which the run loop logs that it
+// was blocked.
+const slowTickLogThreshold = 5 * time.Second
 
 // safeTick runs fn with panic recovery. A panic inside fn is logged to
 // stderr and swallowed so the reconciler loop can continue to the next
@@ -3357,6 +3371,11 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 	if !nudgeDispatcherIsSupervisor(cr.cfg) {
 		return
 	}
+	delivered := 0
+	// Whatever happens below, if due items are still queued afterwards (a seat was
+	// mid-turn when the pass ran, so the quiescence gate refused it), re-arm: without
+	// this nothing retries until an unrelated enqueue or the patrol tick (gcf-adu3i).
+	defer func() { cr.scheduleNudgeRetry(delivered) }()
 	// Nudge ops route through the nudges accessor; the session snapshot it pairs
 	// them with is loaded via the sessions accessor inside loadSessionBeadSnapshot.
 	// Both collapse to the city store today.
@@ -3368,9 +3387,56 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 	if sessionBeads == nil {
 		return
 	}
-	if _, err := dispatchAllQueuedNudges(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr); err != nil {
+	n, err := dispatchAllQueuedNudges(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr)
+	delivered = n
+	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
+}
+
+// Retry backoff for due-but-undelivered nudges. Vars (not consts) so tests can
+// shrink them.
+var (
+	nudgeRetryInitialDelay = 5 * time.Second
+	nudgeRetryMaxDelay     = 60 * time.Second
+)
+
+// scheduleNudgeRetry re-arms the dispatcher after a pass that left due items in the
+// queue. The timer feeds nudgeWakeCh, so the existing select case runs the next pass:
+// no new loop arm. Backoff doubles from nudgeRetryInitialDelay to nudgeRetryMaxDelay
+// while passes make no progress and restarts on a delivery, so a permanently busy
+// target costs one cheap pass per nudgeRetryMaxDelay. Nothing is re-queued here:
+// the pass itself still claims each item exactly once.
+func (cr *CityRuntime) scheduleNudgeRetry(delivered int) {
+	cr.nudgeRetryMu.Lock()
+	defer cr.nudgeRetryMu.Unlock()
+	if cr.nudgeRetryTimer != nil {
+		cr.nudgeRetryTimer.Stop()
+		cr.nudgeRetryTimer = nil
+	}
+	if !queuedNudgesStillDue(cr.cityPath, time.Now()) {
+		cr.nudgeRetryDelay = 0
+		return
+	}
+	switch {
+	case delivered > 0 || cr.nudgeRetryDelay <= 0:
+		cr.nudgeRetryDelay = nudgeRetryInitialDelay
+	default:
+		cr.nudgeRetryDelay *= 2
+		if cr.nudgeRetryDelay > nudgeRetryMaxDelay {
+			cr.nudgeRetryDelay = nudgeRetryMaxDelay
+		}
+	}
+	wake := cr.nudgeWakeCh
+	if wake == nil {
+		return
+	}
+	cr.nudgeRetryTimer = time.AfterFunc(cr.nudgeRetryDelay, func() {
+		select {
+		case wake <- struct{}{}:
+		default: // a wake is already pending; it will run the pass
+		}
+	})
 }
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {

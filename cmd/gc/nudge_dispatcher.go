@@ -364,3 +364,32 @@ func dispatchNudgeTargetBounded(target nudgeTarget, store, sessStore beads.Store
 		return nudgeTargetResult{timedOut: true, bound: bound}
 	}
 }
+
+// queuedNudgesStillDue reports whether the queue holds an unexpired item that is due
+// for delivery now (or an in-flight item whose lease expired), i.e. work the next
+// dispatch pass could still do. Used to decide whether to re-arm the dispatcher after
+// a pass that delivered nothing for a busy seat. Any read error answers false: the
+// patrol tick remains the backstop.
+func queuedNudgesStillDue(cityPath string, now time.Time) bool {
+	if cityPath == "" {
+		return false
+	}
+	state, err := nudgequeue.LoadState(cityPath)
+	if err != nil {
+		return false
+	}
+	live := func(it nudgequeue.Item) bool {
+		return it.Agent != "" && (it.ExpiresAt.IsZero() || it.ExpiresAt.After(now))
+	}
+	for _, it := range state.Pending {
+		if live(it) && (it.DeliverAfter.IsZero() || !it.DeliverAfter.After(now)) {
+			return true
+		}
+	}
+	for _, it := range state.InFlight {
+		if live(it) && !it.LeaseUntil.IsZero() && it.LeaseUntil.Before(now) {
+			return true
+		}
+	}
+	return false
+}
