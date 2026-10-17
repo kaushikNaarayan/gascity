@@ -21,7 +21,13 @@ type listFailingNudgeDispatchStore struct {
 	listCalls int
 }
 
-func (s *listFailingNudgeDispatchStore) List(beads.ListQuery) ([]beads.Bead, error) {
+// List fails only the full session-bead list. The same store doubles as the
+// held nudges store, whose ack/claim bookkeeping lists nudge beads through it
+// (gcf-yhmym borrows it instead of opening a fresh one).
+func (s *listFailingNudgeDispatchStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if q.Type != session.BeadType && q.Label != session.LabelSession {
+		return s.Store.List(q)
+	}
 	s.listCalls++
 	return nil, errors.New("full session list must not run for exact fence")
 }
