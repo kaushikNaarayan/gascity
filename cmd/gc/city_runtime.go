@@ -3363,6 +3363,10 @@ func parseRFC3339Metadata(v string) (time.Time, bool) {
 	return t, true
 }
 
+// nudgeBudgetRewakeDelay spaces the follow-up pass after a budget-spent one so
+// the run loop services other wakes in between.
+const nudgeBudgetRewakeDelay = time.Second
+
 // nudgeDispatchTick runs one supervisor-side nudge dispatch pass. Called
 // from the main run loop on wake-socket signal and (belt-and-suspenders)
 // at the end of each patrol tick so a missed wake doesn't strand a queue
@@ -3387,10 +3391,23 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 	if sessionBeads == nil {
 		return
 	}
-	n, err := dispatchAllQueuedNudges(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr)
-	delivered = n
+	out, err := dispatchAllQueuedNudgesBudgeted(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr, parseNudgeDispatchTickBudget(cr.stderr))
+	delivered = out.Delivered
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v\n", cr.logPrefix, err) //nolint:errcheck
+	}
+	if out.Deferred > 0 {
+		// The pass spent its budget (gcf-bxwjo): finish the remaining targets on a
+		// later pass via the existing wake case, so the drain never holds the
+		// controller tick (startup included) for the whole queue.
+		fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: budget spent, %d target(s) deferred to next pass\n", cr.logPrefix, out.Deferred) //nolint:errcheck
+		wake := cr.nudgeWakeCh
+		time.AfterFunc(nudgeBudgetRewakeDelay, func() {
+			select {
+			case wake <- struct{}{}:
+			default: // a wake is already pending; it will run the pass
+			}
+		})
 	}
 }
 
