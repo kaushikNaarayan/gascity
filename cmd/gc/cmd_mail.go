@@ -550,13 +550,21 @@ var mailCheckAPIClient = func(cityPath string) (*api.Client, string) {
 // path because provider-backed mail may need to perform delivery side effects
 // after successful injection.
 // Emits exactly one route=... log line per exit path (gated on GC_DEBUG).
-func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *api.Client, nilReason string, stdout, stderr io.Writer) int {
+func routeMailCheck(cityPath string, args []string, inject bool, hookFormat string, c *api.Client, nilReason string, stdout, stderr io.Writer) int {
 	const cmdName = "mail check"
 	recipient := defaultMailIdentity()
 	if len(args) > 0 {
 		recipient = strings.TrimSpace(args[0])
 	}
 	if inject {
+		// Per-prompt fast path: a recent clean "no mail" answer for this seat
+		// is reused for a few seconds so back-to-back prompts do not each pay a
+		// supervisor probe plus a dolt query. Any mail, degraded notice or error
+		// is never cached, so new mail surfaces within the TTL at worst.
+		if mailCheckEmptyMarkerFresh(cityPath, recipient) {
+			logRoute(stderr, cmdName, "cache", "recent-empty")
+			return 0
+		}
 		if c != nil {
 			cr, err := c.ListMailInbox(recipient, "")
 			if err == nil {
@@ -578,7 +586,14 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 			}
 		}
 		logRoute(stderr, cmdName, "fallback", "inject-local-side-effects")
-		return doMailCheckFallback(args, inject, hookFormat, stdout, stderr)
+		// Only the local provider query is authoritative about an empty inbox:
+		// it either printed mail, printed an error, or answered silently.
+		out, errw := &countingWriter{target: stdout}, &countingWriter{target: stderr}
+		code := doMailCheckFallback(args, inject, hookFormat, out, errw)
+		if code == 0 && out.BytesWritten() == 0 && errw.BytesWritten() == 0 {
+			touchMailCheckEmptyMarker(cityPath, recipient)
+		}
+		return code
 	}
 	if c != nil {
 		cr, err := c.ListMailInbox(recipient, "")
