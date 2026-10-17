@@ -1396,7 +1396,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
 		return false, nil
 	}
-	items, err := claimDueQueuedNudgesForTarget(target.cityPath, target, time.Now())
+	items, err := claimDueQueuedNudgesForTargetWithStore(target.cityPath, target, time.Now(), store)
 	if err != nil || len(items) == 0 {
 		return false, err
 	}
@@ -1915,8 +1915,31 @@ func queuedNudgeClaimableForTarget(target nudgeTarget, item queuedNudge) bool {
 type nudgeMaintenanceStore struct {
 	cityPath string
 	opened   bool
+	// borrowed marks a store the caller owns and keeps open across ticks (the
+	// supervisor's long-lived nudges store). close never releases it, and
+	// ensureOpen never dials a second one: opening a fresh native store per
+	// dispatch tick leaked a sql.DB connectionOpener goroutine each time
+	// (gcf-bxwjo: 27,290 leaked after 42d).
+	borrowed bool
 	store    beads.NudgesStore
 	front    *nudgequeue.Store
+}
+
+// newBorrowedNudgeMaintenanceStore wraps a caller-owned store for the
+// maintenance passes. A nil store yields the lazy owning handle, so callers
+// without a store (the CLI poll) keep the open-on-first-need behavior.
+func newBorrowedNudgeMaintenanceStore(cityPath string, store beads.Store) nudgeMaintenanceStore {
+	if store == nil {
+		return nudgeMaintenanceStore{cityPath: cityPath}
+	}
+	nudges := beads.NudgesStore{Store: store}
+	return nudgeMaintenanceStore{
+		cityPath: cityPath,
+		opened:   true,
+		borrowed: true,
+		store:    nudges,
+		front:    nudgeFrontDoor(nudges),
+	}
 }
 
 // frontForState returns the front-door handle to use for the maintenance passes
@@ -1949,7 +1972,7 @@ func (m *nudgeMaintenanceStore) ensureOpen() beads.NudgesStore {
 // close releases the store this frame opened (if any). It never touches a
 // caller-passed store because this type only ever holds a store it opened.
 func (m *nudgeMaintenanceStore) close() error {
-	if !m.opened {
+	if !m.opened || m.borrowed {
 		return nil
 	}
 	return closeBeadStoreHandle(m.store.Store)
@@ -1968,9 +1991,25 @@ func claimDueQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time
 	})
 }
 
+// claimDueQueuedNudgesForTargetWithStore is claimDueQueuedNudgesForTarget for a
+// caller that already holds the nudges store (the supervisor dispatcher). The
+// maintenance passes reuse that handle instead of opening, and leaking, a new
+// one per claim.
+func claimDueQueuedNudgesForTargetWithStore(cityPath string, target nudgeTarget, now time.Time, store beads.Store) ([]queuedNudge, error) {
+	maint := newBorrowedNudgeMaintenanceStore(cityPath, store)
+	defer maint.close() //nolint:errcheck // best-effort
+	return claimDueQueuedNudgesMatchingWithMaint(cityPath, now, func(item queuedNudge) bool {
+		return queuedNudgeClaimableForTarget(target, item)
+	}, &maint)
+}
+
 func claimDueQueuedNudgesMatching(cityPath string, now time.Time, match func(queuedNudge) bool) ([]queuedNudge, error) {
 	maint := nudgeMaintenanceStore{cityPath: cityPath}
 	defer maint.close() //nolint:errcheck // best-effort
+	return claimDueQueuedNudgesMatchingWithMaint(cityPath, now, match, &maint)
+}
+
+func claimDueQueuedNudgesMatchingWithMaint(cityPath string, now time.Time, match func(queuedNudge) bool, maint *nudgeMaintenanceStore) ([]queuedNudge, error) {
 	var claimed []queuedNudge
 	err := withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
 		front := maint.frontForState(state)

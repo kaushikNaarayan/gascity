@@ -119,18 +119,62 @@ func startNudgeWakeListener(ctx context.Context, cityPath string, wakeCh chan<- 
 // into the persisted queue state's DispatchSkips regardless of debugOut, so
 // `gc nudge status` stays informative even with GC_DEBUG unset).
 func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer) (int, error) {
+	out, err := dispatchAllQueuedNudgesBudgeted(cityPath, cfg, store, sessStore, sp, sessionBeads, debugOut, 0)
+	return out.Delivered, err
+}
+
+// nudgeDispatchOutcome is one dispatcher pass's result. Deferred counts matched
+// targets the pass left for a later one because its time budget ran out.
+type nudgeDispatchOutcome struct {
+	Delivered int
+	Deferred  int
+}
+
+// nudgeDispatchTickBudgetDefault bounds one dispatcher pass as a whole
+// (gcf-bxwjo). The per-target bound alone still lets N wedged targets hold the
+// controller tick for N x 10s: the 18:39Z 16 Oct restart sat at
+// adopting_sessions for 15+ min draining 73 queued nudges serially.
+// GC_NUDGE_DISPATCH_TICK_BUDGET overrides it.
+const nudgeDispatchTickBudgetDefault = 15 * time.Second
+
+// parseNudgeDispatchTickBudget reads GC_NUDGE_DISPATCH_TICK_BUDGET fresh on every
+// call. Unset/invalid: the default. Below the per-target floor: the floor, so one
+// target always gets a chance per pass.
+func parseNudgeDispatchTickBudget(stderr io.Writer) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GC_NUDGE_DISPATCH_TICK_BUDGET"))
+	if raw == "" {
+		return nudgeDispatchTickBudgetDefault
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "gc: GC_NUDGE_DISPATCH_TICK_BUDGET=%s invalid duration, using %s\n", raw, nudgeDispatchTickBudgetDefault) //nolint:errcheck // best-effort stderr
+		}
+		return nudgeDispatchTickBudgetDefault
+	}
+	if d < nudgeDispatchTargetTimeoutFloor {
+		return nudgeDispatchTargetTimeoutFloor
+	}
+	return d
+}
+
+// dispatchAllQueuedNudgesBudgeted is dispatchAllQueuedNudges with a wall-clock
+// budget for the whole pass: once it is spent, remaining matched targets are
+// skipped ("budget-exhausted") and reported in Deferred so the caller can
+// schedule another pass. budget <= 0 means unbounded.
+func dispatchAllQueuedNudgesBudgeted(cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer, budget time.Duration) (nudgeDispatchOutcome, error) {
 	if cfg == nil || sessionBeads == nil || cityPath == "" {
-		return 0, nil
+		return nudgeDispatchOutcome{}, nil
 	}
 	if !nudgeDispatcherIsSupervisor(cfg) {
-		return 0, nil
+		return nudgeDispatchOutcome{}, nil
 	}
 	state, err := nudgequeue.LoadState(cityPath)
 	if err != nil {
-		return 0, fmt.Errorf("loading nudge queue: %w", err)
+		return nudgeDispatchOutcome{}, fmt.Errorf("loading nudge queue: %w", err)
 	}
 	if len(state.Pending) == 0 && len(state.InFlight) == 0 {
-		return 0, nil
+		return nudgeDispatchOutcome{}, nil
 	}
 	now := time.Now()
 	pendingAgents := make(map[string]bool, len(state.Pending))
@@ -156,7 +200,7 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 		pendingAgents[item.Agent] = true
 	}
 	if len(pendingAgents) == 0 {
-		return 0, nil
+		return nudgeDispatchOutcome{}, nil
 	}
 
 	// The dispatcher receives the nudges-class store (store) PLUS the session-class
@@ -168,6 +212,8 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 	// (deriving sessStore from the nudges base would mis-resolve session beads once
 	// nudges relocates independently of sessions).
 	delivered := 0
+	deferred := 0
+	passStart := time.Now()
 	var firstErr error
 	// skipCounts accumulates this tick's silent-skip reasons in memory; it is
 	// merged into the persisted queue state's running totals once, after the
@@ -203,6 +249,12 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			// skip reasons below at a glance.
 			skipCounts["not-matched"]++
 			logNudgeDispatchSkip(debugOut, "not-matched", target.agentKey(), target.sessionName, "")
+			continue
+		}
+		if budget > 0 && time.Since(passStart) >= budget {
+			deferred++
+			skipCounts["budget-exhausted"]++
+			logNudgeDispatchSkip(debugOut, "budget-exhausted", target.agentKey(), target.sessionName, "pass budget "+budget.String()+" spent")
 			continue
 		}
 		res := dispatchNudgeTargetBounded(target, store, sessStore, sp, debugOut)
@@ -257,7 +309,7 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 	if err := recordNudgeDispatchSkips(cityPath, skipCounts); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("recording nudge dispatch skip counters: %w", err)
 	}
-	return delivered, firstErr
+	return nudgeDispatchOutcome{Delivered: delivered, Deferred: deferred}, firstErr
 }
 
 // logNudgeDispatchSkip emits a single GC_DEBUG-gated line documenting one
