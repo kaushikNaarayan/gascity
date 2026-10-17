@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
@@ -124,4 +125,86 @@ func TestTryDeliverQueuedNudgesByPollerStorelessClosesWhatItOpens(t *testing.T) 
 	if o, c := *opens-baseOpens, *closes-baseCloses; o != c {
 		t.Fatalf("store-less delivery opened %d stores but closed %d; every handle it opens must be released", o, c)
 	}
+}
+
+// borrowSiteFixture builds a held store, a started session over it and the
+// delivery target for one queued nudge in a fresh city, for the wiring tests
+// that pin each remaining bookkeeping site of tryDeliverQueuedNudgesByPoller.
+func borrowSiteFixture(t *testing.T, fake runtime.Provider, setActivity func(session string)) (dir string, held *countingNudgeStore, heldCloses *int, target nudgeTarget) {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	dir = t.TempDir()
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", time.Now().Add(-time.Minute))); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+	heldCloses = new(int)
+	held = &countingNudgeStore{MemStore: beads.NewMemStore(), closes: heldCloses}
+	mgr := newSessionManagerWithConfig(dir, held, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	setActivity(info.SessionName)
+	target = nudgeTarget{cityPath: dir, agent: config.Agent{Name: "worker"}, sessionID: info.ID, resolved: &config.ResolvedProvider{Name: "codex"}, sessionName: info.SessionName}
+	return dir, held, heldCloses, target
+}
+
+func requireNoStoreOpens(t *testing.T, opens, closes *int, baseOpens, baseCloses int, heldCloses *int) {
+	t.Helper()
+	if got := *opens - baseOpens; got != 0 {
+		t.Fatalf("delivery opened %d nudges stores, want 0 (borrow the held store)", got)
+	}
+	if got := *closes - baseCloses; got != 0 || *heldCloses != 0 {
+		t.Fatalf("delivery closed a store (seam closes=%d, held closes=%d); the held store belongs to the runtime", got, *heldCloses)
+	}
+}
+
+// TestTryDeliverQueuedNudgesByPollerActivityConfirmedAckBorrowsHeldStore pins
+// the ack of a batch whose earlier unconfirmed submit is proven by later
+// activity (gcf-1n2): that ack must reuse the held store (gcf-yhmym).
+func TestTryDeliverQueuedNudgesByPollerActivityConfirmedAckBorrowsHeldStore(t *testing.T) {
+	fake := runtime.NewFake()
+	attemptAt := time.Now().Add(-30 * time.Second)
+	activityAt := attemptAt.Add(5 * time.Second)
+	dir, held, heldCloses, target := borrowSiteFixture(t, fake, func(s string) { fake.Activity = map[string]time.Time{s: activityAt} })
+	opens, closes := installDirCountingNudgeStoreSeam(t, dir)
+
+	claimed, err := claimDueWorkerNudges(dir)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claimDueWorkerNudges: n=%d err=%v", len(claimed), err)
+	}
+	if err := recordQueuedNudgeFailureWithStore(dir, beads.NudgesStore{Store: held}, queuedNudgeIDs(claimed), sessiontmux.ErrNudgeSubmitUnconfirmed, attemptAt); err != nil {
+		t.Fatalf("recordQueuedNudgeFailureWithStore: %v", err)
+	}
+
+	baseOpens, baseCloses := *opens, *closes
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, held, held, fake, 3*time.Second, worker.LiveObservation{Running: true, LastActivity: &activityAt})
+	if err != nil || !delivered {
+		t.Fatalf("delivered=%v err=%v, want true,nil", delivered, err)
+	}
+	for _, c := range fake.Calls {
+		if c.Method == "Nudge" {
+			t.Fatalf("unexpected redelivery: %#v", c)
+		}
+	}
+	requireNoStoreOpens(t, opens, closes, baseOpens, baseCloses, heldCloses)
+}
+
+// TestTryDeliverQueuedNudgesByPollerDeliveredUnobservedAckBorrowsHeldStore pins
+// the injected_unobserved ack (pane consumed the submit, busy-state missed).
+func TestTryDeliverQueuedNudgesByPollerDeliveredUnobservedAckBorrowsHeldStore(t *testing.T) {
+	fake := &recordingErrorNudgeProvider{Fake: runtime.NewFake(), err: sessiontmux.ErrNudgeSubmitDeliveredUnobserved}
+	idle := time.Now().Add(-10 * time.Second)
+	dir, held, heldCloses, target := borrowSiteFixture(t, fake, func(s string) { fake.Activity = map[string]time.Time{s: idle} })
+	opens, closes := installDirCountingNudgeStoreSeam(t, dir)
+
+	baseOpens, baseCloses := *opens, *closes
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, held, held, fake, 3*time.Second, worker.LiveObservation{Running: true, LastActivity: &idle})
+	if err != nil || !delivered {
+		t.Fatalf("delivered=%v err=%v, want true,nil", delivered, err)
+	}
+	requireNoStoreOpens(t, opens, closes, baseOpens, baseCloses, heldCloses)
 }
