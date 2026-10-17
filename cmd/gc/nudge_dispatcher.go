@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -204,21 +205,31 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			logNudgeDispatchSkip(debugOut, "not-matched", target.agentKey(), target.sessionName, "")
 			continue
 		}
-		obs, err := workerObserveNudgeTarget(target, sessStore, sp)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			skipCounts["observe-error"]++
-			logNudgeDispatchSkip(debugOut, "observe-error", target.agentKey(), target.sessionName, err.Error())
+		res := dispatchNudgeTargetBounded(target, store, sessStore, sp, debugOut)
+		if res.inFlight {
+			skipCounts["in-flight"]++
+			logNudgeDispatchSkip(debugOut, "in-flight", target.agentKey(), target.sessionName, "previous delivery attempt still running")
 			continue
 		}
-		if !obs.Running {
+		if res.timedOut {
+			skipCounts["timeout"]++
+			logNudgeDispatchSkip(debugOut, "timeout", target.agentKey(), target.sessionName, "exceeded "+res.bound.String())
+			continue
+		}
+		if res.observeErr != nil {
+			if firstErr == nil {
+				firstErr = res.observeErr
+			}
+			skipCounts["observe-error"]++
+			logNudgeDispatchSkip(debugOut, "observe-error", target.agentKey(), target.sessionName, res.observeErr.Error())
+			continue
+		}
+		if !res.running {
 			skipCounts["not-running"]++
 			logNudgeDispatchSkip(debugOut, "not-running", target.agentKey(), target.sessionName, "")
 			continue
 		}
-		ok, err := tryDeliverQueuedNudgesByPoller(target, store, sessStore, sp, defaultNudgePollQuiescence, obs)
+		ok, err := res.delivered, res.deliverErr
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -262,4 +273,123 @@ func logNudgeDispatchSkip(w io.Writer, reason, agent, session, detail string) {
 		extra = append(extra, "detail", detail)
 	}
 	logRoute(w, "nudge-dispatch-tick", "skip", reason, extra...)
+}
+
+// nudgeDispatchTargetTimeoutDefault bounds how long one dispatcher pass waits
+// on a single target's observe+deliver attempt before moving on to the next
+// target (gcf-eln5). The dispatcher runs inside the controller tick, and
+// delivery does runtime-provider pane I/O with no context: one wedged pane
+// held the whole tick for up to 196s in the 14-15 Oct always-on trace
+// (bead_reconcile.nudge_dispatch_tick p50 4s, max 196s). 10s sits well above
+// the observed healthy per-pass cost (p50 4s for ALL targets together) and far
+// below the stall. GC_NUDGE_DISPATCH_TARGET_TIMEOUT overrides it.
+const nudgeDispatchTargetTimeoutDefault = 10 * time.Second
+
+// nudgeDispatchTargetTimeoutFloor is the minimum accepted override; below it
+// healthy targets would report "timeout" every tick.
+const nudgeDispatchTargetTimeoutFloor = 100 * time.Millisecond
+
+// parseNudgeDispatchTargetTimeout reads GC_NUDGE_DISPATCH_TARGET_TIMEOUT fresh
+// on every call (same shape as parseRouteRecoveryScopeTimeout). Unset/invalid:
+// the default. Below the floor: the floor.
+func parseNudgeDispatchTargetTimeout(stderr io.Writer) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GC_NUDGE_DISPATCH_TARGET_TIMEOUT"))
+	if raw == "" {
+		return nudgeDispatchTargetTimeoutDefault
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "gc: GC_NUDGE_DISPATCH_TARGET_TIMEOUT=%s invalid duration, using %s\n", raw, nudgeDispatchTargetTimeoutDefault) //nolint:errcheck // best-effort stderr
+		}
+		return nudgeDispatchTargetTimeoutDefault
+	}
+	if d < nudgeDispatchTargetTimeoutFloor {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "gc: GC_NUDGE_DISPATCH_TARGET_TIMEOUT=%s below minimum (%s), using %s\n", raw, nudgeDispatchTargetTimeoutFloor, nudgeDispatchTargetTimeoutFloor) //nolint:errcheck // best-effort stderr
+		}
+		return nudgeDispatchTargetTimeoutFloor
+	}
+	return d
+}
+
+// nudgeTargetResult is one target's bounded observe+deliver outcome.
+type nudgeTargetResult struct {
+	running    bool
+	delivered  bool
+	observeErr error
+	deliverErr error
+	timedOut   bool
+	inFlight   bool
+	bound      time.Duration
+}
+
+// dispatchNudgeTargetBounded runs observe+deliver for one target, single-
+// flighted per session and bounded to the target timeout. Like
+// recoverScopeRoutesBounded, the bound is on the caller's wait: the goroutine
+// keeps running and still delivers/releases when it returns, so the next tick
+// can retry. Queue claims are atomic (claimDueQueuedNudgesForTarget), so a late
+// completion cannot double-deliver. Healthy targets after a slow one are still
+// served this tick, and a still-wedged target is skipped ("in-flight") on later
+// ticks instead of piling up concurrent pane calls.
+func dispatchNudgeTargetBounded(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider, stderr io.Writer) nudgeTargetResult {
+	key := "nudge-dispatch:" + target.sessionName
+	if !acquireProbeFlight(key) {
+		return nudgeTargetResult{inFlight: true}
+	}
+	done := make(chan nudgeTargetResult, 1)
+	go func() {
+		defer releaseProbeFlight(key)
+		var r nudgeTargetResult
+		obs, err := workerObserveNudgeTarget(target, sessStore, sp)
+		if err != nil {
+			r.observeErr = err
+			done <- r
+			return
+		}
+		r.running = obs.Running
+		if !obs.Running {
+			done <- r
+			return
+		}
+		r.delivered, r.deliverErr = tryDeliverQueuedNudgesByPoller(target, store, sessStore, sp, defaultNudgePollQuiescence, obs)
+		done <- r
+	}()
+	bound := parseNudgeDispatchTargetTimeout(stderr)
+	select {
+	case r := <-done:
+		r.bound = bound
+		return r
+	case <-time.After(bound):
+		return nudgeTargetResult{timedOut: true, bound: bound}
+	}
+}
+
+// queuedNudgesStillDue reports whether the queue holds an unexpired item that is due
+// for delivery now (or an in-flight item whose lease expired), i.e. work the next
+// dispatch pass could still do. Used to decide whether to re-arm the dispatcher after
+// a pass that delivered nothing for a busy seat. Any read error answers false: the
+// patrol tick remains the backstop.
+func queuedNudgesStillDue(cityPath string, now time.Time) bool {
+	if cityPath == "" {
+		return false
+	}
+	state, err := nudgequeue.LoadState(cityPath)
+	if err != nil {
+		return false
+	}
+	live := func(it nudgequeue.Item) bool {
+		return it.Agent != "" && (it.ExpiresAt.IsZero() || it.ExpiresAt.After(now))
+	}
+	for _, it := range state.Pending {
+		if live(it) && (it.DeliverAfter.IsZero() || !it.DeliverAfter.After(now)) {
+			return true
+		}
+	}
+	for _, it := range state.InFlight {
+		if live(it) && !it.LeaseUntil.IsZero() && it.LeaseUntil.Before(now) {
+			return true
+		}
+	}
+	return false
 }

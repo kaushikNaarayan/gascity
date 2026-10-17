@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,6 +90,8 @@ const (
 	// now), after which cachedLastRun remembers it across ticks and rebuilds.
 	orderTrackingHistoryIndexLimit   = 256
 	defaultMaxOrderDispatchesPerTick = 4
+	minOrderDispatchInterval         = 15 * time.Second
+	maxOrderAdmissionLatency         = 10 * time.Minute
 	orderTrackingSweepCloseBudget    = 4
 
 	// orderTrackingRetentionWatchdogInterval is the minimum time between
@@ -99,6 +102,50 @@ const (
 	// closed order-tracking beads deleted per watchdog invocation.
 	orderTrackingRetentionWatchdogDeleteBudget = 100
 )
+
+// orderDispatchCadence is the bounded service plan for the lightweight
+// order-only scheduler. The full reconciler retains its patrol cadence; this
+// plan exists solely to keep due-order admission independent of slow work.
+type orderDispatchCadence struct {
+	interval             time.Duration
+	maxDispatchesPerTick int
+}
+
+// orderDispatchStats separates scheduler health from the enclosing supervisor
+// cycle so operators can see both queue pressure and admission progress.
+// DueCount is the number of due orders observed in this bounded pass; it is
+// deliberately not an unbounded queue census, because discovering every tail
+// order can itself execute external condition checks and starve the lane.
+type orderDispatchStats struct {
+	Duration      time.Duration
+	DueCount      int
+	AdmittedCount int
+	OldestDueAge  time.Duration
+}
+
+func computeOrderDispatchCadence(aa []orders.Order, patrolInterval time.Duration, maxDispatchesPerTick int) orderDispatchCadence {
+	if len(aa) == 0 {
+		return orderDispatchCadence{}
+	}
+	if maxDispatchesPerTick <= 0 {
+		maxDispatchesPerTick = defaultMaxOrderDispatchesPerTick
+	}
+	if patrolInterval <= 0 {
+		patrolInterval = 30 * time.Second
+	}
+	rounds := int(math.Ceil(float64(len(aa)) / float64(maxDispatchesPerTick)))
+	interval := maxOrderAdmissionLatency / time.Duration(rounds)
+	if interval > patrolInterval {
+		interval = patrolInterval
+	}
+	// The dedicated lane has a hard lower bound. Apply it after the patrol
+	// cap: a very short patrol interval must not accidentally create a 5s
+	// admission loop and multiply controller work.
+	if interval < minOrderDispatchInterval {
+		interval = minOrderDispatchInterval
+	}
+	return orderDispatchCadence{interval: interval, maxDispatchesPerTick: maxDispatchesPerTick}
+}
 
 // defaultOrderTrackingDeleteAfterClose is derived from the canonical config
 // constant so both load-time defaults and the runtime fallback stay in sync.
@@ -302,6 +349,7 @@ type memoryOrderDispatcher struct {
 	stderr               io.Writer
 	maxTimeout           time.Duration
 	maxDispatchesPerTick int
+	cadence              orderDispatchCadence
 	nextDispatchStart    int
 	cfg                  *config.City
 	cityName             string
@@ -309,6 +357,8 @@ type memoryOrderDispatcher struct {
 	cacheMu              sync.Mutex
 	lastRunCache         map[string]time.Time
 	gateBackoffUntil     map[string]time.Time
+	statsMu              sync.Mutex
+	lastStats            orderDispatchStats
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -453,6 +503,7 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 		stderr:               lockedStderr(stderr),
 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
 		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
+		cadence:              computeOrderDispatchCadence(aa, cfg.Daemon.PatrolIntervalDuration(), defaultMaxOrderDispatchesPerTick),
 		cfg:                  cfg,
 		cityName:             loadedCityName(cfg, cityPath),
 		cityPath:             cityPath,
@@ -461,7 +512,27 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 	}
 }
 
+func (m *memoryOrderDispatcher) orderDispatchCadence() orderDispatchCadence { return m.cadence }
+
+func (m *memoryOrderDispatcher) lastOrderDispatchStats() orderDispatchStats {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	return m.lastStats
+}
+
+func (m *memoryOrderDispatcher) recordOrderDispatchStats(stats orderDispatchStats) {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	m.lastStats = stats
+}
+
 func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, now time.Time) {
+	started := time.Now()
+	stats := orderDispatchStats{}
+	defer func() {
+		stats.Duration = time.Since(started)
+		m.recordOrderDispatchStats(stats)
+	}()
 	// Skip all order dispatch when the city is suspended. Use the
 	// dispatcher's in-scope city path so suspension state resolves
 	// against the controlled city rather than the process cwd.
@@ -504,15 +575,30 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	if m.maxDispatchesPerTick > 0 {
 		start = m.nextDispatchStart % total
 	}
-	spendDispatchBudget := func(idx int) bool {
+	hasDispatchBudget := func() bool {
+		return m.maxDispatchesPerTick <= 0 || budgetSpent < m.maxDispatchesPerTick
+	}
+	spendDispatchBudget := func(idx int) {
 		budgetSpent++
+		stats.AdmittedCount++
 		if m.maxDispatchesPerTick > 0 {
 			m.nextDispatchStart = (idx + 1) % total
 		}
-		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
 	}
 
 	for offset := 0; offset < total; offset++ {
+		// Admission is the lane's hard budget. Do not scan, open stores, read
+		// history, run a condition subprocess, or construct a failure bead after
+		// it is exhausted: any of those can block the independent scheduler and
+		// reintroduce starvation behind a slow tail order.
+		if !hasDispatchBudget() {
+			return
+		}
+		// A canceled pass (shutdown, or a reload/rescan handoff preempting the
+		// lane) stops scanning; the next tick resumes from the carried cursor.
+		if ctx.Err() != nil {
+			return
+		}
 		idx := (start + offset) % total
 		a := m.aa[idx]
 		// Skip orders targeting suspended rigs.
@@ -617,9 +703,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				Subject: a.ScopedName(),
 				Message: msg,
 			})
-			if spendDispatchBudget(idx) {
-				return
-			}
+			spendDispatchBudget(idx)
 			continue
 		}
 		// Thread the dispatch tick's context into the condition check so a
@@ -627,6 +711,20 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		// instead of waiting out its (now operator-configurable) check_timeout.
 		triggerOpts.ConditionCtx = ctx
 		result := orders.CheckTriggerWithOptions(a, now, lastRunFn, m.ep, cursorFn, triggerOpts)
+		if ctx.Err() != nil && !result.Due && a.Trigger == "condition" {
+			// The pass was canceled (a reload/rescan handoff preempting the lane,
+			// or shutdown) while this condition check was running, so the check
+			// was killed and proves nothing. Move the rotation cursor past this
+			// order before stopping: a cut-short pass must still make progress,
+			// otherwise a slow condition sitting at the cursor plus reloads that
+			// arrive faster than its check time would restart every pass on the
+			// same order and starve everything behind it (gcf-lo5u.3 O1). The
+			// order is re-evaluated when the rotation comes back around.
+			if m.maxDispatchesPerTick > 0 {
+				m.nextDispatchStart = (idx + 1) % total
+			}
+			return
+		}
 		if lastRunErr != nil {
 			logDispatchError(m.stderr, "gc: order dispatch: reading last run for %s: %v", a.ScopedName(), lastRunErr)
 			continue
@@ -642,6 +740,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			}
 			continue
 		}
+		stats.DueCount++
 		if lastRunFromCache && orderTriggerUsesLastRun(a) {
 			refreshedLastRun, err := baseLastRunFn(a.ScopedName())
 			if err != nil {
@@ -657,6 +756,16 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				if !result.Due {
 					continue
 				}
+			}
+		}
+
+		// Lateness = now - the scheduled fire time that was missed (cron: the
+		// matched/caught-up minute; cooldown: last run + interval), NOT time
+		// since the last run: this is the "tick N minutes late / dropped"
+		// signal. Computed from the final (possibly re-checked) result.
+		if !result.ScheduledAt.IsZero() && now.After(result.ScheduledAt) {
+			if age := now.Sub(result.ScheduledAt); age > stats.OldestDueAge {
+				stats.OldestDueAge = age
 			}
 		}
 
@@ -700,9 +809,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			continue
 		}
 		m.rememberLastRun(scoped, storeKeysForGate, trackingBead.CreatedAt)
-		if spendDispatchBudget(idx) {
-			return
-		}
+		spendDispatchBudget(idx)
 	}
 }
 
@@ -1096,6 +1203,21 @@ func (m *memoryOrderDispatcher) carryLastRunCacheFrom(prev *memoryOrderDispatche
 	for key, last := range prev.lastRunCache {
 		if existing, ok := m.lastRunCache[key]; !ok || last.After(existing) {
 			m.lastRunCache[key] = last
+		}
+	}
+}
+
+// carrySchedulingStateFrom preserves the next fair-rotation position across a
+// rebuild. Names, rather than indexes, survive an order-set reorder.
+func (m *memoryOrderDispatcher) carrySchedulingStateFrom(prev *memoryOrderDispatcher) {
+	if m == nil || prev == nil || len(m.aa) == 0 || len(prev.aa) == 0 {
+		return
+	}
+	nextName := prev.aa[prev.nextDispatchStart%len(prev.aa)].ScopedName()
+	for idx := range m.aa {
+		if m.aa[idx].ScopedName() == nextName {
+			m.nextDispatchStart = idx
+			return
 		}
 	}
 }

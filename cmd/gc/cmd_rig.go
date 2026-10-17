@@ -276,6 +276,7 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath string, includes []string, nameOverr
 }
 
 func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string, nameOverride, prefixOverride, defaultBranchOverride string, startSuspended, adopt bool, stdout, stderr io.Writer) (config.Rig, int) {
+	defer invalidateSharedCityConfig(cityPath)
 	// Preflight the rig path before loading config so an invalid rig path is
 	// reported ahead of a config-load failure (Provision re-checks it as
 	// step 2). This preserves the original error ordering.

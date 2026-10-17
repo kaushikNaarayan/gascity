@@ -1007,7 +1007,7 @@ func rigFromCwd(cityPath string) string {
 
 // rigFromCwdDir matches cwd against registered rigs in a city's config.
 func rigFromCwdDir(cityPath, cwd string) string {
-	cfg, err := loadCityConfig(cityPath, io.Discard)
+	cfg, err := loadCityConfigShared(cityPath)
 	if err != nil {
 		return ""
 	}
@@ -1405,7 +1405,7 @@ func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.
 		runtimeCityPath = cityForStoreDir(storePath)
 	}
 	if cfg == nil {
-		cfg, _ = loadCityConfig(runtimeCityPath, io.Discard)
+		cfg, _ = loadCityConfigShared(runtimeCityPath)
 	} else {
 		// Loading the config would have run the builtin-cache readiness pass.
 		// Reusing one must not skip that self-heal for a city this process has

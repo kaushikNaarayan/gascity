@@ -228,9 +228,24 @@ func conformanceAssignedWorkCapture(t *testing.T, e splitEnv) {
 	if err != nil {
 		t.Fatalf("create live pool session bead: %v", err)
 	}
+	deadSess, err := e.sessionsStore().Create(splitEnvPoolSessionBead(e.qualified, "executor-dead"))
+	if err != nil {
+		t.Fatalf("create expected-dead pool session bead: %v", err)
+	}
+	closed := "closed"
+	if err := e.sessionsStore().Update(deadSess.ID, beads.UpdateOpts{Status: &closed}); err != nil {
+		t.Fatalf("close expected-dead pool session bead %s: %v", deadSess.ID, err)
+	}
+	deadSess, err = e.sessionsStore().Get(deadSess.ID)
+	if err != nil {
+		t.Fatalf("reload closed expected-dead pool session bead %s: %v", deadSess.ID, err)
+	}
+	if deadSess.Status != "closed" {
+		t.Fatalf("expected-dead pool session bead %s status = %q, want closed", deadSess.ID, deadSess.Status)
+	}
 	live := e.mintWispWith(t, wispOpts{title: "live-held claimed wisp", routedTo: e.qualified, status: "in_progress", assignee: sess.ID})
-	dead := e.mintWispWith(t, wispOpts{title: "dead-held claimed wisp", routedTo: e.qualified, status: "in_progress", assignee: splitEnvDeadAssignee})
-	hqDead := splitEnvDeadClaimedWorkBead(t, e.work, e.qualified)
+	dead := e.mintWispWith(t, wispOpts{title: "dead-held claimed wisp", routedTo: e.qualified, status: "in_progress", assignee: deadSess.ID})
+	hqDead := splitEnvDeadClaimedWorkBead(t, e.work, e.qualified, deadSess.ID)
 
 	got, stores, refs, _, partial := collectAssignedWorkBeadsWithStores(e.cfg, e.sessionsStore(), e.rigStores, nil, nil)
 	if partial {
@@ -291,8 +306,8 @@ func conformanceAssignedWorkCapture(t *testing.T, e splitEnv) {
 		if err != nil {
 			t.Fatalf("reload HQ dead-claimed work bead: %v", err)
 		}
-		if stranded.Status != "in_progress" || stranded.Assignee != splitEnvDeadAssignee {
-			t.Errorf("HQ dead claim %s = status %q assignee %q, want it still stranded at in_progress/%s. If a controller-tick path now recovers it, the HQ-work arm has landed: update this leg, the capture check above and I1's hqWork row together", hqDead.ID, stranded.Status, stranded.Assignee, splitEnvDeadAssignee)
+		if stranded.Status != "in_progress" || stranded.Assignee != deadSess.ID {
+			t.Errorf("HQ dead claim %s = status %q assignee %q, want it still stranded at in_progress/%s. If a controller-tick path now recovers it, the HQ-work arm has landed: update this leg, the capture check above and I1's hqWork row together", hqDead.ID, stranded.Status, stranded.Assignee, deadSess.ID)
 		}
 	}
 
@@ -1376,16 +1391,12 @@ func countGraphClassBeads(t *testing.T, store beads.Store) int {
 	return n
 }
 
-// splitEnvDeadAssignee is the identity of a session that is gone: it holds a
-// claim, and no session bead names it, so orphan release must recover the claim
-// wherever the release pass can reach it.
-const splitEnvDeadAssignee = "s-dead99"
-
 // splitEnvDeadClaimedWorkBead mints a routed WORK-class bead claimed by a dead
-// session, in the store handed to it. It is the HQ-work leg of I1/I2: a plain
-// work-class bead (no reserved prefix, coordclass ClassWork) carrying
-// gc.routed_to, which is what order dispatch stamps on a city-scope target.
-func splitEnvDeadClaimedWorkBead(t *testing.T, store beads.Store, qualified string) beads.Bead {
+// session with durable closed-session proof, in the store handed to it. It is
+// the HQ-work leg of I1/I2: a plain work-class bead (no reserved prefix,
+// coordclass ClassWork) carrying gc.routed_to, which is what order dispatch
+// stamps on a city-scope target.
+func splitEnvDeadClaimedWorkBead(t *testing.T, store beads.Store, qualified, deadAssignee string) beads.Bead {
 	t.Helper()
 	created, err := store.Create(beads.Bead{
 		Title:    "dead-claimed HQ work bead",
@@ -1399,7 +1410,7 @@ func splitEnvDeadClaimedWorkBead(t *testing.T, store beads.Store, qualified stri
 		t.Fatalf("HQ bead %s classifies as infrastructure; this leg is about the WORK class specifically", created.ID)
 	}
 	inProgress := "in_progress"
-	assignee := splitEnvDeadAssignee
+	assignee := deadAssignee
 	if err := store.Update(created.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee}); err != nil {
 		t.Fatalf("stage the dead claim on HQ work bead %s: %v", created.ID, err)
 	}

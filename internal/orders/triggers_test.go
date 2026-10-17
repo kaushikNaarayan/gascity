@@ -839,3 +839,40 @@ func TestCheckTriggerCronBadTZFailsClosed(t *testing.T) {
 		t.Errorf("due=%v reason=%q, want fail-closed with a bad-tz reason", res.Due, res.Reason)
 	}
 }
+
+// ScheduledAt is the scheduled fire time, so now-ScheduledAt is lateness
+// (gcf-lo5u.1): a cron due at 04:00 and evaluated at 04:20 is 20m late no
+// matter when the order last ran.
+func TestCheckTriggerScheduledAtIsScheduledFireTime(t *testing.T) {
+	never := func(string) (time.Time, error) { return time.Time{}, nil }
+
+	cron := Order{Name: "late", Trigger: "cron", Schedule: "0 */4 * * *"}
+	lastRun := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 5, 29, 4, 20, 0, 0, time.UTC)
+	res := CheckTrigger(cron, now, func(string) (time.Time, error) { return lastRun, nil }, nil, nil)
+	if !res.Due {
+		t.Fatalf("cron not due: %q", res.Reason)
+	}
+	if want := time.Date(2026, 5, 29, 4, 0, 0, 0, time.UTC); !res.ScheduledAt.Equal(want) {
+		t.Fatalf("catch-up ScheduledAt = %s, want %s (lateness %s, not time since lastRun %s)", res.ScheduledAt, want, now.Sub(res.ScheduledAt), now.Sub(lastRun))
+	}
+
+	onTime := CheckTrigger(cron, time.Date(2026, 5, 29, 8, 0, 30, 0, time.UTC), func(string) (time.Time, error) { return lastRun, nil }, nil, nil)
+	if want := time.Date(2026, 5, 29, 8, 0, 0, 0, time.UTC); !onTime.Due || !onTime.ScheduledAt.Equal(want) {
+		t.Fatalf("matched-minute ScheduledAt = %s due=%v, want %s", onTime.ScheduledAt, onTime.Due, want)
+	}
+
+	cd := Order{Name: "cd", Trigger: "cooldown", Interval: "10m"}
+	last := time.Date(2026, 5, 29, 4, 0, 0, 0, time.UTC)
+	cdRes := CheckTrigger(cd, last.Add(25*time.Minute), func(string) (time.Time, error) { return last, nil }, nil, nil)
+	if want := last.Add(10 * time.Minute); !cdRes.Due || !cdRes.ScheduledAt.Equal(want) {
+		t.Fatalf("cooldown ScheduledAt = %s due=%v, want %s (15m late)", cdRes.ScheduledAt, cdRes.Due, want)
+	}
+
+	if r := CheckTrigger(cron, time.Date(2026, 5, 29, 4, 20, 0, 0, time.UTC), never, nil, nil); !r.Due || !r.ScheduledAt.IsZero() {
+		t.Fatalf("never-run cron catch-up ScheduledAt = %s due=%v, want zero (a fresh order missed nothing)", r.ScheduledAt, r.Due)
+	}
+	if r := CheckTrigger(cd, last, never, nil, nil); !r.Due || !r.ScheduledAt.IsZero() {
+		t.Fatalf("never-run cooldown ScheduledAt = %s, want zero (no schedule to be late against)", r.ScheduledAt)
+	}
+}

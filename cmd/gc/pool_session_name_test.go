@@ -246,7 +246,7 @@ func TestGCSweepSessionBeads_SkipsAlreadyClosed(t *testing.T) {
 	}
 }
 
-func TestReleaseOrphanedPoolAssignments_ReopensMissingPoolAssignee(t *testing.T) {
+func TestReleaseOrphanedPoolAssignments_PreservesUnknownNonEmptyAssignee(t *testing.T) {
 	store := beads.NewMemStore()
 	work, err := store.Create(beads.Bead{
 		Title:    "orphaned pool work",
@@ -274,19 +274,148 @@ func TestReleaseOrphanedPoolAssignments_ReopensMissingPoolAssignee(t *testing.T)
 		nil,
 		nil,
 	)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none without durable dead-session proof", released)
 	}
 
 	got, err := store.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Get work bead: %v", err)
 	}
-	if got.Status != "open" {
-		t.Fatalf("status = %q, want open", got.Status)
+	if got.Status != "in_progress" {
+		t.Fatalf("status = %q, want in_progress", got.Status)
 	}
-	if got.Assignee != "" {
-		t.Fatalf("assignee = %q, want empty", got.Assignee)
+	if got.Assignee != "worker-dead" {
+		t.Fatalf("assignee = %q, want worker-dead", got.Assignee)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_ReopensDurablyClosedHolder(t *testing.T) {
+	base := beads.NewMemStore()
+	closed, err := base.Create(beads.Bead{
+		Title:  "dead pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "worker-mc-dead",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create closed session: %v", err)
+	}
+	if err := base.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	closed, err = base.Get(closed.ID)
+	if err != nil {
+		t.Fatalf("Reload closed session: %v", err)
+	}
+	store := sessionListMissStore{
+		Store:          base,
+		directSessions: map[string]beads.Bead{"worker-mc-dead": closed},
+	}
+	work, err := base.Create(beads.Bead{
+		Title:    "durably orphaned pool work",
+		Assignee: "worker-mc-dead",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create work: %v", err)
+	}
+	if err := base.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work: %v", err)
+	}
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(store, testPoolReleaseConfig(), "", nil, []beads.Bead{work}, nil, nil, nil)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	}
+	got, err := base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work: %v", err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("work = status %q assignee %q, want open/unassigned", got.Status, got.Assignee)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_ClosedHolderWithAliveDetachedProbeStaysAssigned(t *testing.T) {
+	base := beads.NewMemStore()
+	closed, err := base.Create(beads.Bead{Title: "dead pool session", Type: sessionBeadType, Labels: []string{sessionBeadLabel}, Metadata: map[string]string{"session_name": "worker-mc-closed"}})
+	if err != nil {
+		t.Fatalf("Create closed session: %v", err)
+	}
+	if err := base.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	closed, err = base.Get(closed.ID)
+	if err != nil {
+		t.Fatalf("Reload closed session: %v", err)
+	}
+	work, err := base.Create(beads.Bead{Title: "closed holder with live detached probe", Assignee: "worker-mc-closed", Metadata: map[string]string{"gc.routed_to": "worker", detachedProbeMetadataKey: testDetachedPoolProbeSpec}})
+	if err != nil {
+		t.Fatalf("Create work: %v", err)
+	}
+	if err := base.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work: %v", err)
+	}
+	installFakeTmux(t, "exit 0")
+	store := sessionListMissStore{Store: base, directSessions: map[string]beads.Bead{"mc-closed": closed}}
+	if released := releaseOrphanedPoolAssignmentsFromBeads(store, testPoolReleaseConfig(), "", nil, []beads.Bead{work}, nil, nil, nil); len(released) != 0 {
+		t.Fatalf("released = %v, want none while detached probe is alive", released)
+	}
+	got, err := base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "worker-mc-closed" {
+		t.Fatalf("work = status %q assignee %q, want in_progress/worker-mc-closed", got.Status, got.Assignee)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_ClosedHolderWithErroredDetachedProbeStaysAssigned(t *testing.T) {
+	base := beads.NewMemStore()
+	closed, err := base.Create(beads.Bead{Title: "dead pool session", Type: sessionBeadType, Labels: []string{sessionBeadLabel}, Metadata: map[string]string{"session_name": "worker-mc-closed"}})
+	if err != nil {
+		t.Fatalf("Create closed session: %v", err)
+	}
+	if err := base.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	closed, err = base.Get(closed.ID)
+	if err != nil {
+		t.Fatalf("Reload closed session: %v", err)
+	}
+	work, err := base.Create(beads.Bead{Title: "closed holder with errored detached probe", Assignee: "worker-mc-closed", Metadata: map[string]string{"gc.routed_to": "worker", detachedProbeMetadataKey: testDetachedPoolProbeSpec}})
+	if err != nil {
+		t.Fatalf("Create work: %v", err)
+	}
+	if err := base.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work: %v", err)
+	}
+	installFakeTmux(t, "exit 2")
+	store := sessionListMissStore{Store: base, directSessions: map[string]beads.Bead{"mc-closed": closed}}
+	if released := releaseOrphanedPoolAssignmentsFromBeads(store, testPoolReleaseConfig(), "", nil, []beads.Bead{work}, nil, nil, nil); len(released) != 0 {
+		t.Fatalf("released = %v, want none while detached probe errors", released)
+	}
+	got, err := base.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "worker-mc-closed" {
+		t.Fatalf("work = status %q assignee %q, want in_progress/worker-mc-closed", got.Status, got.Assignee)
 	}
 }
 
@@ -356,6 +485,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensEphemeralPoolAssignee(t *testing.
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
 		store,
@@ -403,6 +533,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensLegacyWorkflowRunTarget(t *testin
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
 		store,
@@ -555,13 +686,13 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeDeadPreservesGuardWhenRelea
 	}
 }
 
-func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t *testing.T) {
+func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsNeverRelease(t *testing.T) {
 	resetDetachedProbeErrorCountsForTest()
 	store := beads.NewMemStore()
 	work := createDetachedOrphanedPoolWork(t, store)
 	installFakeTmux(t, "exit 2")
 
-	for tick := 1; tick <= 2; tick++ {
+	for tick := 1; tick <= detachedProbeErrorThreshold+1; tick++ {
 		released := releaseOrphanedPoolAssignmentsFromBeads(
 			store,
 			testPoolReleaseConfig(),
@@ -573,7 +704,7 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t 
 			nil,
 		)
 		if len(released) != 0 {
-			t.Fatalf("tick %d released = %v, want none before third error", tick, released)
+			t.Fatalf("tick %d released = %v, want none for a probe error", tick, released)
 		}
 		got, err := store.Get(work.ID)
 		if err != nil {
@@ -587,31 +718,31 @@ func TestReleaseOrphanedPoolAssignments_DetachedProbeErrorsReleaseOnThirdTick(t 
 		}
 	}
 
-	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store,
-		testPoolReleaseConfig(),
-		"",
-		nil,
-		[]beads.Bead{work},
-		nil,
-		nil,
-		nil,
-	)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("third tick released = %v, want [%s]", released, work.ID)
-	}
 	got, err := store.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Get work bead: %v", err)
 	}
-	if got.Status != "open" {
-		t.Fatalf("status = %q, want open", got.Status)
+	if got.Status != "in_progress" || got.Assignee != "worker-dead" {
+		t.Fatalf("work = status %q assignee %q, want in_progress/worker-dead", got.Status, got.Assignee)
 	}
-	if got.Metadata[detachedProbeMetadataKey] != "" {
-		t.Fatalf("gc.detached = %q, want cleared", got.Metadata[detachedProbeMetadataKey])
+	if got.Metadata[detachedProbeMetadataKey] != testDetachedPoolProbeSpec {
+		t.Fatalf("gc.detached = %q, want preserved", got.Metadata[detachedProbeMetadataKey])
 	}
-	if _, ok := got.Metadata["error_count"]; ok {
-		t.Fatalf("persisted error_count metadata after release: %+v", got.Metadata)
+}
+
+func TestDetachedProbeResultAllowsOrphanRelease_FailsClosedUnlessDead(t *testing.T) {
+	work := beads.Bead{ID: "work-1"}
+	for _, status := range []detachedProbeStatus{detachedProbeError, detachedProbeTimeout, detachedProbeStatus("unknown")} {
+		for sweep := 1; sweep <= 2; sweep++ {
+			allows, clearMetadata := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: status, Err: errors.New("probe unavailable")})
+			if allows || clearMetadata {
+				t.Fatalf("status %q sweep %d = allows %t clear %t, want fail-closed", status, sweep, allows, clearMetadata)
+			}
+		}
+	}
+	allows, clearMetadata := detachedProbeResultAllowsOrphanRelease(work, testDetachedPoolProbeSpec, detachedProbeResult{Status: detachedProbeDead})
+	if !allows || !clearMetadata {
+		t.Fatalf("dead probe = allows %t clear %t, want release and clear", allows, clearMetadata)
 	}
 }
 
@@ -634,6 +765,23 @@ func createDetachedOrphanedPoolWork(t *testing.T, store beads.Store) beads.Bead 
 	work, err = store.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
+	}
+	return work
+}
+
+// affirmativelyDeadPoolHolder equips a release-mechanism fixture with the
+// positive evidence the reaper now requires. Tests using it still exercise
+// their original store/CAS/race behavior rather than treating local absence as
+// proof that a holder died.
+func affirmativelyDeadPoolHolder(t *testing.T, store beads.Store, work beads.Bead) beads.Bead {
+	t.Helper()
+	installFakeTmux(t, "exit 1")
+	if err := store.SetMetadata(work.ID, detachedProbeMetadataKey, testDetachedPoolProbeSpec); err != nil {
+		t.Fatalf("Set detached dead probe: %v", err)
+	}
+	work, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work with detached dead probe: %v", err)
 	}
 	return work
 }
@@ -1160,6 +1308,7 @@ func TestCollectAndReleaseOrphanPoolStepBead_Issue2793(t *testing.T) {
 	if err := store.DepAdd(work.ID, blocker.ID, "blocks"); err != nil {
 		t.Fatalf("Block orphaned step bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	cfg := &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}}
 
@@ -1211,6 +1360,7 @@ func TestCollectAndReleaseOrphanWorkflowRunTargetBead(t *testing.T) {
 	if err := store.DepAdd(work.ID, blocker.ID, "blocks"); err != nil {
 		t.Fatalf("Block workflow run-target bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	cfg := &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}}
 
@@ -1338,6 +1488,7 @@ func TestReleaseOrphanedPoolAssignments_UpdatesRigStoreFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, rigStore, work)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
 		cityStore,
@@ -1403,6 +1554,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensRigStoreMissingPoolAssignee(t *te
 	if err != nil {
 		t.Fatalf("Reload rig work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, rigStore, work)
 	if citySession.ID != work.ID {
 		t.Fatalf("test setup expected overlapping city/rig IDs, got city %q rig %q", citySession.ID, work.ID)
 	}
@@ -1469,6 +1621,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensCrossStoreIDCollisions(t *testing
 	if err != nil {
 		t.Fatalf("Reload city work bead: %v", err)
 	}
+	cityWork = affirmativelyDeadPoolHolder(t, cityStore, cityWork)
 	rigWork, err := rigStore.Create(beads.Bead{
 		Title:    "orphaned rig pool work",
 		Assignee: "worker-rig-dead",
@@ -1484,6 +1637,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensCrossStoreIDCollisions(t *testing
 	if err != nil {
 		t.Fatalf("Reload rig work bead: %v", err)
 	}
+	rigWork = affirmativelyDeadPoolHolder(t, rigStore, rigWork)
 	if cityWork.ID != rigWork.ID {
 		t.Fatalf("test setup expected overlapping city/rig IDs, got city %q rig %q", cityWork.ID, rigWork.ID)
 	}
@@ -1541,6 +1695,7 @@ func TestReleaseOrphanedPoolAssignments_ClearsSessionAffinityOnRelease(t *testin
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
 		store,
@@ -1708,6 +1863,7 @@ func TestReleaseOrphanedPoolAssignments_ReleasesRigWorkAssignedToUnreachableOpen
 	if err != nil {
 		t.Fatalf("Reload rig work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, rigStore, work)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
 		cityStore,
@@ -1918,6 +2074,7 @@ func TestReleaseOrphanedPoolAssignments_ReopensStaleDirectAssigneeForNamedBacked
 	if err != nil {
 		t.Fatalf("Reload work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, store, work)
 
 	cfg := &config.City{
 		Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}},
@@ -2010,6 +2167,7 @@ func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore
 	if err != nil {
 		t.Fatalf("Reload rig work bead: %v", err)
 	}
+	work = affirmativelyDeadPoolHolder(t, rigStore, work)
 
 	cfg := &config.City{
 		Rigs:   []config.Rig{{Name: "repo", Path: t.TempDir()}},
@@ -2203,12 +2361,14 @@ func newConditionalReleaseProbeStoreWithMetadata(t *testing.T, extra map[string]
 	t.Helper()
 	mem := beads.NewMemStore()
 	metadata := map[string]string{
-		"gc.routed_to":        "worker",
-		"gc.session_affinity": "require",
+		"gc.routed_to":           "worker",
+		"gc.session_affinity":    "require",
+		detachedProbeMetadataKey: testDetachedPoolProbeSpec,
 	}
 	for k, v := range extra {
 		metadata[k] = v
 	}
+	installFakeTmux(t, "exit 1")
 	work, err := mem.Create(beads.Bead{
 		Title:    "orphaned pool work",
 		Assignee: "worker-dead",
@@ -2601,6 +2761,50 @@ func TestReleaseOrphanedPoolAssignments_SkipsLiveModernPoolSessionWhenLiveListMi
 	}
 	if got.Assignee != sessionName {
 		t.Fatalf("assignee = %q, want %q", got.Assignee, sessionName)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_PreservesUnmatchedNonEmptyHolderAcrossSweeps(t *testing.T) {
+	// A Linux-local snapshot has no authority to declare a non-empty holder on
+	// another host dead. Repeating that absence must remain fail-closed: status,
+	// assignee, and history stay untouched until a positive dead-session path
+	// releases the work.
+	store := beads.NewMemStore()
+	work, err := store.Create(beads.Bead{
+		Title:    "remote-held pool work",
+		Assignee: "mac-worker-remote-holder",
+		Metadata: map[string]string{"gc.routed_to": "worker", "history_marker": "unchanged"},
+	})
+	if err != nil {
+		t.Fatalf("Create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work: %v", err)
+	}
+	before := work
+	for sweep := 1; sweep <= 2; sweep++ {
+		work, err = store.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get work before sweep %d: %v", sweep, err)
+		}
+		released := releaseOrphanedPoolAssignments(store, testPoolReleaseConfig(), "", nil, []beads.Bead{work}, []beads.Store{store}, nil, nil)
+		if len(released) != 0 {
+			t.Fatalf("sweep %d released = %v, want none", sweep, released)
+		}
+		got, err := store.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get work after sweep %d: %v", sweep, err)
+		}
+		if got.Status != "in_progress" || got.Assignee != "mac-worker-remote-holder" {
+			t.Fatalf("sweep %d work = status %q assignee %q, want in_progress/mac-worker-remote-holder", sweep, got.Status, got.Assignee)
+		}
+		if got.Metadata["history_marker"] != before.Metadata["history_marker"] {
+			t.Fatalf("sweep %d history marker = %q, want %q", sweep, got.Metadata["history_marker"], before.Metadata["history_marker"])
+		}
 	}
 }
 
