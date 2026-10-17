@@ -39,7 +39,9 @@ func settledGoroutines() int {
 	var n int
 	for i := 0; i < 5; i++ {
 		goruntime.GC()
-		time.Sleep(20 * time.Millisecond)
+		for j := 0; j < 50; j++ {
+			goruntime.Gosched()
+		}
 		n = goruntime.NumGoroutine()
 	}
 	return n
