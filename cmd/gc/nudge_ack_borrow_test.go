@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,27 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
+
+// installDirCountingNudgeStoreSeam is installCountingNudgeStoreSeam scoped to
+// one city path: the seam is a process global, so a straggler goroutine from an
+// earlier test opening its own city's store must not count against this one.
+func installDirCountingNudgeStoreSeam(t *testing.T, dir string) (opens, closes *int) {
+	t.Helper()
+	var mu sync.Mutex
+	var openCount, closeCount int
+	prev := openNudgeBeadStore
+	openNudgeBeadStore = func(cityPath string) beads.NudgesStore {
+		if cityPath != dir {
+			return prev(cityPath)
+		}
+		mu.Lock()
+		openCount++
+		mu.Unlock()
+		return beads.NudgesStore{Store: &countingNudgeStore{MemStore: beads.NewMemStore(), closes: &closeCount}}
+	}
+	t.Cleanup(func() { openNudgeBeadStore = prev })
+	return &openCount, &closeCount
+}
 
 // TestTryDeliverQueuedNudgesByPollerBorrowsHeldStore pins gcf-yhmym at the call
 // site: the supervisor dispatcher hands tryDeliverQueuedNudgesByPoller the nudges
@@ -29,8 +51,8 @@ func TestTryDeliverQueuedNudgesByPollerBorrowsHeldStore(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("GC_BEADS", "file")
-			opens, closes := installCountingNudgeStoreSeam(t)
 			dir := t.TempDir()
+			opens, closes := installDirCountingNudgeStoreSeam(t, dir)
 			now := time.Now().Add(-1 * time.Minute)
 			if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", now)); err != nil {
 				t.Fatalf("enqueueQueuedNudge: %v", err)
@@ -86,8 +108,8 @@ func TestTryDeliverQueuedNudgesByPollerBorrowsHeldStore(t *testing.T) {
 // store-less corner (nil store): the single fallback handle is released.
 func TestTryDeliverQueuedNudgesByPollerStorelessClosesWhatItOpens(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
-	opens, closes := installCountingNudgeStoreSeam(t)
 	dir := t.TempDir()
+	opens, closes := installDirCountingNudgeStoreSeam(t, dir)
 	now := time.Now().Add(-1 * time.Minute)
 	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", now)); err != nil {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
