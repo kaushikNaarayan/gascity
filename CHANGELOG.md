@@ -9,13 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known issues
 
-- **`gc init` can fail with `exec beads init: context deadline exceeded` on a
-  slow disk or heavily loaded host.** gc bounds the beads-init phase with a
-  fixed 120s deadline; a fresh init that legitimately takes longer (observed
-  122-142s under sustained load) is cancelled and reported as a failure. This
-  is pre-existing (the same code shipped in v1.3.9-v1.3.11), not introduced by
-  this release, and is tracked as gcf-6ryi with a fix targeted for v1.3.13.
-  **Workaround:** re-run `gc init`.
+- **v1.3.12 is not a rollback target for v1.3.13.** It lacks the
+  delivered-unobserved nudge repair (gcf-3jul.1) and the cross-host claim
+  fail-closed fix (gcf-lcx1.16.1, #85). Roll back to the previously installed
+  binary instead.
 
 ### Fixed
 
