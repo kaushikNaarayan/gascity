@@ -95,7 +95,7 @@ jobs:
           got_dolt="$(dolt version 2>&1)"
           echo "installed bd:   $got_bd"
           echo "installed dolt: $got_dolt"
-          echo "$got_bd" | grep -qF "${{ steps.pins.outputs.bd_version }}" || { echo "::error::installed bd does not report VERSIONS-pinned ${{ steps.pins.outputs.bd_version }} — got: $got_bd"; exit 1; }
+          want_bd="${{ steps.pins.outputs.bd_version }}"; echo "$got_bd" | grep -qF "${want_bd#v}" || { echo "::error::installed bd does not report VERSIONS-pinned ${{ steps.pins.outputs.bd_version }} — got: $got_bd"; exit 1; }
           echo "$got_dolt" | grep -qF "${{ steps.pins.outputs.dolt_version }}" || { echo "::error::installed dolt does not report VERSIONS-pinned ${{ steps.pins.outputs.dolt_version }} — got: $got_dolt"; exit 1; }
 
       - name: Build the standalone gc binary (the shipped product path, not the in-process test binary)
