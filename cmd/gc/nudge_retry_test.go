@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -246,5 +247,23 @@ func TestQueuedNudgesStillDue(t *testing.T) {
 	}
 	if queuedNudgesStillDue("", now) {
 		t.Error("empty city path must answer false")
+	}
+}
+
+// A nudge dispatch tick reports each sub-step's duration so a slow
+// nudge_dispatch_tick can be attributed (gcf-664rj).
+func TestNudgeDispatchTickReportsSubPhases(t *testing.T) {
+	h := newRetryHarness(t)
+	h.idle()
+	var got []string
+	h.cr.nudgeDispatchTick(context.Background(), func(name string, d time.Duration) {
+		if d < 0 {
+			t.Errorf("phase %s duration = %s, want >= 0", name, d)
+		}
+		got = append(got, name)
+	})
+	want := []string{"session_snapshot", "dispatch_pass", "retry_schedule"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("phases = %v, want %v", got, want)
 	}
 }

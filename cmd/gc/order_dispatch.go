@@ -813,6 +813,35 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}
 }
 
+// orderRunCtxKey carries the controller's long-lived run context through a
+// dispatch pass's per-pass context (see CityRuntime.dispatchOrders).
+type orderRunCtxKey struct{}
+
+// withOrderRunCtx marks ctx, a per-pass child of run, so the order runs the pass
+// launches can outlive the pass but still stop with the controller.
+func withOrderRunCtx(ctx, run context.Context) context.Context {
+	return context.WithValue(ctx, orderRunCtxKey{}, run)
+}
+
+// orderLaunchContext is the context an order run executes under. The dispatch
+// pass is canceled when it returns (and by a lane handoff), but launching a run
+// only starts a goroutine, so deriving the run from the pass killed every exec
+// still running at pass end after its event cursor was already persisted
+// (gcf-664rj). The run therefore ignores the pass's cancellation and stops with
+// the controller's run context when the pass carries one, else with ctx itself.
+func orderLaunchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	run, ok := ctx.Value(orderRunCtxKey{}).(context.Context)
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	launch, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(run, cancel)
+	return launch, func() {
+		stop()
+		cancel()
+	}
+}
+
 // launchDispatchOne spawns dispatchOne with a context that cancels when
 // EITHER the caller's tick ctx OR m.dispatchCtx is done — required so
 // cancel() reaches goroutines whose tick ctx was context.Background().
@@ -825,14 +854,17 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 	if onDone == nil {
 		onDone = func() {}
 	}
+	// The run's lifetime is not the dispatch pass's: see orderLaunchContext.
+	launchCtx, cancelLaunch := orderLaunchContext(ctx)
 	if m.dispatchCtx == nil {
 		go func() {
 			defer onDone()
-			m.runDispatchGuarded(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
+			defer cancelLaunch()
+			m.runDispatchGuarded(launchCtx, store, target, a, cityPath, trackingID, vars, execEnv)
 		}()
 		return
 	}
-	mergedCtx, cancelMerged := context.WithCancel(ctx)
+	mergedCtx, cancelMerged := context.WithCancel(launchCtx)
 	stopAfter := context.AfterFunc(m.dispatchCtx, cancelMerged)
 	go func() {
 		// onDone runs last (registered first → LIFO), after dispatchOne has
@@ -841,6 +873,7 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 		defer onDone()
 		defer stopAfter()
 		defer cancelMerged()
+		defer cancelLaunch()
 		m.runDispatchGuarded(mergedCtx, store, target, a, cityPath, trackingID, vars, execEnv)
 	}()
 }

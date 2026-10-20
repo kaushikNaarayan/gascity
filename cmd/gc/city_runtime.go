@@ -1576,6 +1576,8 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) orde
 	// the lane (lockOrderLaneForHandoff) can interrupt a slow condition check
 	// instead of waiting out its check_timeout.
 	passCtx, cancel := context.WithCancel(ctx)
+	// Runs the pass launches outlive it and stop with ctx (gcf-664rj).
+	passCtx = withOrderRunCtx(passCtx, ctx)
 	cr.orderPassMu.Lock()
 	cr.orderPassCancel = cancel
 	cr.orderPassMu.Unlock()
@@ -2790,7 +2792,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// queued items get delivered even if the wake socket missed the
 	// enqueue (process race during supervisor restart, listener crash).
 	phaseStart = time.Now()
-	cr.nudgeDispatchTick(ctx)
+	cr.nudgeDispatchTick(ctx, func(name string, d time.Duration) {
+		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick."+name, time.Now().Add(-d), nil)
+	})
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
 
 	// Idle recovery: re-nudge pool slots that are running but never claimed
@@ -3371,15 +3375,28 @@ const nudgeBudgetRewakeDelay = time.Second
 // from the main run loop on wake-socket signal and (belt-and-suspenders)
 // at the end of each patrol tick so a missed wake doesn't strand a queue
 // item past the patrol interval.
-func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
+//
+// phases, when given, receives the duration of each sub-step (session_snapshot,
+// dispatch_pass, retry_schedule) so a slow tick can be attributed (gcf-664rj:
+// the whole tick took a median 126s on 1.3.13 with only the total traced).
+func (cr *CityRuntime) nudgeDispatchTick(_ context.Context, phases ...func(name string, d time.Duration)) {
 	if !nudgeDispatcherIsSupervisor(cr.cfg) {
 		return
+	}
+	span := func(name string, start time.Time) {
+		for _, f := range phases {
+			f(name, time.Since(start))
+		}
 	}
 	delivered := 0
 	// Whatever happens below, if due items are still queued afterwards (a seat was
 	// mid-turn when the pass ran, so the quiescence gate refused it), re-arm: without
 	// this nothing retries until an unrelated enqueue or the patrol tick (gcf-adu3i).
-	defer func() { cr.scheduleNudgeRetry(delivered) }()
+	defer func() {
+		retryStart := time.Now()
+		cr.scheduleNudgeRetry(delivered)
+		span("retry_schedule", retryStart)
+	}()
 	// Nudge ops route through the nudges accessor; the session snapshot it pairs
 	// them with is loaded via the sessions accessor inside loadSessionBeadSnapshot.
 	// Both collapse to the city store today.
@@ -3387,11 +3404,15 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 	if store.Store == nil {
 		return
 	}
+	snapshotStart := time.Now()
 	sessionBeads := cr.nudgeDispatchSessionSnapshot()
+	span("session_snapshot", snapshotStart)
 	if sessionBeads == nil {
 		return
 	}
+	passStart := time.Now()
 	out, err := dispatchAllQueuedNudgesBudgeted(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr, parseNudgeDispatchTickBudget(cr.stderr))
+	span("dispatch_pass", passStart)
 	delivered = out.Delivered
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v\n", cr.logPrefix, err) //nolint:errcheck
