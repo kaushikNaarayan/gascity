@@ -1712,6 +1712,17 @@ The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 	return cmd
 }
 
+// errEmptyMailRecipient is reported when send is given an empty or
+// whitespace-only recipient. The resolvers treat an empty identifier as the
+// reserved "human" mailbox (their default for inbox/read), so without this check
+// an unset shell variable in `gc mail send "$TO" ...` silently mailed the founder
+// (gcf-u1gie). Mailing human must be explicit: `gc mail send human ...`.
+const errEmptyMailRecipient = `gc mail send: empty recipient (use "human" to mail the founder explicitly)`
+
+func emptyMailRecipient(to string) bool {
+	return strings.TrimSpace(to) == ""
+}
+
 // cmdMailSend is the CLI entry point for sending mail. It opens the provider,
 // resolves session mailbox identities, and delegates to doMailSend.
 // The to parameter is the --to flag value (empty if not set).
@@ -1803,6 +1814,10 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			args = []string{args[0], subject, body}
 		}
 	}
+	if !all && len(args) > 0 && emptyMailRecipient(args[0]) {
+		fmt.Fprintln(stderr, errEmptyMailRecipient) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if !all && len(args) > 0 && store != nil {
 		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, store, args[0], idCache)
 		if err != nil {
@@ -1837,6 +1852,10 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 		return 1
 	}
 	to := args[0]
+	if emptyMailRecipient(to) {
+		fmt.Fprintln(stderr, errEmptyMailRecipient) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 
 	var subject, body string
 	if len(args) >= 3 {
