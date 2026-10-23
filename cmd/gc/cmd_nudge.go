@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -2656,6 +2657,15 @@ func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.St
 				filtered = append(filtered, item)
 				continue
 			}
+			if deadNudgeTerminalVerified.has(item.ID, item.BeadID) {
+				// Already confirmed terminal by an earlier pass in this process: skip
+				// the per-tick shadow lookup (a full issues scan on the hq store).
+				if !item.DeadAt.IsZero() && item.DeadAt.Before(cutoff) {
+					continue
+				}
+				filtered = append(filtered, item)
+				continue
+			}
 			shadow, ok, err := front.FindIncludingTerminal(item.ID)
 			if err != nil {
 				// Fail open: store lookup errors retain the item rather than
@@ -2684,6 +2694,7 @@ func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.St
 					continue
 				}
 			}
+			deadNudgeTerminalVerified.add(item.ID, item.BeadID)
 			if !item.DeadAt.IsZero() && item.DeadAt.Before(cutoff) {
 				// Terminal bead confirmed in store — safe to prune once past retention.
 				continue
@@ -2692,7 +2703,54 @@ func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.St
 		filtered = append(filtered, item)
 	}
 	state.Dead = filtered
+	deadNudgeTerminalVerified.retain(filtered)
 	return nil
+}
+
+// deadNudgeVerifiedSet remembers dead-letter nudges whose shadow bead was
+// already confirmed terminal, so the supervisor's per-tick prune does not
+// re-run the FindIncludingTerminal lookup for each retained item (gcf-9h9w7:
+// that lookup is a full-row scan of issues on a large store, ~1 s each).
+// Process-local: a restart re-verifies once.
+type deadNudgeVerifiedSet struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+var deadNudgeTerminalVerified = &deadNudgeVerifiedSet{ids: map[string]struct{}{}}
+
+func (v *deadNudgeVerifiedSet) has(id, beadID string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	_, ok := v.ids[id+"|"+beadID]
+	return ok
+}
+
+func (v *deadNudgeVerifiedSet) add(id, beadID string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.ids[id+"|"+beadID] = struct{}{}
+}
+
+// retain drops memo entries for items no longer in the dead list.
+func (v *deadNudgeVerifiedSet) retain(items []queuedNudge) {
+	keep := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		keep[item.ID+"|"+item.BeadID] = struct{}{}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for k := range v.ids {
+		if _, ok := keep[k]; !ok {
+			delete(v.ids, k)
+		}
+	}
+}
+
+func (v *deadNudgeVerifiedSet) reset() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.ids = map[string]struct{}{}
 }
 
 func queuedNudgeExists(state *nudgeQueueState, id string) bool {
