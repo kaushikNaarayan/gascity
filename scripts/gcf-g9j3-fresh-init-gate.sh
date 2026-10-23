@@ -84,6 +84,12 @@ echo "gate workdir: $WORKDIR"
 # is still needed for that case.
 cleanup_gate_processes() {
     local pid
+    # gcf-5cz53: the supervisor's argv does not name WORKDIR, so the awk match
+    # below cannot find it; stop it through its own GC_HOME socket first.
+    if [ -n "${GC_HOME:-}" ] && [ -S "$GC_HOME/supervisor.sock" ]; then
+        env -i PATH="$PATH" HOME="${REAL_HOME}" DOLT_ROOT_PATH="$GC_HOME" GC_HOME="$GC_HOME" USER="$(whoami)" \
+            "${START_GC_BIN:-$GC_BIN}" supervisor stop >/dev/null 2>&1 || true
+    fi
     for pid in $(ps -eo pid=,comm=,args= 2>/dev/null \
         | awk -v w="$WORKDIR" -v self="$$" \
             '$2 ~ /^(dolt|gc|gc\.real|bd)$/ && index($0, w) && $1 != self { print $1 }'); do
@@ -97,6 +103,16 @@ trap 'exit 143' TERM HUP
 fail() {
     echo "GATE FAILED: $1" >&2
     exit 1
+}
+
+# gcf-5cz53: runner temp dirs are cleaned and artifact upload is unreliable
+# (storage quota), so on a start-cycle failure print the evidence into the
+# job log itself: the tail of the start log, the runner host and the load.
+dump_start_diag() {
+    local log="$1"
+    echo "--- gate diag: host=$(hostname) loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null) ---" >&2
+    echo "--- tail -80 $log ---" >&2
+    tail -80 "$log" >&2 2>/dev/null || echo "(no $log)" >&2
 }
 
 isolated_home_setup() {
@@ -243,20 +259,39 @@ wait_for_city_readiness_or_failure() {
     return 2
 }
 
+# gcf-5cz53: `gc init --no-start` does not register the city with the
+# supervisor, so a bare `supervisor run` comes up with no city to load (no
+# dolt, no sessions) and the readiness wait below times out on every build,
+# the released one included. Register it explicitly (this also starts a
+# detached supervisor, which each cycle below stops before its own run).
+# GCF_G9J3_GATE_SKIP_REGISTER=1 is the negative control for this step only: the gate must FAIL without it.
+if [ "${GCF_G9J3_GATE_SKIP_REGISTER:-0}" != 1 ]; then
+env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" DOLT_ROOT_PATH="$GC_HOME" GC_HOME="$GC_HOME" USER="$(whoami)" \
+    "$START_GC_BIN" register "$CITY" --yes > "$WORKDIR/register.log" 2>&1 \
+    || fail "city register — see $WORKDIR/register.log"
+fi
+
 for cycle in 1 2; do
+    env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" DOLT_ROOT_PATH="$GC_HOME" GC_HOME="$GC_HOME" USER="$(whoami)" \
+        "$START_GC_BIN" supervisor stop > "$WORKDIR/superstop-pre-$cycle.log" 2>&1
     env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="$GC_HOME" USER="$(whoami)" \
         "$GC_BIN" stop "$CITY" --force > "$WORKDIR/stop-$cycle.log" 2>&1
-    nohup timeout 200 env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" GC_HOME="$GC_HOME" USER="$(whoami)" \
+    # Make readiness below mean "THIS start brought dolt up", not a survivor of the register-time supervisor.
+    # Guard: only ever match a city inside this run's WORKDIR (an empty/odd $CITY would otherwise reduce the pattern to a suffix the live town dolt matches).
+    case "$CITY" in "$WORKDIR"/?*) pkill -9 -f "$CITY/.gc/runtime/packs/dolt/dolt-config.yaml" 2>/dev/null ;; esac
+    sleep 2
+    nohup timeout 200 env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" DOLT_ROOT_PATH="$GC_HOME" GC_HOME="$GC_HOME" USER="$(whoami)" \
         "$START_GC_BIN" supervisor run > "$WORKDIR/start-$cycle.log" 2>&1 &
     disown
     wait_for_city_readiness_or_failure "$WORKDIR/start-$cycle.log" "$CITY" "${GCF_G9J3_GATE_READY_TIMEOUT:-180}"
     rc=$?
+    [ "$rc" -ne 0 ] && dump_start_diag "$WORKDIR/start-$cycle.log"
     if [ "$rc" -eq 1 ]; then
         fail "start cycle $cycle: init-failure line detected — see $WORKDIR/start-$cycle.log"
     elif [ "$rc" -eq 2 ]; then
         fail "start cycle $cycle: timed out waiting for city readiness (${GCF_G9J3_GATE_READY_TIMEOUT:-180}s) — see $WORKDIR/start-$cycle.log"
     fi
-    env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" GC_HOME="$GC_HOME" USER="$(whoami)" \
+    env -i PATH="$(dirname "$BD_BIN"):$(dirname "$(command -v dolt)"):/usr/bin:/bin" HOME="${REAL_HOME}" DOLT_ROOT_PATH="$GC_HOME" GC_HOME="$GC_HOME" USER="$(whoami)" \
         "$START_GC_BIN" supervisor stop > "$WORKDIR/superstop-$cycle.log" 2>&1
     sleep 2
     echo "rig-city start cycle $cycle: PASS (city reached readiness, no init-failure line)"
