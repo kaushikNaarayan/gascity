@@ -264,3 +264,58 @@ func TestStampRunSessionIdentityToleratesLengthMismatchAndNilSnapshot(t *testing
 		t.Errorf("expected no writes on degenerate input, got %d", store.writes)
 	}
 }
+
+// rootGateStore hides one bead from Get (as a cross-store or not-yet-visible
+// root would be) and counts the Gets issued for it.
+type rootGateStore struct {
+	beads.Store
+	hiddenID string
+	hidden   bool
+	gets     int
+}
+
+func (r *rootGateStore) Get(id string) (beads.Bead, error) {
+	if id == r.hiddenID {
+		r.gets++
+		if r.hidden {
+			return beads.Bead{}, beads.ErrNotFound
+		}
+	}
+	return r.Store.Get(id)
+}
+
+// TestStampRunSessionIdentityRemembersFailedRootWithinPassOnly pins gcf-eln5 (2):
+// a root whose Get fails is looked up once per pass (not once per step), and a
+// root that appears afterwards is picked up on the NEXT pass. Negative control:
+// without the per-pass failed-root memo every step re-Gets the missing root.
+func TestStampRunSessionIdentityRemembersFailedRootWithinPassOnly(t *testing.T) {
+	const sn = "gascity-packs-polecat-gc-1"
+	const wd = "/home/ds/gascity-packs-worktrees/gascity-packs-polecat-1"
+	root := beads.Bead{ID: "gpk-root", Type: "molecule", Status: "in_progress", Metadata: map[string]string{"gc.kind": "workflow"}}
+	seed := []beads.Bead{root}
+	for _, id := range []string{"gpk-s1", "gpk-s2", "gpk-s3"} {
+		seed = append(seed, beads.Bead{ID: id, Type: "step", Status: "in_progress", Assignee: sn, Metadata: map[string]string{"gc.root_bead_id": "gpk-root"}})
+	}
+	mem := beads.NewMemStoreFrom(0, seed, nil)
+	gate := &rootGateStore{Store: mem, hiddenID: "gpk-root", hidden: true}
+	steps := seed[1:]
+	stores := []beads.Store{gate, gate, gate}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession(sn, wd)})
+
+	stats := stampRunSessionIdentityStats(steps, stores, sessions, io.Discard)
+	if gate.gets != 1 || stats.rootGets != 1 || stats.rootGetFailures != 1 || stats.rootNegativeHits != 2 {
+		t.Fatalf("pass 1: store gets=%d stats=%+v, want 1 Get, 1 failure, 2 negative hits", gate.gets, stats)
+	}
+
+	// The root becomes visible; the next pass must retry and stamp it.
+	gate.hidden = false
+	gate.gets = 0
+	stats = stampRunSessionIdentityStats(steps, stores, sessions, io.Discard)
+	if gate.gets != 1 || stats.rootPatches != 1 {
+		t.Fatalf("pass 2: store gets=%d stats=%+v, want 1 Get and 1 root patch", gate.gets, stats)
+	}
+	gotRoot, _ := mem.Get("gpk-root")
+	if gotRoot.Metadata["gc.session_name"] != sn {
+		t.Errorf("root gc.session_name = %q, want %q after it appeared", gotRoot.Metadata["gc.session_name"], sn)
+	}
+}

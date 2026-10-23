@@ -740,14 +740,25 @@ func buildDesiredStateWithSessionBeads(
 		// correct, and any bead missed by a partial query simply gets stamped
 		// on a later tick.
 		subPhaseStart = time.Now()
-		stampRunSessionIdentity(assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
+		stampStats := stampRunSessionIdentityStats(assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
+		stampElapsed := time.Since(subPhaseStart)
+		canonicalizeStart := time.Now()
 		// Re-home work pre-assigned to a legacy bound form of a now-unbound pool
 		// agent onto the canonical identity, so the canonical session the
 		// awake/scale accounting wakes for it can actually surface and claim it
 		// (the agent-side work_query/claim path matches identities by raw string).
 		canonicalizeLegacyBoundAssignedWork(cfg, assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
+		canonicalizeElapsed := time.Since(canonicalizeStart)
 		recordDemandSubPhase(trace, "demand_snapshot.stamp_and_canonicalize_assigned", subPhaseStart, map[string]any{
-			"beads": len(assignedWorkBeads),
+			"beads":              len(assignedWorkBeads),
+			"stamp_ms":           stampElapsed.Milliseconds(),
+			"canonicalize_ms":    canonicalizeElapsed.Milliseconds(),
+			"in_progress":        stampStats.inProgress,
+			"step_patches":       stampStats.stepPatches,
+			"root_gets":          stampStats.rootGets,
+			"root_get_failures":  stampStats.rootGetFailures,
+			"root_negative_hits": stampStats.rootNegativeHits,
+			"root_patches":       stampStats.rootPatches,
 		})
 		// Re-home open, unassigned work still routed to a legacy bound form of a
 		// now-unbound pool agent. This is the demand/claim half of the migration:
@@ -4195,17 +4206,44 @@ func sessionBeadIdentifierInfo(info session.Info) string {
 // failure is logged and skipped — stamping is best-effort observability and
 // must never block reconciliation.
 func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, sessionBeads *sessionBeadSnapshot, stderr io.Writer) {
+	stampRunSessionIdentityStats(workBeads, workStores, sessionBeads, stderr)
+}
+
+// stampPassStats counts the store round trips one stampRunSessionIdentity pass
+// made, so the demand_snapshot trace can attribute its per-bead cost (gcf-eln5).
+type stampPassStats struct {
+	inProgress       int
+	stepPatches      int
+	rootGets         int
+	rootGetFailures  int
+	rootNegativeHits int
+	rootPatches      int
+}
+
+// stampRootMemo is the per-pass root memo: stamped roots are resolved once, and
+// roots whose Get failed are remembered for the rest of the pass so every further
+// step of a cross-store/missing root does not repeat the failing Get. It lives
+// only for one pass, so a root that appears or changes is re-read on the next one.
+type stampRootMemo struct {
+	stamped map[string]struct{}
+	failed  map[string]struct{}
+	stats   *stampPassStats
+}
+
+func stampRunSessionIdentityStats(workBeads []beads.Bead, workStores []beads.Store, sessionBeads *sessionBeadSnapshot, stderr io.Writer) stampPassStats {
+	var stats stampPassStats
 	if sessionBeads == nil || len(workBeads) != len(workStores) {
-		return
+		return stats
 	}
 	sessionByAssignee := buildSessionAssigneeIndex(sessionBeads)
 	// Roots stamped this pass, so a multi-step run's shared root is resolved
 	// once rather than per step.
-	stampedRoots := map[string]struct{}{}
+	memo := &stampRootMemo{stamped: map[string]struct{}{}, failed: map[string]struct{}{}, stats: &stats}
 	for i, wb := range workBeads {
 		if wb.Status != "in_progress" {
 			continue
 		}
+		stats.inProgress++
 		store := workStores[i]
 		if store == nil {
 			continue
@@ -4233,6 +4271,7 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 			patch[beadmeta.WorkDirMetadataKey] = workDir
 		}
 		if len(patch) > 0 {
+			stats.stepPatches++
 			if err := store.SetMetadataBatch(wb.ID, patch); err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "stampRunSessionIdentity: %s: %v\n", wb.ID, err) //nolint:errcheck
 			}
@@ -4242,8 +4281,9 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 		// workBeads and route-time stamping skips it for pool agents. The
 		// dashboard's root-only snapshot reads the root's own metadata, so a
 		// worked step back-fills its root via gc.root_bead_id. (#2843)
-		stampRunRootFromStep(store, wb, sessionName, workDir, !sbInfo.PoolManaged, stampedRoots, stderr)
+		stampRunRootFromStep(store, wb, sessionName, workDir, !sbInfo.PoolManaged, memo, stderr)
 	}
+	return stats
 }
 
 // workDirStampHasOwnershipEvidence reports whether existing bead metadata
@@ -4264,21 +4304,29 @@ func workDirStampHasOwnershipEvidence(metadata map[string]string, workDir string
 // the root and writes only the keys that differ. Best-effort — a root that is
 // in another store, already gone, or already stamped is silently skipped (a
 // cross-store root gets stamped on its own store's reconcile pass).
-func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workDir string, allowUnownedWorkDir bool, stampedRoots map[string]struct{}, stderr io.Writer) {
+func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workDir string, allowUnownedWorkDir bool, memo *stampRootMemo, stderr io.Writer) {
 	rootID := strings.TrimSpace(step.Metadata[beadmeta.RootBeadIDMetadataKey])
 	if rootID == "" || rootID == step.ID {
 		return
 	}
-	if _, done := stampedRoots[rootID]; done {
+	if _, done := memo.stamped[rootID]; done {
 		return
 	}
+	if _, bad := memo.failed[rootID]; bad {
+		memo.stats.rootNegativeHits++
+		return
+	}
+	memo.stats.rootGets++
 	root, err := store.Get(rootID)
 	if err != nil {
-		// Cross-store / missing / transient — do NOT mark stamped, so a later
-		// step this pass (or a later reconcile) can retry resolving the root.
+		// Cross-store / missing / transient — not marked stamped, but remembered
+		// as failed for the rest of THIS pass only, so later steps of the same
+		// root skip the repeat Get while the next reconcile pass retries it.
+		memo.stats.rootGetFailures++
+		memo.failed[rootID] = struct{}{}
 		return
 	}
-	stampedRoots[rootID] = struct{}{}
+	memo.stamped[rootID] = struct{}{}
 	patch := map[string]string{}
 	if sessionName != "" && strings.TrimSpace(root.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 		patch[beadmeta.SessionNameMetadataKey] = sessionName
@@ -4290,6 +4338,7 @@ func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workD
 	if len(patch) == 0 {
 		return
 	}
+	memo.stats.rootPatches++
 	if err := store.SetMetadataBatch(rootID, patch); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "stampRunSessionIdentity root %s: %v\n", rootID, err) //nolint:errcheck
 	}
