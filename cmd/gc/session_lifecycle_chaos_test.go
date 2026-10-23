@@ -46,8 +46,10 @@ func TestReconciler_RollsBackExpiredPendingCreateForConfiguredNamedSession(t *te
 	h.createSessionIntent()
 	h.assertCreatingIntent()
 
+	stale := h.env.clk.Now().Add(-pendingCreateNeverStartedTimeout - pendingCreateDeferredGrace - time.Minute).UTC().Format(time.RFC3339)
 	markConfiguredNamedPendingCreate(t, h, map[string]string{
-		"pending_create_started_at": h.env.clk.Now().Add(-pendingCreateNeverStartedTimeout - time.Minute).UTC().Format(time.RFC3339),
+		"pending_create_started_at":  stale,
+		"pending_create_deferred_at": stale,
 	})
 	h.setDesired(false)
 	h.reconcileTick()

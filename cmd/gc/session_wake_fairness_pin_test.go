@@ -185,7 +185,9 @@ func TestWakeBudgetFairnessEpochBoundsFreshCycleStarvation(t *testing.T) {
 	for i := 0; i < maxWakes; i++ {
 		old = append(old, create("old-"+string(rune('a'+i)), base.Add(-2*time.Hour)))
 	}
-	dispatcher := create("control-dispatcher", base.Add(-time.Hour))
+	// Not named control-dispatcher: infra templates now rank ahead of this epoch
+	// path (gcf-rrzbj, session_wake_priority_test.go).
+	dispatcher := create("late-seat", base.Add(-time.Hour))
 
 	candidates := func() []startCandidate {
 		out := make([]startCandidate, 0, maxWakes+1)

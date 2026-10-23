@@ -261,6 +261,7 @@ type Info struct {
 	// internal-only mirror; see WakeAttemptsMetadata for the precedent.
 	PendingCreateClaimMetadata string
 	PendingCreateStartedAt     string   // pending_create_started_at (raw RFC3339; stale-create sweep parses it)
+	PendingCreateDeferredAt    string   // pending_create_deferred_at (raw RFC3339; last wake-budget deferral of a never-started create)
 	WakeAttempts               int      // wake_attempts parsed as int (0 on missing/invalid)
 	QuarantinedUntil           string   // quarantined_until (raw RFC3339; quarantine check parses it)
 	AliasHistory               []string // prior aliases (alias_history, normalized via session.AliasHistory)

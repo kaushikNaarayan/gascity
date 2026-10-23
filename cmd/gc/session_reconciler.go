@@ -974,6 +974,48 @@ func pendingCreateLeaseActiveInfo(i sessionpkg.Info, clk clock.Clock, startupTim
 // behind a busy pool start queue.
 const pendingCreateNeverStartedTimeout = 10 * time.Minute
 
+// pendingCreateDeferredGrace keeps a never-started pending create alive while the
+// wake budget keeps deferring it (gcf-rrzbj e). The patrol gap (15m, longer under
+// load) exceeds pendingCreateNeverStartedTimeout, so a create deferred in one wave
+// would otherwise be rolled back and re-created before the next wave could start
+// it. It must exceed any plausible patrol gap; a deferral older than this means the
+// reconciler stopped offering the session waves, and rollback is correct again.
+const pendingCreateDeferredGrace = time.Hour
+
+// pendingCreateDeferredRefreshAfter rate-limits the pending_create_deferred_at
+// write so a deep backlog does one store write per session per interval, not per tick.
+const pendingCreateDeferredRefreshAfter = 20 * time.Minute
+
+// firstWavePendingCreateGrace gives a never-started pending create one reconcile
+// pass of grace before its lease can roll it back (gcf-rrzbj f). Hand-made sessions
+// are created between ticks and are first met by a pass 15m or more after the
+// anchor, so the 10m lease is already spent before any start wave could offer them
+// as a candidate. When the lease would expire and no wave has yet deferred this
+// attempt, it returns the pending_create_deferred_at patch that opens the deferred
+// grace instead; the create then rolls back only if no wave starts it within
+// pendingCreateDeferredGrace. A create offered a wave and failed to start has
+// last_woke_at (or a deferred marker) and is not touched, so it still expires.
+func firstWavePendingCreateGrace(i sessionpkg.Info, clk clock.Clock) (sessionpkg.MetadataPatch, bool) {
+	if !i.PendingCreateClaim || strings.TrimSpace(i.LastWokeAt) != "" || strings.TrimSpace(i.ID) == "" {
+		return nil, false
+	}
+	if !pendingCreateRollbackState(i.MetadataState) || !pendingCreateNeverStartedLeaseExpiredInfo(i, clk) {
+		return nil, false
+	}
+	anchor := i.CreatedAt
+	if started, ok := parseRFC3339Metadata(i.PendingCreateStartedAt); ok {
+		anchor = started
+	}
+	if deferred, ok := parseRFC3339Metadata(i.PendingCreateDeferredAt); ok && !deferred.Before(anchor) {
+		return nil, false
+	}
+	now := time.Now()
+	if clk != nil {
+		now = clk.Now()
+	}
+	return sessionpkg.MetadataPatch{"pending_create_deferred_at": now.UTC().Format(time.RFC3339)}, true
+}
+
 // pendingCreateNeverStartedExpiredInfo reports whether a never-started
 // pending-create lease in a rollback state has expired. Info.MetadataState is the
 // RAW state metadata handed to pendingCreateRollbackState (which trims internally).
@@ -1001,12 +1043,18 @@ func pendingCreateNeverStartedLeaseExpiredInfo(i sessionpkg.Info, clk clock.Cloc
 	if started, ok := parseRFC3339Metadata(i.PendingCreateStartedAt); ok {
 		anchor = started
 	}
-	if anchor.IsZero() {
-		return true
-	}
 	now := time.Now()
 	if clk != nil {
 		now = clk.Now()
+	}
+	// A wake-budget deferral recorded AFTER this attempt's anchor means the session
+	// is waiting for a wave slot, not stuck: hold the lease for the deferred grace.
+	if deferred, ok := parseRFC3339Metadata(i.PendingCreateDeferredAt); ok && !deferred.Before(anchor) &&
+		!now.After(deferred.Add(pendingCreateDeferredGrace)) {
+		return false
+	}
+	if anchor.IsZero() {
+		return true
 	}
 	return now.After(anchor.Add(pendingCreateNeverStartedTimeout))
 }
@@ -1573,6 +1621,9 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// every helper below takes the session id or the folded Info.
 		id := orderedRows[i].Info.ID
 		info := infoByID[id]
+		if patch, ok := firstWavePendingCreateGrace(info, clk); ok && sessFront != nil {
+			info = tick.applyStore(id, sessFront, patch)
+		}
 		name := strings.TrimSpace(info.SessionNameMetadata)
 		tp, desired := desiredState[name]
 		if shadowTick != nil {

@@ -146,6 +146,7 @@ var infoKeyCodec = []infoKeySpec{
 		i.PendingCreateClaimMetadata = v
 	}},
 	{"pending_create_started_at", func(i *Info, v string) { i.PendingCreateStartedAt = v }},
+	{"pending_create_deferred_at", func(i *Info, v string) { i.PendingCreateDeferredAt = v }},
 	{"quarantined_until", func(i *Info, v string) { i.QuarantinedUntil = v }},
 	{aliasHistoryMetadataKey, func(i *Info, v string) {
 		i.AliasHistory = normalizeAliasList(strings.Split(v, ","), "")

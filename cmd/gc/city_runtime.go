@@ -839,6 +839,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		// Re-read on every iteration so a hot reload of city.toml takes
 		// effect on the next event without disturbing in-flight timers.
 		debounce := cr.cfg.Daemon.TickDebounceDuration()
+		syncPatrolTicker(ticker, &interval, cr.cfg.Daemon.PatrolIntervalDuration())
 		select {
 		case <-ticker.C:
 			// Patrol scans every reconciler state authoritatively, so any
@@ -878,6 +879,19 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// syncPatrolTicker applies a hot-reloaded patrol_interval to the running patrol
+// ticker. *current tracks the interval the ticker was last armed with; it is
+// updated and the ticker Reset only when want is positive and differs. It
+// reports whether the ticker was reset.
+func syncPatrolTicker(ticker *time.Ticker, current *time.Duration, want time.Duration) bool {
+	if want <= 0 || want == *current {
+		return false
+	}
+	ticker.Reset(want)
+	*current = want
+	return true
 }
 
 type orderCadencedDispatcher interface {

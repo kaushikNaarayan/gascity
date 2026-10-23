@@ -5943,8 +5943,10 @@ func TestReconcileSessionBeads_ConfiguredPendingCreateWithoutDemandUsesNeverStar
 			wantClosed: false,
 		},
 		{
-			name:       "after lease expires",
-			startedAt:  time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC).Add(-(pendingCreateNeverStartedTimeout + time.Second)),
+			name: "after lease expires",
+			// Past the lease AND the deferred grace a first reconcile pass opens
+			// (gcf-rrzbj f); the marker below records that wave.
+			startedAt:  time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC).Add(-(pendingCreateNeverStartedTimeout + pendingCreateDeferredGrace + time.Second)),
 			wantClosed: true,
 		},
 	}
@@ -5955,9 +5957,10 @@ func TestReconcileSessionBeads_ConfiguredPendingCreateWithoutDemandUsesNeverStar
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			session := env.createSessionBead("s-gc-late", "worker")
 			env.setSessionMetadata(&session, map[string]string{
-				"state":                     "creating",
-				"pending_create_claim":      "true",
-				"pending_create_started_at": pendingCreateStartedAtNow(tt.startedAt),
+				"state":                      "creating",
+				"pending_create_claim":       "true",
+				"pending_create_started_at":  pendingCreateStartedAtNow(tt.startedAt),
+				"pending_create_deferred_at": pendingCreateStartedAtNow(tt.startedAt),
 				// last_woke_at deliberately empty: preWakeCommit never fired before
 				// this configured template lost pool demand.
 			})
@@ -7619,15 +7622,16 @@ func TestReconcileSessionBeads_RollsBackPendingCreateWhenLeaseExpiredAndNoRuntim
 		Type:   sessionBeadType,
 		Labels: []string{sessionBeadLabel, "template:helper"},
 		Metadata: map[string]string{
-			"session_name":              "helper",
-			"session_name_explicit":     "true",
-			"pending_create_claim":      "true",
-			"pending_create_started_at": pendingCreateStartedAtNow(clk.Now().Add(-(pendingCreateNeverStartedTimeout + time.Second))),
-			"template":                  "helper",
-			"state":                     "creating",
-			"generation":                "1",
-			"continuation_epoch":        "1",
-			"instance_token":            "test-token",
+			"session_name":               "helper",
+			"session_name_explicit":      "true",
+			"pending_create_claim":       "true",
+			"pending_create_started_at":  pendingCreateStartedAtNow(clk.Now().Add(-(pendingCreateNeverStartedTimeout + pendingCreateDeferredGrace + time.Second))),
+			"pending_create_deferred_at": pendingCreateStartedAtNow(clk.Now().Add(-(pendingCreateNeverStartedTimeout + pendingCreateDeferredGrace + time.Second))),
+			"template":                   "helper",
+			"state":                      "creating",
+			"generation":                 "1",
+			"continuation_epoch":         "1",
+			"instance_token":             "test-token",
 			// last_woke_at deliberately empty — preWakeCommit never fired.
 		},
 	})
@@ -8210,7 +8214,7 @@ func TestReconcileSessionBeads_RollbackBudgetDefersExcessStaleNoRuntimeCreatesAn
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "helper"}}}
 
 	var sessions []beads.Bead
-	staleStartedAt := pendingCreateStartedAtNow(env.clk.Now().Add(-(pendingCreateNeverStartedTimeout + time.Second)))
+	staleStartedAt := pendingCreateStartedAtNow(env.clk.Now().Add(-(pendingCreateNeverStartedTimeout + pendingCreateDeferredGrace + time.Second)))
 	for i := 0; i < 6; i++ {
 		name := fmt.Sprintf("sky-%d", i)
 		env.addDesired(name, "helper", false)
@@ -8218,10 +8222,11 @@ func TestReconcileSessionBeads_RollbackBudgetDefersExcessStaleNoRuntimeCreatesAn
 		env.markSessionCreating(&session)
 		session.CreatedAt = env.clk.Now().Add(-24 * time.Hour)
 		env.setSessionMetadata(&session, map[string]string{
-			"pending_create_claim":      "true",
-			"pending_create_started_at": staleStartedAt,
-			"session_name_explicit":     "true",
-			"instance_token":            fmt.Sprintf("token-%d", i),
+			"pending_create_claim":       "true",
+			"pending_create_started_at":  staleStartedAt,
+			"pending_create_deferred_at": staleStartedAt,
+			"session_name_explicit":      "true",
+			"instance_token":             fmt.Sprintf("token-%d", i),
 		})
 		sessions = append(sessions, session)
 	}

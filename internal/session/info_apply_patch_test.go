@@ -34,7 +34,7 @@ var allProjectedMetadataKeys = []string{
 	beadmeta.TriggerBeadStoreRefMetadataKey, beadmeta.BrainParentSIDMetadataKey,
 	beadmeta.PackMetadataKey, beadmeta.PackWorkspaceMetadataKey, beadmeta.WorkDirMetadataKey,
 	beadmeta.WorkerDirMetadataKey,
-	"pending_create_claim", "pending_create_started_at", "quarantined_until",
+	"pending_create_claim", "pending_create_started_at", "pending_create_deferred_at", "quarantined_until",
 	aliasHistoryMetadataKey, "continuity_eligible", "last_woke_at", "wake_budget_spent_at", "awake_started_at", "usage_compute_emitted_at", "state_reason",
 	"creation_complete_at", "continuation_reset_pending", SessionCircuitStateMetadataKey,
 	ResetCommittedAtKey,

@@ -209,12 +209,36 @@ func markWakeBudgetSpent(candidate *startCandidate, sessFront *sessionpkg.Store,
 	return nil
 }
 
-// sortCandidatesByWakeFairness orders candidates least-recently-woken first so a
-// budget-limited tick rotates wakes across sessions instead of always deferring
-// the same back-of-order sessions. Stable on the original order for ties. Callers
-// must only sort within a dependency wave (every candidate's deps are satisfied).
+// wakeFairnessRank groups candidates for the per-tick wake budget. Infra
+// (always-mode named sessions and control dispatchers) wakes ahead of on-demand
+// crew; a candidate that has never attempted a start (no wake_budget_spent_at and
+// no valid last_woke_at) wakes ahead of one that has, so a pending create that is rolled back and
+// re-created (fresh CreatedAt) no longer sorts behind every long-dead seat.
+func wakeFairnessRank(c startCandidate) int {
+	if c.info.ConfiguredNamedMode == "always" || c.tp.ConfiguredNamedMode == "always" ||
+		strings.HasSuffix(c.logicalTemplate(nil), "control-dispatcher") {
+		return 0
+	}
+	if _, err := time.Parse(time.RFC3339, c.info.WakeBudgetSpentAt); err == nil {
+		return 2
+	}
+	if _, err := time.Parse(time.RFC3339, c.info.LastWokeAt); err == nil {
+		return 2
+	}
+	return 1
+}
+
+// sortCandidatesByWakeFairness orders candidates by wakeFairnessRank, then (for
+// attempted candidates) least-recently-woken first so a budget-limited tick
+// rotates wakes across sessions instead of always deferring the same back-of-order
+// sessions. Stable on the original order for ties. Callers must only sort within
+// a dependency wave (every candidate's deps are satisfied).
 func sortCandidatesByWakeFairness(candidates []startCandidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
+		ri, rj := wakeFairnessRank(candidates[i]), wakeFairnessRank(candidates[j])
+		if ri != rj {
+			return ri < rj
+		}
 		return wakeFairnessTime(candidates[i]).Before(wakeFairnessTime(candidates[j]))
 	})
 }
@@ -627,6 +651,31 @@ func formatLifecycleError(err error) string {
 		return ""
 	}
 	return strings.ReplaceAll(err.Error(), "\n", "\\n")
+}
+
+// holdDeferredPendingCreateLease records that a never-started pending create was
+// offered a wave but deferred by the wake budget, so its rollback lease holds for
+// pendingCreateDeferredGrace instead of expiring before the next wave (gcf-rrzbj e).
+// Only never-started creates (claim held, no last_woke_at) are touched; a create
+// whose start actually ran and failed has a last_woke_at / rollback path of its own.
+// Best-effort and rate-limited: a failed write only loses the extension.
+func holdDeferredPendingCreateLease(c startCandidate, sessFront *sessionpkg.Store, clk clock.Clock, stderr io.Writer) {
+	if sessFront == nil || !c.info.PendingCreateClaim || strings.TrimSpace(c.info.LastWokeAt) != "" || strings.TrimSpace(c.info.ID) == "" {
+		return
+	}
+	now := time.Now()
+	if clk != nil {
+		now = clk.Now()
+	}
+	if prev, ok := parseRFC3339Metadata(c.info.PendingCreateDeferredAt); ok && now.Sub(prev) < pendingCreateDeferredRefreshAfter {
+		return
+	}
+	patch := sessionpkg.MetadataPatch{"pending_create_deferred_at": now.UTC().Format(time.RFC3339)}
+	if err := sessFront.ApplyPatch(c.info.ID, patch); err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: hold deferred pending-create lease %s: %v\n", c.info.ID, err) //nolint:errcheck
+		}
+	}
 }
 
 func logLifecycleWave(w io.Writer, op string, wave int, started time.Time, count int) {
@@ -2730,6 +2779,7 @@ func executePlannedStartsTraced(
 		if wakeCount >= maxWakes {
 			for _, candidate := range waveCandidates {
 				logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
+				holdDeferredPendingCreateLease(candidate, sessFront, clk, stderr)
 			}
 			continue
 		}
@@ -2754,6 +2804,7 @@ func executePlannedStartsTraced(
 			if wakeCount >= maxWakes {
 				for _, candidate := range ready[offset:] {
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
+					holdDeferredPendingCreateLease(candidate, sessFront, clk, stderr)
 				}
 				break
 			}

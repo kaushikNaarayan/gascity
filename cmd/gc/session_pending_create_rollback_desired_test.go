@@ -81,26 +81,28 @@ func TestDesiredQuarantinedPendingCreateRollsBackAfterLeaseExpiry(t *testing.T) 
 
 	if err := h.env.store.SetMetadataBatch(h.sessionID, map[string]string{
 		// Quarantine outlives the never-started lease timeout by a wide margin.
-		"quarantined_until": h.env.clk.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		"quarantined_until": h.env.clk.Now().Add(4 * time.Hour).UTC().Format(time.RFC3339),
 	}); err != nil {
 		t.Fatalf("seed quarantine: %v", err)
 	}
 	// Healing must come from the rollback, never from a successful start.
 	h.env.sp.StartErrors[h.sessionName] = errors.New("provider start failure")
 
-	at := runDesiredPendingCreateTicks(t, h, 30)
+	// A hand-made create gets one wave of grace before the lease can roll it back
+	// (gcf-rrzbj f), so the floor is the deferred grace, not the bare 10m lease.
+	at := runDesiredPendingCreateTicks(t, h, int((pendingCreateDeferredGrace+pendingCreateNeverStartedTimeout)/time.Minute)+10)
 	if at < 0 {
 		got, _ := h.env.store.Get(h.sessionID)
-		t.Fatalf("quarantined never-started pending-create survived 30m (lease expired at %s): status=%q state=%q claim=%q",
+		t.Fatalf("quarantined never-started pending-create survived the grace (lease expired at %s): status=%q state=%q claim=%q",
 			pendingCreateNeverStartedTimeout, got.Status,
 			strings.TrimSpace(got.Metadata["state"]),
 			strings.TrimSpace(got.Metadata["pending_create_claim"]))
 	}
 	// The rollback must be driven by the lease floor, not by the quarantine
 	// lifting at 60m — catching a regression that defers it to quarantine expiry.
-	if maxTicks := int(pendingCreateNeverStartedTimeout/time.Minute) + 5; at > maxTicks {
-		t.Errorf("claim released at tick %d, want <= %d (lease floor %s, not quarantine expiry)",
-			at, maxTicks, pendingCreateNeverStartedTimeout)
+	if maxTicks := int((pendingCreateNeverStartedTimeout+pendingCreateDeferredGrace)/time.Minute) + 5; at > maxTicks {
+		t.Errorf("claim released at tick %d, want <= %d (lease floor %s + grace %s, not quarantine expiry)",
+			at, maxTicks, pendingCreateNeverStartedTimeout, pendingCreateDeferredGrace)
 	}
 }
 
