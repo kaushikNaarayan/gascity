@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
@@ -415,7 +416,7 @@ func (p *agentBuildParams) resolveSessionName(qualifiedName, _ string) string {
 		}
 	}
 	if p.beadStore != nil {
-		sn := findSessionNameByTemplate(p.beadStore, qualifiedName)
+		sn := p.storeSessionNames.find(p.beadStore, qualifiedName)
 		if sn != "" {
 			p.beadNames[qualifiedName] = sn
 			return sn
@@ -426,6 +427,41 @@ func (p *agentBuildParams) resolveSessionName(qualifiedName, _ string) string {
 	sn := agent.SessionNameFor(p.cityName, qualifiedName, p.sessionTemplate)
 	p.beadNames[qualifiedName] = sn
 	return sn
+}
+
+// storeSessionNameIndex serves resolveSessionName's store fallback (a name the
+// tick's session snapshot does not know) from a single fresh open-session load
+// per build cycle. findSessionNameByTemplate costs four full metadata/label
+// scans of the store per name, and every desired agent without an open session
+// bead pays it every tick, so the cost grew linearly with desired sessions
+// (gcf-eln5: ~0.5s each at 70k beads). One loadSessionBeadSnapshot is two
+// open-session lists regardless of how many names miss, and the snapshot's
+// agent-name/template-hint indexes encode the same precedence rules the
+// per-name scan applied. If that load fails the per-name scan is the fallback,
+// so a store hiccup degrades to the old behavior, never to a wrong name.
+type storeSessionNameIndex struct {
+	mu     sync.Mutex
+	loaded bool
+	snap   *sessionBeadSnapshot
+}
+
+func (x *storeSessionNameIndex) find(store beads.Store, qualifiedName string) string {
+	if x == nil {
+		return findSessionNameByTemplate(store, qualifiedName)
+	}
+	x.mu.Lock()
+	if !x.loaded {
+		x.loaded = true
+		if snap, err := loadSessionBeadSnapshot(store); err == nil {
+			x.snap = snap
+		}
+	}
+	snap := x.snap
+	x.mu.Unlock()
+	if snap == nil {
+		return findSessionNameByTemplate(store, qualifiedName)
+	}
+	return snap.FindSessionNameByTemplate(strings.TrimSpace(qualifiedName))
 }
 
 // sessionNameFromBeadID derives the tmux session name from a bead ID.

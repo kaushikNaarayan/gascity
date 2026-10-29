@@ -77,6 +77,11 @@ type agentBuildParams struct {
 	// during this build cycle. Populated lazily by resolveSessionName.
 	beadNames map[string]string
 
+	// storeSessionNames answers resolveSessionName's store-fallback lookups from
+	// one open-session pass per build cycle instead of four metadata scans per
+	// name (gcf-eln5). A pointer so the by-value copies of the params share it.
+	storeSessionNames *storeSessionNameIndex
+
 	// skillCatalog is the shared skill catalog for this city (union of
 	// city pack's skills/ and every bootstrap implicit-import pack's
 	// skills/). Loaded once per build cycle and reused across every
@@ -110,27 +115,28 @@ type agentBuildParams struct {
 // newAgentBuildParams constructs agentBuildParams from the common startup values.
 func newAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtime.Provider, beaconTime time.Time, store beads.Store, stderr io.Writer) *agentBuildParams {
 	params := &agentBuildParams{
-		city:            cfg,
-		cityName:        cityName,
-		cityPath:        cityPath,
-		workspace:       &cfg.Workspace,
-		agents:          append([]config.Agent(nil), cfg.Agents...),
-		providers:       cfg.Providers,
-		lookPath:        exec.LookPath,
-		fs:              fsys.OSFS{},
-		sp:              sp,
-		rigs:            cfg.Rigs,
-		sessionTemplate: cfg.Workspace.SessionTemplate,
-		beaconTime:      beaconTime,
-		packDirs:        cfg.PackDirs,
-		packOverlayDirs: cfg.PackOverlayDirs,
-		rigOverlayDirs:  cfg.RigOverlayDirs,
-		globalFragments: cfg.Workspace.GlobalFragments,
-		appendFragments: mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
-		beadStore:       store,
-		beadNames:       make(map[string]string),
-		stderr:          stderr,
-		sessionProvider: cfg.Session.Provider,
+		city:              cfg,
+		cityName:          cityName,
+		cityPath:          cityPath,
+		workspace:         &cfg.Workspace,
+		agents:            append([]config.Agent(nil), cfg.Agents...),
+		providers:         cfg.Providers,
+		lookPath:          exec.LookPath,
+		fs:                fsys.OSFS{},
+		sp:                sp,
+		rigs:              cfg.Rigs,
+		sessionTemplate:   cfg.Workspace.SessionTemplate,
+		beaconTime:        beaconTime,
+		packDirs:          cfg.PackDirs,
+		packOverlayDirs:   cfg.PackOverlayDirs,
+		rigOverlayDirs:    cfg.RigOverlayDirs,
+		globalFragments:   cfg.Workspace.GlobalFragments,
+		appendFragments:   mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
+		beadStore:         store,
+		beadNames:         make(map[string]string),
+		storeSessionNames: &storeSessionNameIndex{},
+		stderr:            stderr,
+		sessionProvider:   cfg.Session.Provider,
 	}
 	if store != nil {
 		params.poolSessionCreateBudget = poolplan.NewCreateBudget(cfg.Daemon.MaxWakesPerTickOrDefault())
