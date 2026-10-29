@@ -768,8 +768,14 @@ func buildDesiredStateWithSessionBeads(
 		// string, so the route must be canonicalized before demand is counted or
 		// the cold pool never wakes for it.
 		subPhaseStart = time.Now()
+		// The open-population read shares assignedReadyCache's memo with the
+		// assigned-work pass above (gcf-eln5): that pass's writes
+		// (stampRunSessionIdentity, canonicalizeLegacyBoundAssignedWork) touch only
+		// assigned beads' assignee/gc.routed_to and session_name/work_dir
+		// metadata, none of which this unassigned-and-routed filter reads for an
+		// unassigned bead, so the pre-write snapshot selects the same set.
 		var unassignedRoutedPartial bool
-		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWork(cfg, store, rigStores, suspendedRigPaths, stderr)
+		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWork(cfg, store, rigStores, suspendedRigPaths, stderr, assignedReadyCache)
 		canonicalizeLegacyBoundUnassignedRoutedWork(cfg, unassignedRoutedBeads, unassignedRoutedStores, stderr)
 		repairControlDispatcherRoutesForStoreScope(cityPath, cfg, unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, stderr)
 		// canonicalizeLegacyBound* above rewrote gc.routed_to on open ready
@@ -1346,7 +1352,7 @@ func collectAssignedWorkBeadsWithStores(
 			// demand (EB-42o8/gc-nz5i; extends gc-4zb/#4395). A Live read reaches
 			// the backing store's raw --status=open filter, which excludes it —
 			// see listOpenForControllerDemandLive.
-			if openDemand, err := listOpenForControllerDemandLive(source.store); err == nil {
+			if openDemand, err := cache.openLiveSnapshot(source.store); err == nil {
 				appendOpenAssignedMoleculeWorkUnique(&result, &resultStores, &resultStoreRefs, readyIDs, openDemand, seen, source.store, source.ref)
 			} else {
 				errs = append(errs, fmt.Errorf("List(open, live demand): %w", err))
@@ -1375,7 +1381,7 @@ func collectAssignedWorkBeadsWithStores(
 			// appendOpenRoutedWorkUnique never markReadyAssigned (see the
 			// skipReadyAssignees note below), and releaseOrphanedPoolAssignments'
 			// own live re-read (liveWorkAssignmentStillReleasable) skips it.
-			if openRouted, err := listBothTiersForControllerDemand(source.store, beads.ListQuery{Status: "open"}); err == nil {
+			if openRouted, err := cache.openCachedSnapshot(source.store); err == nil {
 				appendOpenRoutedWorkUnique(&result, &resultStores, &resultStoreRefs, openRouted, seen, source.store, source.ref)
 			} else {
 				errs = append(errs, fmt.Errorf("List(open): %w", err))
@@ -2164,6 +2170,12 @@ type readyDemandCache struct {
 	mu     sync.Mutex
 	live   map[beads.Store]*readyDemandEntry
 	cached map[beads.Store]*readyDemandEntry
+	// openLive and openCached memoize the Status:"open" population reads
+	// (listOpenForControllerDemandLive / listBothTiersForControllerDemand) the
+	// same way: one backing-store scan per store per cache, not one per consumer.
+	// See openLiveSnapshot.
+	openLive   map[beads.Store]*readyDemandEntry
+	openCached map[beads.Store]*readyDemandEntry
 }
 
 type readyDemandEntry struct {
@@ -2174,8 +2186,10 @@ type readyDemandEntry struct {
 
 func newReadyDemandCache() *readyDemandCache {
 	return &readyDemandCache{
-		live:   make(map[beads.Store]*readyDemandEntry),
-		cached: make(map[beads.Store]*readyDemandEntry),
+		live:       make(map[beads.Store]*readyDemandEntry),
+		cached:     make(map[beads.Store]*readyDemandEntry),
+		openLive:   make(map[beads.Store]*readyDemandEntry),
+		openCached: make(map[beads.Store]*readyDemandEntry),
 	}
 }
 
@@ -2214,6 +2228,63 @@ func (c *readyDemandCache) cachedSnapshot(store beads.Store) ([]beads.Bead, erro
 		e.rows, e.err = beads.HandlesFor(store).Cached.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
 	})
 	return e.rows, e.err
+}
+
+// openLiveSnapshot returns the memoized Status:"open" live population read for
+// store (listOpenForControllerDemandLive), fetching it once. On a 12k-open-bead
+// city each of these scans costs seconds, and a tick issued it once per
+// consumer (assigned-molecule demand, unassigned-routed re-home) per store
+// (gcf-eln5). Every call returns an independent copy: consumers such as
+// repairControlDispatcherRoutesForStoreScope delete keys from Bead.Metadata,
+// and a shared map would leak that edit to the next consumer. A nil cache
+// reads directly.
+func (c *readyDemandCache) openLiveSnapshot(store beads.Store) ([]beads.Bead, error) {
+	if c == nil {
+		return listOpenForControllerDemandLive(store)
+	}
+	e := c.entry(c.openLive, store)
+	e.once.Do(func() {
+		e.rows, e.err = listOpenForControllerDemandLive(store)
+	})
+	return cloneBeadRows(e.rows), e.err
+}
+
+// openCachedSnapshot is openLiveSnapshot for the collapsed-status cache tier
+// (listBothTiersForControllerDemand with Status:"open"). A nil cache reads
+// directly.
+func (c *readyDemandCache) openCachedSnapshot(store beads.Store) ([]beads.Bead, error) {
+	if c == nil {
+		return listBothTiersForControllerDemand(store, beads.ListQuery{Status: "open"})
+	}
+	e := c.entry(c.openCached, store)
+	e.once.Do(func() {
+		e.rows, e.err = listBothTiersForControllerDemand(store, beads.ListQuery{Status: "open"})
+	})
+	return cloneBeadRows(e.rows), e.err
+}
+
+// cloneBeadRows copies rows deeply enough that a consumer may mutate
+// Metadata, Labels, Needs, or Dependencies without touching the memo. nil in,
+// nil out.
+func cloneBeadRows(rows []beads.Bead) []beads.Bead {
+	if rows == nil {
+		return nil
+	}
+	out := make([]beads.Bead, len(rows))
+	for i, b := range rows {
+		if b.Metadata != nil {
+			m := make(map[string]string, len(b.Metadata))
+			for k, v := range b.Metadata {
+				m[k] = v
+			}
+			b.Metadata = m
+		}
+		b.Labels = append([]string(nil), b.Labels...)
+		b.Needs = append([]string(nil), b.Needs...)
+		b.Dependencies = append([]beads.Dep(nil), b.Dependencies...)
+		out[i] = b
+	}
+	return out
 }
 
 // liveReady reproduces liveReadyForControllerDemandQuery from the shared live
@@ -4498,7 +4569,8 @@ func canonicalizeLegacyBoundUnassignedRoutedWork(cfg *config.City, workBeads []b
 // read per store per tick so the raw-status filter runs, which costs a
 // backing-store round trip the cached read did not — the accepted tradeoff for
 // not counting blocked work as demand.
-func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, stderr io.Writer) ([]beads.Bead, []beads.Store, []string, bool) {
+func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, stderr io.Writer, caches ...*readyDemandCache) ([]beads.Bead, []beads.Store, []string, bool) {
+	cache := optionalReadyDemandCache(caches)
 	if cfg == nil {
 		return nil, nil, nil, false
 	}
@@ -4529,7 +4601,7 @@ func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigSto
 		// and the route-repair passes, and mapBdStatus would otherwise collapse a
 		// blocked bead to "open" and let it count as spawn capacity or get its route
 		// re-stamped (EB-42o8/gc-nz5i; extends gc-4zb/#4395). See listOpenForControllerDemandLive.
-		open, err := listOpenForControllerDemandLive(source.store)
+		open, err := cache.openLiveSnapshot(source.store)
 		if err != nil {
 			// A failed live demand read must NOT read as zero demand: the only
 			// demand signal this set feeds is openControlDispatcherDemand (its
