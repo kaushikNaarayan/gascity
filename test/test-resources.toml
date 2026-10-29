@@ -17,8 +17,12 @@ resource = "subprocess"
 # tagged cmd/gc/real_binary_guard_exec_test.go (+1 file, +1 exec.Command call:
 # the `bd version` pin check). The untagged and Small debt ratchets are
 # deliberately unchanged.
-baseline_calls = 614
-baseline_files = 177
+# 614/177 -> 615/178 (gcf-2g1th): accounted for entirely by the new
+# internal/bootstrap/packs/core/cascade_nudge_behavior_test.go (+1 file, +1
+# exec.Command call: runs the shipped bash script against a fake gc). The call
+# is a declared Medium owner, so the Small debt ratchet is unchanged.
+baseline_calls = 615
+baseline_files = 178
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-80po0c.2"
@@ -82,8 +86,10 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 413
-baseline_files = 118
+# +1 call/+1 file (gcf-2g1th): cascade_nudge_behavior_test.go, a declared
+# Medium owner; see the scope=all subprocess row above.
+baseline_calls = 414
+baseline_files = 119
 reported_calls = 380
 reported_files = 98
 owner_bead = "ga-80po0c.2"
@@ -247,6 +253,17 @@ resources = ["subprocess"]
 owner_bead = "ga-80po0c.2.1"
 invariant = "internal/api tracked-source error URN guard is a checked Medium owner"
 resource_owner = "only the git ls-files call lexically inside TestEveryEmittedErrorCodeIsRegistered leaves Small debt"
+migration_target = "P0.4b"
+expires = "2026-10-31"
+
+[[medium]]
+package_dir = "internal/bootstrap/packs/core"
+package_name = "core"
+owner = "TestCascadeNudgeReadsFlatBeadClosedPayload"
+resources = ["subprocess"]
+owner_bead = "ga-80po0c.2.1"
+invariant = "the cascade-nudge flat-payload proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestCascadeNudgeReadsFlatBeadClosedPayload, which exists to run the shipped script against a fake gc: only a real run proves the jq filter finds the blocker in a flat bead.closed payload (gcf-2g1th)"
 migration_target = "P0.4b"
 expires = "2026-10-31"
 

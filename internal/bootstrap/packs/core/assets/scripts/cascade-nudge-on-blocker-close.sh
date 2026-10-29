@@ -93,7 +93,7 @@ EVENTS="$(gc events --type bead.closed --since "$LOOKBACK" 2>/dev/null)" || exit
 [ -n "$EVENTS" ] || exit 0
 
 BLOCKERS="$(printf '%s\n' "$EVENTS" \
-    | jq -r '.payload.bead.id // empty' 2>/dev/null | sort -u)" || BLOCKERS=""
+    | jq -r '(.payload.bead // .payload).id // empty' 2>/dev/null | sort -u)" || BLOCKERS=""
 [ -n "$BLOCKERS" ] || exit 0
 
 # Load dedup state (object mapping "<blocker>|<dependent>" -> ISO timestamp).
