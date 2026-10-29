@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5515,4 +5516,99 @@ func TestResolveNudgePollInterval(t *testing.T) {
 			t.Fatalf("resolveNudgePollInterval = %v, want default %v", got, defaultNudgePollInterval)
 		}
 	})
+}
+
+// tickingClock advances one second on every Now call, so a maintenance
+// deadline expressed in seconds bounds the number of items examined.
+type tickingClock struct{ t time.Time }
+
+func (c *tickingClock) Now() time.Time {
+	c.t = c.t.Add(time.Second)
+	return c.t
+}
+
+// Dead letters that stay in the queue (inside the retention window) must not
+// consume a bounded prune's whole budget on every pass: the starting point
+// rotates so droppable items behind them are reached (gcf-r47m3).
+func TestPruneDeadQueuedNudgesBudgetRotatesPastRetainedItems(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	front := nudgeFrontDoor(store)
+	now := time.Now().UTC()
+
+	mk := func(id string, deadAt time.Time) queuedNudge {
+		item := newQueuedNudgeWithOptions("worker", "dead "+id, "session", now.Add(-3*time.Hour), queuedNudgeOptions{ID: id, SessionID: "gc-worker"})
+		beadID, _, err := ensureQueuedNudgeBead(store, item)
+		if err != nil {
+			t.Fatalf("ensureQueuedNudgeBead(%s): %v", id, err)
+		}
+		item.BeadID = beadID
+		item.LastError = "failed"
+		item.DeadAt = deadAt
+		if err := front.Terminalize(item, "failed", "failed", "", deadAt); err != nil {
+			t.Fatalf("Terminalize(%s): %v", id, err)
+		}
+		return item
+	}
+	var dead []queuedNudge
+	for _, id := range []string{"keep-1", "keep-2", "keep-3"} { // inside retention: retained, but still looked up
+		dead = append(dead, mk(id, now.Add(-10*time.Minute)))
+	}
+	for _, id := range []string{"old-1", "old-2"} { // past retention: droppable
+		dead = append(dead, mk(id, now.Add(-3*time.Hour)))
+	}
+
+	state := &nudgeQueueState{Dead: dead}
+	deadPruneCursor.Store(0)
+	// Budget of ~3 items per pass (each item costs one Now call in the loop).
+	for pass := 0; pass < 4 && len(state.Dead) > 3; pass++ {
+		clk := &tickingClock{t: now}
+		if err := pruneDeadQueuedNudgesWithClock(state, front, now, now.Add(3*time.Second), clk); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if len(state.Dead) != 3 {
+		t.Fatalf("dead = %d after bounded passes, want 3 (old-1/old-2 pruned past the retained head)", len(state.Dead))
+	}
+	for _, item := range state.Dead {
+		if !strings.HasPrefix(item.ID, "keep-") {
+			t.Fatalf("unexpected survivor %s", item.ID)
+		}
+	}
+}
+
+// Negative control: with the cursor pinned at 0 every pass (the pre-rotation
+// behavior), the same input never reaches the droppable items.
+func TestPruneDeadQueuedNudgesBudgetWithoutRotationStarves(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	front := nudgeFrontDoor(store)
+	now := time.Now().UTC()
+	var dead []queuedNudge
+	for i, age := range []time.Duration{10 * time.Minute, 10 * time.Minute, 10 * time.Minute, 3 * time.Hour} {
+		id := "n-" + strconv.Itoa(i)
+		item := newQueuedNudgeWithOptions("worker", id, "session", now.Add(-4*time.Hour), queuedNudgeOptions{ID: id, SessionID: "gc-worker"})
+		beadID, _, err := ensureQueuedNudgeBead(store, item)
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.BeadID, item.LastError, item.DeadAt = beadID, "failed", now.Add(-age)
+		if err := front.Terminalize(item, "failed", "failed", "", item.DeadAt); err != nil {
+			t.Fatal(err)
+		}
+		dead = append(dead, item)
+	}
+	state := &nudgeQueueState{Dead: dead}
+	for pass := 0; pass < 4; pass++ {
+		deadPruneCursor.Store(0) // defeat rotation
+		clk := &tickingClock{t: now}
+		if err := pruneDeadQueuedNudgesWithClock(state, front, now, now.Add(3*time.Second), clk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(state.Dead) != 4 {
+		t.Fatalf("dead = %d, want 4: without rotation the droppable tail must starve", len(state.Dead))
+	}
 }
