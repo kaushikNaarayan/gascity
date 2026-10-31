@@ -33,9 +33,14 @@ trap 'rm -f "$TMP" "$SESSION_TMP"' EXIT
 RIG_NAMES=""
 RIG_LIST=$(gc rig list --json 2>/dev/null) || RIG_LIST=""
 if [ -n "$RIG_LIST" ]; then
-    RIG_NAMES=$(echo "$RIG_LIST" | jq -r '.rigs[] | select(.hq == false) | .name' 2>/dev/null) || RIG_NAMES=""
+    # Suspended rigs run no agents, so their in-progress beads are not
+    # orphans of a dead session; skip them (gcf-9h9w7).
+    RIG_NAMES=$(echo "$RIG_LIST" | jq -r '.rigs[] | select(.hq == false and (.suspended // false) == false) | .name' 2>/dev/null) || RIG_NAMES=""
 fi
 
+# `gc session list --json` is city-wide: every `--rig <name>` returns the same
+# session set, so one call per pass is enough. It used to run twice per rig
+# (2 x 33 full-row gc:session scans per sweep on the hq store, gcf-9h9w7).
 append_session_list() {
     local session_fetch_tmp
     session_fetch_tmp=$(mktemp) || return 1
@@ -48,52 +53,30 @@ append_session_list() {
     return 1
 }
 
-append_hq_scope() {
+# append_bead_list stages one scope's in-progress beads. A failed bead query
+# only drops that scope's rows, so one stale or unreachable rig does not
+# disable cleanup elsewhere.
+append_bead_list() {
     local bead_fetch_tmp
     bead_fetch_tmp=$(mktemp) || return 1
-    append_session_list gc session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    gc bd list --status=in_progress --json --limit=0 2>/dev/null >"$bead_fetch_tmp" || true
-    append_session_list gc session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
+    gc bd list "$@" --status=in_progress --json --limit=0 2>/dev/null >"$bead_fetch_tmp" || true
     cat "$bead_fetch_tmp" >>"$TMP"
     rm -f "$bead_fetch_tmp"
 }
 
-append_rig_scope() {
-    local rig="$1"
-    local bead_fetch_tmp
-    bead_fetch_tmp=$(mktemp) || return 1
-    append_session_list gc --rig "$rig" session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    gc bd list --rig "$rig" --status=in_progress --json --limit=0 2>/dev/null >"$bead_fetch_tmp" || true
-    append_session_list gc --rig "$rig" session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    cat "$bead_fetch_tmp" >>"$TMP"
-    rm -f "$bead_fetch_tmp"
-}
+# Step 1b: Take the city-wide liveness snapshot BEFORE and AFTER the whole bead
+# walk. The second pass closes the session-list-before-bead-query race where a
+# newly spawned session can claim work after the first pass but before a
+# bead query. Liveness is required: if either pass fails, skip the sweep.
+append_session_list gc session list --json || exit 0
 
-# Step 1b: Get all known live session identities around each bead-list query.
-# The second liveness pass closes the session-list-before-bd-list race where a
-# newly spawned session can claim work after the first pass but before bd-list.
-# HQ liveness is required; per-rig failures only skip that rig's staged bead
-# rows so one stale or unreachable rig does not disable cleanup elsewhere.
-append_hq_scope || exit 0
-
+append_bead_list
 while IFS= read -r rig; do
     [ -z "$rig" ] && continue
-    if ! append_rig_scope "$rig"; then
-        echo "orphan-sweep: skipping rig $rig after session-list failure" >&2
-    fi
+    append_bead_list --rig "$rig"
 done <<<"$RIG_NAMES"
+
+append_session_list gc session list --json || exit 0
 
 IN_PROGRESS=$(jq -c -s 'add // []' "$TMP" 2>/dev/null) || IN_PROGRESS="[]"
 if [ "$IN_PROGRESS" = "[]" ]; then
