@@ -87,13 +87,16 @@ func TestSupervisorClaimGoroutineCountStaysFlat(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	backing := beads.NewMemStore()
-	if err := enqueueQueuedNudge(dir, newQueuedNudgeWithOptions("worker", "do work", "session", now, queuedNudgeOptions{ID: "n-flat"})); err != nil {
-		t.Fatalf("enqueueQueuedNudge: %v", err)
-	}
+	// Install the store seam BEFORE enqueueing: enqueue opens its shadow-bead
+	// store through openNudgeBeadStore, and with the real opener that starts a
+	// managed dolt sql-server nothing stops (gcf-m8ee6 leak-guard failure).
 	prev := openNudgeBeadStore
 	t.Cleanup(func() { openNudgeBeadStore = prev })
 	openNudgeBeadStore = func(string) beads.NudgesStore {
 		return beads.NudgesStore{Store: newLeakingNudgeStore(backing, true)}
+	}
+	if err := enqueueQueuedNudge(dir, newQueuedNudgeWithOptions("worker", "do work", "session", now, queuedNudgeOptions{ID: "n-flat"})); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
 	target := nudgeTarget{cityPath: dir}
 	const passes = 100
