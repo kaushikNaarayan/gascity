@@ -693,6 +693,7 @@ func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState
 		return
 	}
 	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.WakeMode == "fresh")
+	preserveUserHoldInPatch(info, batch)
 	_ = sessFront.ApplyPatch(info.ID, batch)
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,21 @@ import (
 
 // gcf-70fzq: a named seat parked with `gc session suspend` (user-hold) must
 // not be started by namedWorkReady just because it has an assigned open bead.
+// holdFixtureOverride is applied last to the session bead metadata (live fixture).
+var holdFixtureOverride map[string]string
+
+// holdWorkStatus overrides the assigned bead status ("" = open).
+var (
+	holdWorkStatus string
+	holdTrace      bool
+)
+
+// holdPoolManaged models the live web_dev2 bead: pool-managed ephemeral, not a named session.
+var holdPoolManaged bool
+
+// holdAgentAcks makes the test agent drain-ack whenever it sees a drain request.
+var holdAgentAcks bool
+
 func runNamedHoldPipeline(t *testing.T, hold bool) (starts []string, meta map[string]string) {
 	return runNamedHoldPipelineN(t, hold, false, 1)
 }
@@ -26,13 +42,20 @@ func runNamedHoldPipelineN(t *testing.T, hold, alive bool, ticks int) (starts []
 		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(1), WorkQuery: "printf ''"}},
 		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
 	}
+	if holdPoolManaged {
+		cfg.NamedSessions = nil
+	}
 	identity := "worker"
 	sessionName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}
 	sp := runtime.NewFake()
-	if _, err := store.Create(beads.Bead{Title: "assigned", Type: "task", Status: "open", Assignee: identity}); err != nil {
+	workStatus := "open"
+	if holdWorkStatus != "" {
+		workStatus = holdWorkStatus
+	}
+	if _, err := store.Create(beads.Bead{Title: "assigned", Type: "task", Status: workStatus, Assignee: identity}); err != nil {
 		t.Fatal(err)
 	}
 	m := map[string]string{
@@ -46,6 +69,16 @@ func runNamedHoldPipelineN(t *testing.T, hold, alive bool, ticks int) (starts []
 		m["sleep_reason"] = "user-hold"
 		m["state"] = "suspended"
 	}
+	if holdPoolManaged {
+		delete(m, namedSessionMetadataKey)
+		delete(m, namedSessionIdentityMetadata)
+		delete(m, namedSessionModeMetadata)
+		m["pool_managed"] = "true"
+		m["session_origin"] = "ephemeral"
+	}
+	for k, v := range holdFixtureOverride {
+		m[k] = v
+	}
 	if alive {
 		m["state"] = "active"
 		_ = sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"})
@@ -57,8 +90,16 @@ func runNamedHoldPipelineN(t *testing.T, hold, alive bool, ticks int) (starts []
 	var stdout, stderr bytes.Buffer
 	var ds DesiredStateResult
 	dt := newDrainTracker()
+	var dops drainOps
+	if holdAgentAcks {
+		dops = newDrainOps(sp)
+	}
 	for i := 0; i < ticks; i++ {
 		clk.Time = clk.Time.Add(2 * time.Minute)
+		if holdTrace {
+			bb, _ := store.Get(sb.ID)
+			t.Logf("tick %d state=%s reason=%q intent=%q running=%v stderr=%s", i, bb.Metadata["state"], bb.Metadata["sleep_reason"], bb.Metadata["sleep_intent"], sp.IsRunning(sessionName), strings.ReplaceAll(stdout.String(), "\n", "|"))
+		}
 		ds = buildDesiredState(cfg.EffectiveCityName(), cityPath, clk.Now().UTC(), cfg, sp, store, &stderr)
 		cfgNames := configuredSessionNames(cfg, cfg.EffectiveCityName(), store)
 		syncSessionBeads(cityPath, store, ds.State, sp, cfgNames, cfg, clk, &stderr, true)
@@ -72,12 +113,20 @@ func runNamedHoldPipelineN(t *testing.T, hold, alive bool, ticks int) (starts []
 		}
 		mergeNamedSessionDemand(pd, ds.NamedSessionDemand, cfg)
 		snap := newSessionBeadSnapshot(sessions)
+		if holdAgentAcks && sp.IsRunning(sessionName) {
+			if d, _ := dops.isDraining(sessionName); d {
+				_ = dops.setDrainAck(sessionName)
+			}
+		}
 		reconcileSessionBeadsAtPathWithNamedDemand(context.Background(), cityPath, snap.OpenForReconcile(), snap, ds.State, cfgNames, cfg, sp,
-			store, nil, ds.AssignedWorkBeads, nil, nil, dt, nil, pd,
+			store, dops, ds.AssignedWorkBeads, nil, nil, dt, nil, pd,
 			ds.NamedSessionDemand, ds.NamedSessionRoutedDemand, ds.StoreQueryPartial, nil, cfg.EffectiveCityName(),
-			nil, clk, events.Discard, 0, 0, &stdout, &stderr)
+			nil, clk, events.NewFake(), 0, 0, &stdout, &stderr)
 	}
 	for _, c := range sp.SnapshotCalls() {
+		if holdTrace {
+			t.Logf("call %s %s", c.Method, c.Name)
+		}
 		if c.Method == "Start" {
 			starts = append(starts, c.Name)
 		}
@@ -110,5 +159,101 @@ func TestNamedSeatUserHoldRunningSeatStaysDownAfterDrain(t *testing.T) {
 	// the initial Start in setup is a Fake call too; allow exactly that one.
 	if len(starts) > 1 {
 		t.Fatalf("held seat restarted after drain: %v meta=%v", starts, meta)
+	}
+}
+
+// Live fixture (gcf-70fzq, web_dev2 gp-28xasdk 31 Oct): held_until far future but
+// sleep_intent/sleep_reason blank, wake_mode=fresh. The seat cycled drain->wake.
+func TestNamedSeatLiveFixtureFutureHeldUntilBlankIntentStaysDown(t *testing.T) {
+	holdFixtureOverride = map[string]string{
+		"held_until": "2126-10-07T11:57:08Z", "sleep_reason": "", "sleep_intent": "",
+		"state": "drained", "state_reason": "", "continuation_reset_pending": "true", "session_key": "", "wake_mode": "fresh",
+		"sleep_policy_source": "legacy_off", "slept_at": "2026-03-08T11:00:20Z",
+		"drain_at": "2026-03-08T11:00:00Z",
+	}
+	defer func() { holdFixtureOverride = nil }()
+	starts, meta := runNamedHoldPipelineN(t, true, false, 20)
+	if len(starts) != 0 {
+		t.Fatalf("seat with future held_until was started %v meta=%v", starts, meta)
+	}
+}
+
+func TestNamedSeatLiveFixtureRunningDrainsAndStaysDown(t *testing.T) {
+	holdFixtureOverride = map[string]string{
+		"held_until": "2126-10-07T11:57:08Z", "sleep_reason": "", "sleep_intent": "",
+		"state_reason": "creation_complete", "wake_mode": "fresh",
+		"sleep_policy_source": "legacy_off", "drain_at": "2026-03-08T12:00:00Z",
+	}
+	defer func() { holdFixtureOverride = nil }()
+	starts, meta := runNamedHoldPipelineN(t, true, true, 30)
+	if len(starts) > 1 { // setup Start counts once
+		t.Fatalf("running held seat restarted %v meta=%v", starts, meta)
+	}
+}
+
+func TestNamedSeatLiveFixtureAsleepIdleInProgressStaysDown(t *testing.T) {
+	holdFixtureOverride = map[string]string{
+		"held_until": "2126-10-07T11:57:08Z", "sleep_reason": "idle", "sleep_intent": "",
+		"state": "asleep", "slept_at": "2026-03-08T11:58:00Z", "wake_mode": "fresh",
+		"sleep_policy_source": "legacy_off", "session_key": "", "continuation_reset_pending": "true",
+	}
+	defer func() { holdFixtureOverride = nil }()
+	holdWorkStatus = "in_progress"
+	defer func() { holdWorkStatus = "" }()
+	starts, meta := runNamedHoldPipelineN(t, true, false, 20)
+	if len(starts) != 0 {
+		t.Fatalf("seat with future held_until was started %v meta=%v", starts, meta)
+	}
+}
+
+// Real flow: running seat, user-hold applied by CLI suspend, controller drains it,
+// agent drain-acks with assigned work (CompleteDrainPatch(idle) wipes sleep_intent).
+func TestNamedSeatCLIHoldRunningAgentAcksStaysDown(t *testing.T) {
+	holdAgentAcks = true
+	defer func() { holdAgentAcks = false }()
+	starts, meta := runNamedHoldPipelineN(t, true, true, 30)
+	t.Logf("FINAL meta=%v starts=%v", meta, starts)
+	if len(starts) > 1 { // the setup Start counts once
+		t.Fatalf("held seat re-started after agent drain-ack: %v meta=%v", starts, meta)
+	}
+}
+
+func TestNamedSeatCLIHoldRunningFreshInProgressAgentAcksStaysDown(t *testing.T) {
+	holdAgentAcks = true
+	holdWorkStatus = "in_progress"
+	holdFixtureOverride = map[string]string{"wake_mode": "fresh"}
+	defer func() { holdAgentAcks = false; holdWorkStatus = ""; holdFixtureOverride = nil }()
+	starts, meta := runNamedHoldPipelineN(t, true, true, 30)
+	t.Logf("FINAL meta=%v starts=%v", meta, starts)
+	if len(starts) > 1 {
+		t.Fatalf("held seat re-started after agent drain-ack: %v", starts)
+	}
+}
+
+// LIVE FIXTURE gcf-70fzq: gp-28xasdk is a pool-managed ephemeral session (no
+// configured_named_*), held via CLI suspend, drained, agent drain-acked.
+func TestPoolSeatCLIHoldRunningAgentAcksStaysDown(t *testing.T) {
+	holdAgentAcks, holdWorkStatus, holdPoolManaged = true, "in_progress", true
+	holdFixtureOverride = map[string]string{"wake_mode": "fresh"}
+	defer func() { holdAgentAcks, holdWorkStatus, holdPoolManaged, holdFixtureOverride = false, "", false, nil }()
+	starts, meta := runNamedHoldPipelineN(t, true, true, 30)
+	t.Logf("FINAL starts=%v state=%s intent=%q reason=%q held=%s", starts, meta["state"], meta["sleep_intent"], meta["sleep_reason"], meta["held_until"])
+	if len(starts) > 1 {
+		t.Fatalf("held pool seat re-started after agent drain-ack: %v", starts)
+	}
+	if meta["sleep_intent"] != "user-hold" || meta["held_until"] == "" {
+		t.Fatalf("drain-ack wiped the user hold (bare held_until is only a keep-alive): intent=%q reason=%q held=%q", meta["sleep_intent"], meta["sleep_reason"], meta["held_until"])
+	}
+	if meta["state"] == "stranded-repair" || meta["close_reason"] != "" {
+		t.Fatalf("held session was retired by stranded repair: state=%q close_reason=%q", meta["state"], meta["close_reason"])
+	}
+}
+
+func TestNamedSeatCLIHoldAgentAckKeepsUserHoldIntent(t *testing.T) {
+	holdAgentAcks = true
+	defer func() { holdAgentAcks = false }()
+	_, meta := runNamedHoldPipelineN(t, true, true, 12)
+	if meta["sleep_intent"] != "user-hold" || meta["held_until"] == "" {
+		t.Fatalf("drain-ack wiped the user hold: intent=%q reason=%q state=%q", meta["sleep_intent"], meta["sleep_reason"], meta["state"])
 	}
 }
