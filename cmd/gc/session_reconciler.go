@@ -490,6 +490,30 @@ func (r drainAckFinalizeResult) applyTo(info sessionpkg.Info) sessionpkg.Info {
 	return info
 }
 
+// sessionUserHeld reports whether the session carries an operator hold from
+// gc session suspend: sleep_intent=user-hold, or a future held_until together
+// with the user-hold sleep reason.
+func sessionUserHeld(info sessionpkg.Info, now time.Time) bool {
+	if info.SleepIntent == string(sessionpkg.SleepReasonUserHold) {
+		return true
+	}
+	return info.SleepReason == string(sessionpkg.SleepReasonUserHold) && metadataTimeInFuture(info.HeldUntil, now)
+}
+
+// preserveUserHoldInPatch keeps an operator hold intact across the sleep/drain
+// patches. CompleteDrainPatch/SleepPatch blank sleep_intent and set a new
+// sleep_reason, which turned a "gc session suspend" hold into a bare held_until
+// (only a keep-alive) after the first drain-ack, so the seat re-woke from its
+// assigned work (gcf-70fzq).
+func preserveUserHoldInPatch(info sessionpkg.Info, patch sessionpkg.MetadataPatch) {
+	if info.SleepIntent != string(sessionpkg.SleepReasonUserHold) {
+		return
+	}
+	patch["sleep_intent"] = string(sessionpkg.SleepReasonUserHold)
+	patch["sleep_reason"] = string(sessionpkg.SleepReasonUserHold)
+	patch["state"] = string(sessionpkg.StateSuspended)
+}
+
 func finalizeDrainAckStoppedSession(
 	cityPath string,
 	cfg *config.City,
@@ -611,6 +635,7 @@ func finalizeDrainAckStoppedSession(
 	if info.RestartRequested == "true" {
 		batch["restart_requested"] = ""
 	}
+	preserveUserHoldInPatch(info, batch)
 	foldedInfo, err := sessionFrontDoor(store).ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: finalizing drain-ack stopped %s: %v\n", name, err) //nolint:errcheck
@@ -3797,7 +3822,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// fire the repair on the first episode's stale timestamp. Reuses
 			// unclaimWorkAssignedToRetiredSessionInfo, the Info form of the same detach primitive
 			// named-session retirement uses.
-			if !storeQueryPartial &&
+			if !storeQueryPartial && !sessionUserHeld(infoByID[target.info.ID], clk.Now()) &&
 				repairStrandedPoolWorkerBead(store, rigStores, infoByID[target.info.ID], retiredSessionFallbackRouteInfo(infoByID[target.info.ID]), clk, stderr) {
 				tick.markClosed(target.info.ID)
 				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, stderr)
