@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // gcf-70fzq: a named seat parked with `gc session suspend` (user-hold) must
@@ -30,6 +31,9 @@ var holdPoolManaged bool
 
 // holdAgentAcks makes the test agent drain-ack whenever it sees a drain request.
 var holdAgentAcks bool
+
+// holdWakeAtTick > 0 applies what `gc session wake` writes (ClearWakeBlockersPatch) at that tick.
+var holdWakeAtTick int
 
 func runNamedHoldPipeline(t *testing.T, hold bool) (starts []string, meta map[string]string) {
 	return runNamedHoldPipelineN(t, hold, false, 1)
@@ -96,6 +100,13 @@ func runNamedHoldPipelineN(t *testing.T, hold, alive bool, ticks int) (starts []
 	}
 	for i := 0; i < ticks; i++ {
 		clk.Time = clk.Time.Add(2 * time.Minute)
+		if holdWakeAtTick > 0 && i == holdWakeAtTick {
+			bw, _ := store.Get(sb.ID)
+			wp := session.ClearWakeBlockersPatch(session.State(bw.Metadata["state"]), bw.Metadata["sleep_reason"])
+			if err := store.SetMetadataBatch(sb.ID, wp); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if holdTrace {
 			bb, _ := store.Get(sb.ID)
 			t.Logf("tick %d state=%s reason=%q intent=%q running=%v stderr=%s", i, bb.Metadata["state"], bb.Metadata["sleep_reason"], bb.Metadata["sleep_intent"], sp.IsRunning(sessionName), strings.ReplaceAll(stdout.String(), "\n", "|"))
@@ -215,6 +226,22 @@ func TestNamedSeatCLIHoldRunningAgentAcksStaysDown(t *testing.T) {
 	t.Logf("FINAL meta=%v starts=%v", meta, starts)
 	if len(starts) > 1 { // the setup Start counts once
 		t.Fatalf("held seat re-started after agent drain-ack: %v meta=%v", starts, meta)
+	}
+	if meta["sleep_intent"] != "user-hold" || meta["held_until"] == "" {
+		t.Fatalf("drain-ack wiped the user hold: intent=%q reason=%q state=%q", meta["sleep_intent"], meta["sleep_reason"], meta["state"])
+	}
+}
+
+// Acceptance #1 second half: after the hold survives the drain-ack, an explicit
+// `gc session wake` (ClearWakeBlockersPatch) lets the seat start from its
+// assigned bead again.
+func TestNamedSeatHeldAfterDrainAckStartsAfterExplicitWake(t *testing.T) {
+	holdAgentAcks = true
+	holdWakeAtTick = 14
+	defer func() { holdAgentAcks = false; holdWakeAtTick = 0 }()
+	starts, meta := runNamedHoldPipelineN(t, true, true, 24)
+	if len(starts) < 2 { // setup Start + the post-wake start
+		t.Fatalf("seat did not start after explicit wake: starts=%v meta=%v", starts, meta)
 	}
 }
 
