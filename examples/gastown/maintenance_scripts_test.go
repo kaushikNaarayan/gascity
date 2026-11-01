@@ -851,22 +851,19 @@ EOF
     ;;
   session)
     if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      if [ "$rig" = "project" ]; then
-        count="$(cat "$GC_RIG_SESSION_COUNT_FILE" 2>/dev/null || printf '0')"
-        count=$((count + 1))
-        printf '%s' "$count" > "$GC_RIG_SESSION_COUNT_FILE"
-        if [ "$count" -eq 1 ]; then
-          printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
-        else
-          cat <<'EOF'
+      # Sessions are city-wide: --rig does not change the answer.
+      count="$(cat "$GC_RIG_SESSION_COUNT_FILE" 2>/dev/null || printf '0')"
+      count=$((count + 1))
+      printf '%s' "$count" > "$GC_RIG_SESSION_COUNT_FILE"
+      if [ "$count" -eq 1 ]; then
+        printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      else
+        cat <<'EOF'
 {"sessions":[
   {"id":"mc-rig-live","session_name":"project__worker-gc-race","alias":"project/worker-1","agent_name":"project/worker","closed":false}
 ],"summary":{},"filters":{},"schema_version":"1"}
 EOF
-        fi
-        exit 0
       fi
-      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
       exit 0
     fi
     ;;
@@ -915,11 +912,91 @@ exit 1
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	log := string(logData)
-	if got := strings.Count(log, "session list --json"); got != 4 {
-		t.Fatalf("session list count = %d, want 4 including rig post-bd refresh:\n%s", got, log)
+	if got := strings.Count(log, "session list --json"); got != 2 {
+		t.Fatalf("session list count = %d, want 2 (city-wide, before and after the rig bead walk):\n%s", got, log)
 	}
 	if strings.Contains(log, "bd update ga-rig-live-race ") {
 		t.Fatalf("rig live session claimed between liveness and bead list was reset:\n%s", log)
+	}
+}
+
+// TestOrphanSweepListsSessionsOncePerPassNotPerRig is the gcf-9h9w7 guard:
+// `gc session list --json` is city-wide, so the sweep must call it exactly
+// twice (before/after the bead walk) no matter how many rigs exist, and must
+// not walk suspended rigs.
+func TestOrphanSweepListsSessionsOncePerPassNotPerRig(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	tmpDir := t.TempDir()
+	gcLog := filepath.Join(tmpDir, "gc.log")
+
+	rigs := []string{`{"name":"hq","hq":true,"suspended":false}`}
+	for i := 0; i < 33; i++ {
+		rigs = append(rigs, fmt.Sprintf(`{"name":"rig%02d","hq":false,"suspended":%t}`, i, i >= 4))
+	}
+	rigJSON := `{"rigs":[` + strings.Join(rigs, ",") + `]}`
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  --rig) shift 2 ;;
+esac
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      printf 'Agent: project/worker\n  source: pack\n'
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '%s\n' "$GC_RIG_JSON"
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      printf '[]\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"GC_RIG_JSON":  rigJSON,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	script := coreScriptPath("orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if got := strings.Count(log, "session list --json"); got != 2 {
+		t.Fatalf("session list count = %d, want 2 regardless of rig count:\n%s", got, log)
+	}
+	// hq + 4 active rigs walk beads; the 29 suspended rigs must not.
+	if got := strings.Count(log, "bd list"); got != 5 {
+		t.Fatalf("bd list count = %d, want 5 (hq + 4 unsuspended rigs):\n%s", got, log)
+	}
+	if strings.Contains(log, "--rig rig04 ") || strings.Contains(log, "--rig rig32 ") {
+		t.Fatalf("suspended rig was walked:\n%s", log)
 	}
 }
 
@@ -1449,16 +1526,12 @@ EOF
     ;;
   session)
     if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      if [ "$rig" = "project" ]; then
-        cat <<'EOF'
+      cat <<'EOF'
 {"sessions":[
   {"id":"mc-live-rig","name":"project/worker-1","template":"project/worker","state":"active","session_name":"project__worker-gc-rig123","alias":"project/worker-1","agent_name":"project/worker","closed":false},
   {"id":"mc-live-rig-asleep","name":"project/worker-2","template":"project/worker","state":"asleep","session_name":"project__worker-gc-asleep","alias":"project/worker-2","agent_name":"project/worker","closed":false}
 ],"summary":{},"filters":{},"schema_version":"1"}
 EOF
-        exit 0
-      fi
-      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
       exit 0
     fi
     ;;
@@ -1526,8 +1599,10 @@ exit 1
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	log := string(logData)
-	if !strings.Contains(log, "--rig project session list --json") {
-		t.Fatalf("rig-scoped session list was not queried:\n%s", log)
+	// Sessions are city-wide: the sweep must not issue a per-rig session list
+	// (gcf-9h9w7); the city-wide pair still covers the rig's live sessions.
+	if strings.Contains(log, "--rig project session list --json") {
+		t.Fatalf("per-rig session list was queried:\n%s", log)
 	}
 	if !strings.Contains(log, "bd release-if-current ga-rig-orphan missing-rig-session") {
 		t.Fatalf("rig orphan bead was not reset:\n%s", log)
@@ -1573,16 +1648,12 @@ EOF
     ;;
   session)
     if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      if [ "$rig" = "project" ]; then
-        cat <<'EOF'
+      cat <<'EOF'
 {"sessions":[
   {"ID":"vgc-live-id","SessionName":"project__worker-vgc-live-name","Alias":"project/worker-1","Template":"project/worker","State":"active","Closed":false},
   {"ID":"vgc-closed","SessionName":"project__worker-vgc-closed","State":"closed","Closed":true}
 ],"summary":{},"filters":{},"schema_version":"1"}
 EOF
-        exit 0
-      fi
-      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
       exit 0
     fi
     ;;
@@ -1665,7 +1736,7 @@ exit 1
 	}
 }
 
-func TestOrphanSweepContinuesAfterSingleRigSessionListFailure(t *testing.T) {
+func TestOrphanSweepContinuesAfterSingleRigBeadListFailure(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
@@ -1696,9 +1767,6 @@ EOF
     ;;
   session)
     if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      if [ "$rig" = "broken" ]; then
-        exit 1
-      fi
       printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
       exit 0
     fi
@@ -1706,11 +1774,7 @@ EOF
   bd)
 	    if [ "$2" = "list" ]; then
 	      if [ "$3" = "--rig" ] && [ "$4" = "broken" ]; then
-	        cat <<'EOF'
-[
-  {"id":"ga-broken-orphan","status":"in_progress","assignee":"missing-broken-session"}
-]
-EOF
+	        exit 1
       elif [ "$3" = "--rig" ] && [ "$4" = "healthy" ]; then
         cat <<'EOF'
 [
@@ -1783,7 +1847,7 @@ exit 1
 		}
 	}
 	if strings.Contains(log, "bd release-if-current ga-broken-orphan ") {
-		t.Fatalf("bead from rig with unknown session liveness was reset:\n%s", log)
+		t.Fatalf("bead from a rig whose bd list failed was reset:\n%s", log)
 	}
 }
 
@@ -1935,12 +1999,13 @@ func TestOrphanSweepPreservesProtectedInProgressEphemeralMoleculeWisp(t *testing
 			if strings.Contains(log, "config show") {
 				t.Fatalf("primary regression must not use config show fallback\n%s", orphanSweepFailureContext(out, gcLog))
 			}
-			if got := countExactLine(lines, "session list --json"); got < 2 {
-				t.Fatalf("HQ session probe count = %d, want at least 2\n%s", got, orphanSweepFailureContext(out, gcLog))
+			// Before/after city-wide liveness probes around the bead walk.
+			if got := countExactLine(lines, "session list --json"); got != 2 {
+				t.Fatalf("city session probe count = %d, want exactly 2\n%s", got, orphanSweepFailureContext(out, gcLog))
 			}
-			// Keep before/after rig liveness probes covered on the protected-wisp path.
-			if got := countExactLine(lines, "--rig project-alpha session list --json"); got < 2 {
-				t.Fatalf("rig session probe count = %d, want at least 2\n%s", got, orphanSweepFailureContext(out, gcLog))
+			// Sessions are city-wide: no per-rig probes (gcf-9h9w7).
+			if got := countExactLine(lines, "--rig project-alpha session list --json"); got != 0 {
+				t.Fatalf("rig session probe count = %d, want 0\n%s", got, orphanSweepFailureContext(out, gcLog))
 			}
 			for _, want := range []string{
 				"bd list --status=in_progress --json --limit=0",
@@ -1989,11 +2054,9 @@ if [ "$*" = "config explain" ]; then
   exit 0
 fi
 if [ "$*" = "session list --json" ]; then
-  if [ "$rig" = "project-alpha" ]; then
-    printf '%s\n' "$ORPHAN_SWEEP_RIG_SESSIONS_JSON"
-  else
-    printf '%s\n' "$ORPHAN_SWEEP_HQ_SESSIONS_JSON"
-  fi
+  # city-wide: one call serves every scope, fixtures are concatenated
+  printf '%s\n' "$ORPHAN_SWEEP_HQ_SESSIONS_JSON"
+  printf '%s\n' "$ORPHAN_SWEEP_RIG_SESSIONS_JSON"
   exit 0
 fi
 if [ "$*" = "bd release-if-current $ORPHAN_SWEEP_ORPHAN_ID $ORPHAN_SWEEP_ORPHAN_ASSIGNEE" ]; then

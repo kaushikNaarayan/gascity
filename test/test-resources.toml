@@ -21,7 +21,11 @@ resource = "subprocess"
 # internal/bootstrap/packs/core/cascade_nudge_behavior_test.go (+1 file, +1
 # exec.Command call: runs the shipped bash script against a fake gc). The call
 # is a declared Medium owner, so the Small debt ratchet is unchanged.
-baseline_calls = 615
+# 615/178 -> 616/178 (gcf-9h9w7): accounted for entirely by the new
+# TestOrphanSweepListsSessionsOncePerPassNotPerRig in
+# examples/gastown/maintenance_scripts_test.go (+1 exec.Command call, a
+# declared Medium owner; no new file).
+baseline_calls = 616
 baseline_files = 178
 reported_calls = 495
 reported_files = 135
@@ -88,7 +92,9 @@ scope = "untagged"
 resource = "subprocess"
 # +1 call/+1 file (gcf-2g1th): cascade_nudge_behavior_test.go, a declared
 # Medium owner; see the scope=all subprocess row above.
-baseline_calls = 414
+# +1 call/+0 files (gcf-9h9w7): TestOrphanSweepListsSessionsOncePerPassNotPerRig,
+# a declared Medium owner; see the scope=all subprocess row above.
+baseline_calls = 415
 baseline_files = 119
 reported_calls = 380
 reported_files = 98
@@ -264,6 +270,17 @@ resources = ["subprocess"]
 owner_bead = "ga-80po0c.2.1"
 invariant = "the cascade-nudge flat-payload proof is a checked Medium subprocess owner"
 resource_owner = "the one bash subprocess is confined to TestCascadeNudgeReadsFlatBeadClosedPayload, which exists to run the shipped script against a fake gc: only a real run proves the jq filter finds the blocker in a flat bead.closed payload (gcf-2g1th)"
+migration_target = "P0.4b"
+expires = "2026-11-30"
+
+[[medium]]
+package_dir = "examples/gastown"
+package_name = "gastown_test"
+owner = "TestOrphanSweepListsSessionsOncePerPassNotPerRig"
+resources = ["subprocess"]
+owner_bead = "ga-80po0c.2.1"
+invariant = "the orphan-sweep call-count proof is a checked Medium subprocess owner"
+resource_owner = "the one /bin/sh subprocess is confined to TestOrphanSweepListsSessionsOncePerPassNotPerRig, which exists to run the shipped orphan-sweep.sh against a fake gc that counts calls: only a real run of the script proves it lists sessions twice per pass and skips suspended rigs (gcf-9h9w7)"
 migration_target = "P0.4b"
 expires = "2026-11-30"
 
