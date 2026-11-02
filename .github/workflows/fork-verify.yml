@@ -39,7 +39,7 @@ jobs:
     # Blacksmith CI graph. This gate exists only for the fork, which cannot
     # use those runners or repository secrets.
     if: ${{ github.repository != 'gastownhall/gascity' }}
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     env:
       DOLT_VERSION: "2.1.10"
       BD_VERSION: "v1.1.0"
@@ -104,7 +104,7 @@ jobs:
     # the PR trains people to ignore red. Run: gh workflow run fork-verify.yml --ref <branch>
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository != 'gastownhall/gascity' }}
     timeout-minutes: 40
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     env:
       GO_VERSION: "1.26.5"
       AC3_MIN_FREE_GB: "5"
@@ -212,7 +212,7 @@ jobs:
     # the PR trains people to ignore red. Run: gh workflow run fork-verify.yml --ref <branch>
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository != 'gastownhall/gascity' }}
     timeout-minutes: 40
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     env:
       GO_VERSION: "1.26.5"
       AC3_MIN_FREE_GB: "5"
@@ -309,7 +309,7 @@ jobs:
     # required yet: pm's bar is 5 consecutive green runs on unchanged main, zero retries.
     # Deliberately excludes unit-core (internal/productmetrics timing tests flake under load: gcf-30gb).
     if: ${{ github.repository != 'gastownhall/gascity' }}
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     timeout-minutes: 40
     env:
       DOLT_VERSION: "2.1.10"

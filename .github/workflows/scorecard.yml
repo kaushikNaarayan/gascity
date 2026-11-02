@@ -10,7 +10,7 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     timeout-minutes: 20
     continue-on-error: true
     permissions:

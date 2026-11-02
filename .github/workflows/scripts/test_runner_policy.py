@@ -86,8 +86,8 @@ class RunnerPolicyTests(unittest.TestCase):
 
                 self.assertFalse(use_blacksmith)
                 self.assertEqual(runners, runner_policy.SELF_HOSTED_RUNNERS)
-                self.assertEqual(runners["runner_2vcpu"], "gt2")
-                self.assertEqual(runners["runner_32vcpu"], "gt2")
+                self.assertEqual(runners["runner_2vcpu"], "pool")
+                self.assertEqual(runners["runner_32vcpu"], "pool")
                 self.assertEqual(runners["runner_macos"], "macos")
                 self.assertIn("material-lab-io/gascity", reason)
 
