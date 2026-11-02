@@ -30,7 +30,7 @@ jobs:
   rc-release:
     name: Draft RC release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) }}
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     permissions:
       contents: write
     steps:

@@ -25,15 +25,15 @@ GITHUB_RUNNERS = {
     "runner_macos": "macos-15",
 }
 
-# Our self-hosted fleet. `gt2` is a single custom label shared by every Linux
+# Our self-hosted fleet. `pool` is a single custom label shared by every Linux
 # runner regardless of requested size (we do not size-partition self-hosted
 # capacity); GitHub schedules a job onto any runner carrying the label, so no
 # per-vcpu label is needed. `macos` is Kaushik's Mac Mini.
 SELF_HOSTED_RUNNERS = {
-    "runner_2vcpu": "gt2",
-    "runner_8vcpu": "gt2",
-    "runner_16vcpu": "gt2",
-    "runner_32vcpu": "gt2",
+    "runner_2vcpu": "pool",
+    "runner_8vcpu": "pool",
+    "runner_16vcpu": "pool",
+    "runner_32vcpu": "pool",
     "runner_macos": "macos",
 }
 

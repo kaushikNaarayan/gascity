@@ -22,7 +22,7 @@ jobs:
   release:
     name: Release
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     permissions:
       contents: write
     env:
@@ -174,7 +174,7 @@ jobs:
     continue-on-error: true
     if: ${{ contains(fromJSON('["gastownhall/gascity", "material-lab-io/gascity"]'), github.repository) && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     needs: release
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     permissions:
       attestations: write
       contents: write
@@ -230,7 +230,7 @@ jobs:
     name: Update Homebrew formula
     if: ${{ github.repository == 'gastownhall/gascity' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     needs: release
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     permissions:
       contents: read
     steps:

@@ -54,7 +54,7 @@ env:
 jobs:
   runner-policy:
     name: Runner policy
-    runs-on: [self-hosted, gt2]
+    runs-on: [self-hosted, pool]
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
