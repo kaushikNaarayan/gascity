@@ -15,6 +15,7 @@ import (
 // this set never leaves our infrastructure.
 var allowedSelfHostedLabels = map[string]bool{
 	"gt2":   true,
+	"pool":  true,
 	"macos": true,
 }
 
