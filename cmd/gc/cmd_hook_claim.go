@@ -1946,7 +1946,7 @@ func hookClaimWorkerBranch(trees []hookClaimWorkTree, resolve hookResolveWorkBra
 }
 
 // hookClaimWorkerTrees returns the checkouts bead records for its own work, most
-// authoritative first: the canonical gc.work_dir, then the legacy work_dir.
+// authoritative first: the legacy work_dir, then the canonical gc.work_dir.
 //
 // These are deliberately NOT storeDir, the directory the work query was answered
 // from. Store and workspace are independent inputs a federated claim routinely
@@ -1954,13 +1954,17 @@ func hookClaimWorkerBranch(trees []hookClaimWorkTree, resolve hookResolveWorkBra
 // tree the worker never commits to and which sits on whatever branch someone last
 // left it on.
 //
-// The canonical key comes first because it is the one the work-record close gate
-// resolves its repo from (work_record_gate.go), so the branch stamped at claim
-// time and the branch a commit is validated against at close time name the same
-// tree. The legacy key follows because it is not reliably dead data here: this
-// fork's provisioner writes gc.work_dir as the per-bead worktree path it INTENDS,
-// which may never be created, while work_dir still records the tree the worker
-// actually used.
+// The legacy key comes first because it is the tree the worker actually used. A
+// formula's branch-setup step records the per-bead worktree it creates under
+// work_dir, while the claim itself stamps the claiming session's HOME checkout as
+// gc.work_dir for a bead that recorded none (gc-2n4c). That home checkout is
+// shared across beads and parked on whatever branch the previous bead left, so
+// letting it outrank the per-bead worktree pins gc.work_branch to that stale
+// branch for the life of the bead (gcf-23j). Putting the legacy tree first lets
+// the next claim tick restamp the branch once branch-setup has run. Where the
+// legacy key does not resolve (never created, store, detached HEAD) the canonical
+// key still answers, and both name the same repository, which is all the close
+// gate resolves from (work_record_gate.go).
 //
 // store is passed in only to be EXCLUDED, and that exclusion is the whole reason it
 // stays a parameter. It arrives already resolved so the list costs one probe of the
@@ -1978,7 +1982,7 @@ func hookClaimWorkerBranch(trees []hookClaimWorkTree, resolve hookResolveWorkBra
 // both of which report a branch of their own, are not.
 func hookClaimWorkerTrees(bead beads.Bead, store hookClaimStoreHead) []hookClaimWorkTree {
 	var trees []hookClaimWorkTree
-	for _, key := range []string{beadmeta.WorkDirMetadataKey, beadmeta.LegacyWorkDirMetadataKey} {
+	for _, key := range []string{beadmeta.LegacyWorkDirMetadataKey, beadmeta.WorkDirMetadataKey} {
 		candidate := strings.TrimSpace(bead.Metadata[key])
 		if candidate == "" {
 			continue

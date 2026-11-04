@@ -93,6 +93,24 @@ func TestHookClaimIdentityPatchResolvesWorkerBranchNotStoreBranch(t *testing.T) 
 			want: "bd-gc-legacy",
 		},
 		{
+			// gcf-23j: the claim stamps the claiming session's home checkout as
+			// gc.work_dir and the formula's branch-setup then records the per-bead
+			// worktree it actually works in under the legacy work_dir. Both resolve,
+			// so the order decides: the legacy tree must win or the stale claim-time
+			// branch is never corrected.
+			name: "legacy work dir wins over a canonical home checkout so branch-setup restamps",
+			metadata: map[string]string{
+				beadmeta.WorkDirMetadataKey:       "/worktrees/polecat-home",
+				beadmeta.LegacyWorkDirMetadataKey: "/worktrees/polecat-home/worktrees/gc-work-1",
+				beadmeta.WorkBranchMetadataKey:    "fix/stale-parked-branch",
+			},
+			branches: map[string]string{
+				"/worktrees/polecat-home":                     "fix/stale-parked-branch",
+				"/worktrees/polecat-home/worktrees/gc-work-1": "polecat/gc-work-1",
+			},
+			want: "polecat/gc-work-1",
+		},
+		{
 			name: "legacy work dir that IS the store dir is refused too",
 			metadata: map[string]string{
 				beadmeta.WorkDirMetadataKey:       "/worktrees/never-created",
