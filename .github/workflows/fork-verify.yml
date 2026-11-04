@@ -361,9 +361,9 @@ jobs:
           done
           echo "cmd/gc fast suite total wall time: $(( SECONDS - total_start ))s, failed shards: $failed" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$failed" -eq 0 ]
-      - name: Test-policy packages (resourcecensus ledger, docsync)
+      - name: Test-policy packages (resourcecensus ledger, docsync, scripts manifests)
         run: |
           set -euo pipefail
           start=$SECONDS
-          go test ./internal/testpolicy/... ./test/docsync/... -count=1
+          go test ./internal/testpolicy/... ./test/docsync/... ./scripts/... -count=1
           echo "policy packages wall time: $(( SECONDS - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
