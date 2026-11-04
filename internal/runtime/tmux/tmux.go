@@ -2250,6 +2250,23 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// entry would let the final Enter's echo land outside the discount window.
 	// pokePrior also carries a still-unanswered earlier poke's baseline forward
 	// so chained nudges inside pokeGrace don't record gc's own echo as prior.
+	// Never type into a pending permission prompt (#2892, upstream #6832): look
+	// under the lock before the first key, again before the paste, and again
+	// before the submit keys. A prompt on screen refuses the nudge with
+	// runtime.ErrPendingInteraction; a pane that cannot be read refuses too,
+	// because what the look cannot see may be a prompt and Enter on one approves
+	// the tool call.
+	promptLook := func() error {
+		err := t.checkNoApprovalPromptIn(session, target)
+		if err == nil || errors.Is(err, runtime.ErrPendingInteraction) {
+			return err
+		}
+		return fmt.Errorf("%w in session %q before sending keys: %w", errPromptLookFailed, session, err)
+	}
+	if err := promptLook(); err != nil {
+		return err
+	}
+
 	commitPoke := t.beginPoke(session)
 	delivered := false
 	defer func() {
@@ -2283,6 +2300,9 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	if err := promptLook(); err != nil {
+		return err
+	}
 	// 2. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
@@ -2314,8 +2334,16 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// "drafted but not submitted" stall; confirming here removes the town's
 	// dependence on an external observer re-kicking the session. Providers
 	// without a reliable indicator keep best-effort delivery.
+	if err := promptLook(); err != nil {
+		return err
+	}
 	submitKeys := t.nudgeSubmitKeySequence(target)
-	sendSubmit := func() error { return t.sendNudgeSubmitSequence(target, submitKeys) }
+	sendSubmit := func() error {
+		if err := promptLook(); err != nil {
+			return err
+		}
+		return t.sendNudgeSubmitSequence(target, submitKeys)
+	}
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
 		confirmed, err := submitEnterAndConfirm(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep)
@@ -4562,3 +4590,7 @@ func (t *Tmux) SetAutoRespawnHook(session string) error {
 
 	return nil
 }
+
+// errPromptLookFailed marks a look for a permission prompt that could not read
+// the pane.
+var errPromptLookFailed = errors.New("could not check for a pending permission prompt")

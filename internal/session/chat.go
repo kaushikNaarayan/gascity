@@ -251,7 +251,7 @@ var (
 	ErrInteractionMismatch = errors.New("pending interaction does not match request")
 	// ErrPendingInteraction reports that the session is blocked on a pending
 	// approval or question and cannot accept a new user turn.
-	ErrPendingInteraction = errors.New("session has a pending interaction")
+	ErrPendingInteraction = runtime.ErrPendingInteraction
 )
 
 type sessionMutationLockEntry struct {

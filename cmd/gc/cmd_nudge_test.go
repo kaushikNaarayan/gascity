@@ -5612,3 +5612,119 @@ func TestPruneDeadQueuedNudgesBudgetWithoutRotationStarves(t *testing.T) {
 		t.Fatalf("dead = %d, want 4: without rotation the droppable tail must starve", len(state.Dead))
 	}
 }
+
+// promptRefusingNudgeProvider refuses to type while refuse is set, the way the
+// tmux provider does behind a pending permission prompt: it returns
+// runtime.ErrPendingInteraction and delivers nothing (no Nudge call recorded).
+type promptRefusingNudgeProvider struct {
+	*runtime.Fake
+	refuse bool
+}
+
+func (p *promptRefusingNudgeProvider) Nudge(name string, content []runtime.ContentBlock) error {
+	if p.refuse {
+		return fmt.Errorf("%w: session %q is waiting on a permission prompt", runtime.ErrPendingInteraction, name)
+	}
+	return p.Fake.Nudge(name, content)
+}
+
+func (p *promptRefusingNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	if p.refuse {
+		return fmt.Errorf("%w: session %q is waiting on a permission prompt", runtime.ErrPendingInteraction, name)
+	}
+	return p.Fake.NudgeNow(name, content)
+}
+
+// TestQueuedNudgeBehindPermissionPromptIsReleasedThenDeliveredOnce is the queue
+// branch of gcf-noxgu (qa spec): a queued nudge that meets a pending permission
+// prompt is released WITHOUT spending an attempt and held back by DeliverAfter;
+// once the prompt is answered it is delivered exactly once.
+func TestQueuedNudgeBehindPermissionPromptIsReleasedThenDeliveredOnce(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", time.Now().Add(-1*time.Minute))); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+	store := openNudgeBeadStore(dir)
+	fake := &promptRefusingNudgeProvider{Fake: runtime.NewFake(), refuse: true}
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	idleSince := time.Now().Add(-10 * time.Second)
+	fake.Activity = map[string]time.Time{info.SessionName: idleSince}
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionID:   info.ID,
+		resolved:    &config.ResolvedProvider{Name: "codex"},
+		sessionName: info.SessionName,
+	}
+	obs := worker.LiveObservation{Running: true, LastActivity: &idleSince}
+	nudgeCalls := func() int {
+		n := 0
+		for _, c := range fake.Calls {
+			if c.Method == "Nudge" || c.Method == "NudgeNow" {
+				n++
+			}
+		}
+		return n
+	}
+
+	// 1. Prompt pending: nothing typed, claim released, no attempt spent, held back.
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, fake, 3*time.Second, obs)
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller (prompt pending): %v", err)
+	}
+	if delivered {
+		t.Fatal("delivered = true, want false while a permission prompt is pending")
+	}
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending=%d inFlight=%d dead=%d, want the nudge back in pending", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].Attempts != 0 {
+		t.Fatalf("attempts = %d, want 0: a pending permission prompt is not a delivery failure", pending[0].Attempts)
+	}
+	if !pending[0].DeliverAfter.After(time.Now()) {
+		t.Fatalf("deliver after = %v, want a later pass while the prompt waits for an answer", pending[0].DeliverAfter)
+	}
+	if n := nudgeCalls(); n != 0 {
+		t.Fatalf("provider recorded %d nudge call(s) behind the prompt, want 0", n)
+	}
+
+	// 2. The prompt is answered and the hold-back has elapsed: deliver once.
+	fake.refuse = false
+	if err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
+		for i := range state.Pending {
+			state.Pending[i].DeliverAfter = time.Now().Add(-time.Second).UTC()
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("make nudge due: %v", err)
+	}
+	delivered, err = tryDeliverQueuedNudgesByPoller(target, store, store, fake, 3*time.Second, obs)
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller (prompt answered): %v", err)
+	}
+	if !delivered {
+		t.Fatal("delivered = false, want true once the prompt is answered")
+	}
+	if n := nudgeCalls(); n != 1 {
+		t.Fatalf("provider recorded %d nudge call(s), want exactly 1", n)
+	}
+	pending, inFlight, dead, err = listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges after delivery: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("after delivery pending=%d inFlight=%d dead=%d, want 0/0/0", len(pending), len(inFlight), len(dead))
+	}
+}

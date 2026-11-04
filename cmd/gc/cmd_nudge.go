@@ -1505,6 +1505,15 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 			}
 			return false, bookkeepErr
 		}
+		if errors.Is(err, runtime.ErrPendingInteraction) {
+			// The session is waiting on a permission prompt (#2892, upstream
+			// #6832). Nothing was typed. Release the claims WITHOUT spending an
+			// attempt, and do not retry before the prompt can have been answered.
+			if recErr := releaseQueuedNudgeClaimsUntilWithMaint(target.cityPath, queuedNudgeIDs(items), time.Now().Add(defaultQueuedNudgeRetryDelay), &maint); recErr != nil {
+				return false, errors.Join(bookkeepErr, recErr)
+			}
+			return false, bookkeepErr
+		}
 		if errors.Is(err, sessiontmux.ErrNudgeSubmitDeliveredUnobserved) {
 			// The pane consumed the submit.  Only busy-state observation missed,
 			// so acknowledge rather than retrying and re-pasting this batch.
@@ -2388,6 +2397,13 @@ func releaseQueuedNudgeClaims(cityPath string, ids []string) error {
 // releaseQueuedNudgeClaimsWithMaint is releaseQueuedNudgeClaims over a
 // caller-supplied maintenance handle (see ackQueuedNudgesWithMaint).
 func releaseQueuedNudgeClaimsWithMaint(cityPath string, ids []string, maint *nudgeMaintenanceStore) error {
+	return releaseQueuedNudgeClaimsUntilWithMaint(cityPath, ids, time.Time{}, maint)
+}
+
+// releaseQueuedNudgeClaimsUntilWithMaint returns claimed nudges to pending
+// without spending an attempt. A non-zero deliverAfter keeps them from being
+// claimed again before then.
+func releaseQueuedNudgeClaimsUntilWithMaint(cityPath string, ids []string, deliverAfter time.Time, maint *nudgeMaintenanceStore) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -2417,6 +2433,9 @@ func releaseQueuedNudgeClaimsWithMaint(cityPath string, ids []string, maint *nud
 			}
 			item.ClaimedAt = time.Time{}
 			item.LeaseUntil = time.Time{}
+			if !deliverAfter.IsZero() {
+				item.DeliverAfter = deliverAfter.UTC()
+			}
 			released = append(released, item)
 		}
 		state.InFlight = inFlight
