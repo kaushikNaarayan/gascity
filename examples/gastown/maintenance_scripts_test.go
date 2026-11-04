@@ -1999,9 +1999,11 @@ func TestOrphanSweepPreservesProtectedInProgressEphemeralMoleculeWisp(t *testing
 			if strings.Contains(log, "config show") {
 				t.Fatalf("primary regression must not use config show fallback\n%s", orphanSweepFailureContext(out, gcLog))
 			}
-			// Before/after city-wide liveness probes around the bead walk.
-			if got := countExactLine(lines, "session list --json"); got != 2 {
-				t.Fatalf("city session probe count = %d, want exactly 2\n%s", got, orphanSweepFailureContext(out, gcLog))
+			// Before/after city-wide liveness probes around the bead walk, plus
+			// the two fresh final-owner re-check reads for the one released
+			// orphan (gcf-toimd).
+			if got := countExactLine(lines, "session list --json"); got != 4 {
+				t.Fatalf("city session probe count = %d, want exactly 4\n%s", got, orphanSweepFailureContext(out, gcLog))
 			}
 			// Sessions are city-wide: no per-rig probes (gcf-9h9w7).
 			if got := countExactLine(lines, "--rig project-alpha session list --json"); got != 0 {
@@ -11103,5 +11105,247 @@ exit 0
 	want := "cross-rig-deps: resolved 4 cross-rig dependencies"
 	if !strings.Contains(string(out), want) {
 		t.Fatalf("cross-rig-deps summary missing or wrong (subshell counter regression?)\nwant substring: %q\ngot output:\n%s\nbd log:\n%s", want, out, logData)
+	}
+}
+
+// orphanSweepPartialConfigGCStub models the gcf-toimd failure: the sweep's
+// first `gc config explain` read omits the crew seat "rig/rig-crew.pm" (a
+// partial/stale read) while the seat has no matching live session in the
+// first session list. When agentVisibleOnRecheck is true the later (fresh)
+// reads show the seat, as they do for a seat that is alive.
+func orphanSweepPartialConfigGCStub(t *testing.T, binDir, stateFile string, agentVisibleOnRecheck bool) {
+	t.Helper()
+	visible := "0"
+	if agentVisibleOnRecheck {
+		visible = "1"
+	}
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      if [ ! -e "`+stateFile+`" ]; then
+        : > "`+stateFile+`"
+        printf 'Agent: other/other-crew.qa\n'
+        exit 0
+      fi
+      printf 'Agent: other/other-crew.qa\n'
+      if [ "`+visible+`" = "1" ]; then
+        printf 'Agent: rig/rig-crew.pm\n'
+      fi
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "show" ] && [ "$3" = "ga-crew" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"ga-crew","status":"in_progress","assignee":"rig/rig-crew.pm"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "list" ]; then
+      printf '[{"id":"ga-crew","status":"in_progress","assignee":"rig/rig-crew.pm"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+}
+
+func runOrphanSweepPartialConfig(t *testing.T, agentVisibleOnRecheck bool) (string, string) {
+	t.Helper()
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	orphanSweepPartialConfigGCStub(t, binDir, filepath.Join(t.TempDir(), "first-explain-done"), agentVisibleOnRecheck)
+	cmd := exec.Command(coreScriptPath("orphan-sweep.sh"))
+	cmd.Env = mergeTestEnv(map[string]string{
+		"GC_CITY":                       cityDir,
+		"GC_CITY_PATH":                  cityDir,
+		"GC_CALL_LOG":                   gcLog,
+		"GC_ORPHAN_SWEEP_RECHECK_DELAY": "0",
+		"PATH":                          binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	})
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("orphan-sweep.sh failed: %v\n%s", err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	return string(out), string(logData)
+}
+
+// TestOrphanSweepDoesNotReleaseCrewSeatOnPartialConfigRead is the gcf-toimd
+// regression: a partial first config read must not release a live crew seat's
+// own in_progress claim, because the final fresh re-check sees the seat.
+func TestOrphanSweepDoesNotReleaseCrewSeatOnPartialConfigRead(t *testing.T) {
+	out, log := runOrphanSweepPartialConfig(t, true)
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("live crew seat's in_progress claim was released after a partial config read:\n%s\n%s", out, log)
+	}
+	if strings.Contains(out, "orphan-sweep: reset") {
+		t.Fatalf("sweep reported a reset for a live crew seat:\n%s", out)
+	}
+}
+
+// TestOrphanSweepStillReleasesCrewSeatThatIsGone is the negative control: when
+// the fresh re-check also finds no agent and no live session, the bead is a
+// genuine orphan and is still released, so the guard did not neuter the sweep.
+func TestOrphanSweepStillReleasesCrewSeatThatIsGone(t *testing.T) {
+	out, log := runOrphanSweepPartialConfig(t, false)
+	if !strings.Contains(log, "bd release-if-current ga-crew rig/rig-crew.pm") {
+		t.Fatalf("genuinely orphaned bead was not released:\n%s\n%s", out, log)
+	}
+}
+
+// orphanSweepRecheckModeGCStub models the sweep's first snapshot missing the
+// crew seat, with the fresh final re-check behaving per mode:
+//
+//	"session-visible"   fresh agents list lacks the seat, fresh session list has it
+//	"explain-empty"     fresh gc config explain/show return nothing (unreadable)
+//	"sessions-fail"     fresh gc session list exits non-zero (unreadable)
+//	"gone"              nothing knows the seat (genuine orphan)
+func orphanSweepRecheckModeGCStub(t *testing.T, binDir, stateDir, mode string) {
+	t.Helper()
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
+bump() { n=$(cat "`+stateDir+`/$1" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "`+stateDir+`/$1"; echo $n; }
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      n=$(bump explain)
+      if [ "$n" -gt 1 ] && [ "`+mode+`" = "explain-empty" ]; then exit 0; fi
+      printf 'Agent: other/other-crew.qa\n'
+      exit 0
+    fi
+    if [ "$2" = "show" ]; then exit 1; fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      n=$(bump sessions)
+      if [ "$n" -gt 2 ]; then
+        if [ "`+mode+`" = "sessions-fail" ]; then exit 1; fi
+        if [ "`+mode+`" = "session-visible" ]; then
+          printf '{"sessions":[{"id":"gp-1","session_name":"rig/rig-crew.pm","state":"active","closed":false}],"summary":{}}\n'
+          exit 0
+        fi
+      fi
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "show" ] && [ "$3" = "ga-crew" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"ga-crew","status":"in_progress","assignee":"rig/rig-crew.pm"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "list" ]; then
+      printf '[{"id":"ga-crew","status":"in_progress","assignee":"rig/rig-crew.pm"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+}
+
+func runOrphanSweepRecheckMode(t *testing.T, mode, delay string) (string, string, time.Duration) {
+	t.Helper()
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	orphanSweepRecheckModeGCStub(t, binDir, t.TempDir(), mode)
+	cmd := exec.Command(coreScriptPath("orphan-sweep.sh"))
+	cmd.Env = mergeTestEnv(map[string]string{
+		"GC_CITY":                       cityDir,
+		"GC_CITY_PATH":                  cityDir,
+		"GC_CALL_LOG":                   gcLog,
+		"GC_ORPHAN_SWEEP_RECHECK_DELAY": delay,
+		"PATH":                          binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	})
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("orphan-sweep.sh failed: %v\n%s", err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	return string(out), string(logData), elapsed
+}
+
+// A fresh SESSION match (agents list still lacks the seat) must skip the release.
+func TestOrphanSweepRecheckSkipsWhenFreshSessionMatches(t *testing.T) {
+	out, log, _ := runOrphanSweepRecheckMode(t, "session-visible", "0")
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("released a seat that a fresh session list shows live:\n%s\n%s", out, log)
+	}
+}
+
+// Unreadable fresh reads mean skip and count as unverifiable, never "gone".
+func TestOrphanSweepRecheckUnreadableAgentsListSkips(t *testing.T) {
+	out, log, _ := runOrphanSweepRecheckMode(t, "explain-empty", "0")
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("released on an unreadable fresh agents list:\n%s\n%s", out, log)
+	}
+	if !strings.Contains(out, "skipped 1 unverifiable") {
+		t.Fatalf("unreadable agents list not counted unverifiable:\n%s", out)
+	}
+}
+
+func TestOrphanSweepRecheckUnreadableSessionListSkips(t *testing.T) {
+	out, log, _ := runOrphanSweepRecheckMode(t, "sessions-fail", "0")
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("released on an unreadable fresh session list:\n%s\n%s", out, log)
+	}
+	if !strings.Contains(out, "skipped 1 unverifiable") {
+		t.Fatalf("unreadable session list not counted unverifiable:\n%s", out)
+	}
+}
+
+// The wait between the two re-reads must really wait (the old
+// 'read -t N _ < <(:)' returned at once on EOF).
+func TestOrphanSweepRecheckDelayActuallyWaits(t *testing.T) {
+	_, log, elapsed := runOrphanSweepRecheckMode(t, "gone", "2")
+	if !strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("genuine orphan not released:\n%s", log)
+	}
+	if elapsed < 1800*time.Millisecond {
+		t.Fatalf("recheck delay of 2s took only %v: the wait is a no-op", elapsed)
 	}
 }

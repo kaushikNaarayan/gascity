@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1066,6 +1067,32 @@ func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Trans
 	return beadFromNativeIssue(issue)
 }
 
+// releaseCommitMessage builds the Dolt commit message for a conditional
+// release. The trailing tag names the process and the first call frame outside
+// internal/beads so an unexplained release in dolt_log can be attributed to a
+// caller (controller reconcile path vs. a `gc bd release-if-current` CLI run
+// from a script) instead of only "gc: release bead X if current" (gcf-toimd).
+func releaseCommitMessage(id string) string {
+	caller := "unknown"
+	pcs := make([]uintptr, 16)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		fr, more := frames.Next()
+		if fr.Function != "" && !strings.Contains(fr.Function, "/internal/beads.") {
+			caller = fr.Function
+			if i := strings.LastIndex(caller, "/"); i >= 0 {
+				caller = caller[i+1:]
+			}
+			break
+		}
+		if !more {
+			break
+		}
+	}
+	return fmt.Sprintf("gc: release bead %s if current [caller=%s pid=%d cmd=%s]", id, caller, os.Getpid(), filepath.Base(os.Args[0]))
+}
+
 // ReleaseIfCurrent clears an in-progress assignment only when the bead still
 // has the expected assignee inside one native Dolt transaction.
 func (s *NativeDoltStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, error) {
@@ -1077,7 +1104,7 @@ func (s *NativeDoltStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, e
 	ctx, cancel := nativeDoltOperationContext(context.TODO())
 	defer cancel()
 	released := false
-	err = storage.RunInTransaction(ctx, fmt.Sprintf("gc: release bead %s if current", id), func(tx beadslib.Transaction) error {
+	err = storage.RunInTransaction(ctx, releaseCommitMessage(id), func(tx beadslib.Transaction) error {
 		issue, err := tx.GetIssue(ctx, id)
 		if err != nil {
 			err = nativeStoreError(id, err)

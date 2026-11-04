@@ -317,6 +317,37 @@ is_known_agent() {
     return 1
 }
 
+# Final owner re-check (gcf-toimd). The identity snapshots above (AGENTS,
+# LIVE_SESSION_IDS) are taken once at the start of a sweep that can run for
+# minutes, and a partial or stale read makes a configured crew seat look like a
+# dead agent: its own in_progress claim was then released while it was alive
+# (false PROPULSION). Immediately before releasing, re-read both sources fresh,
+# twice, and release only when BOTH reads succeed and neither knows the
+# assignee. Returns 0 = confirmed gone, 1 = alive (skip), 2 = unverifiable (skip).
+final_owner_recheck() {
+    local assignee="$1"
+    local attempt fresh_agents fresh_sessions fresh_live
+    for attempt in 1 2; do
+        fresh_agents=$(gc config explain 2>/dev/null | awk '/^Agent: /{print $2}') || fresh_agents=""
+        if [ -z "$fresh_agents" ]; then
+            fresh_agents=$(gc config show 2>/dev/null | awk '/^\[\[agent\]\]/{a=1} a && /^[[:space:]]*name[[:space:]]*=/{print; a=0}' | sed 's/.*=[[:space:]]*"\(.*\)"/\1/') || fresh_agents=""
+        fi
+        [ -n "$fresh_agents" ] || return 2
+        # here-string, not a pipe: under pipefail grep -q's early exit SIGPIPEs printf on lists >64 KB and the match would be lost (fail-open)
+        grep -Fxq -- "$assignee" <<<"$fresh_agents" && return 1
+        fresh_sessions=$(gc session list --json 2>/dev/null) || return 2
+        fresh_live=$(jq -r '
+            .sessions[]?
+            | select((.closed // false) == false and ((.state // "") | ascii_downcase) != "closed")
+            | [.id, .session_name, .alias, .agent_name, .template, .name][]
+            | select(. != null and . != "")' <<<"$fresh_sessions" 2>/dev/null) || return 2
+        grep -Fxq -- "$assignee" <<<"$fresh_live" && return 1
+        # bash builtin wait (no external sleep: the sweep runs with a minimal PATH).
+        [ "$attempt" = "1" ] && { read -r -t "${GC_ORPHAN_SWEEP_RECHECK_DELAY:-1}" _ <> <(:) || true; }
+    done
+    return 0
+}
+
 ORPHANED=0
 UNVERIFIABLE=0
 # Process substitution (not a pipe) keeps the loop body in the parent
@@ -340,6 +371,14 @@ while IFS=$'\t' read -r bead_id assignee; do
                 UNVERIFIABLE=$((UNVERIFIABLE + 1))
                 continue
             fi
+        fi
+        if final_owner_recheck "$assignee"; then
+            :
+        else
+            if [ "$?" = "2" ]; then
+                UNVERIFIABLE=$((UNVERIFIABLE + 1))
+            fi
+            continue
         fi
         if reset_orphan_if_current "$bead_id" "$assignee"; then
             ORPHANED=$((ORPHANED + 1))

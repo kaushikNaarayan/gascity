@@ -25,7 +25,12 @@ resource = "subprocess"
 # TestOrphanSweepListsSessionsOncePerPassNotPerRig in
 # examples/gastown/maintenance_scripts_test.go (+1 exec.Command call, a
 # declared Medium owner; no new file).
-baseline_calls = 616
+# 616/178 -> 618/178 (gcf-toimd): the two orphan-sweep recheck helpers
+# runOrphanSweepPartialConfig + runOrphanSweepRecheckMode in
+# examples/gastown/maintenance_scripts_test.go (+2 exec.Command calls, no new
+# file; they run the shipped orphan-sweep.sh against a fake gc). Untagged and
+# Small debt rows move by the same +2.
+baseline_calls = 618
 baseline_files = 178
 reported_calls = 495
 reported_files = 135
@@ -94,7 +99,9 @@ resource = "subprocess"
 # Medium owner; see the scope=all subprocess row above.
 # +1 call/+0 files (gcf-9h9w7): TestOrphanSweepListsSessionsOncePerPassNotPerRig,
 # a declared Medium owner; see the scope=all subprocess row above.
-baseline_calls = 415
+# +2 calls/+0 files (gcf-toimd): the two orphan-sweep recheck helpers; see the
+# scope=all subprocess row above.
+baseline_calls = 417
 baseline_files = 119
 reported_calls = 380
 reported_files = 98
@@ -423,7 +430,9 @@ medium_reason = "package TestMain mutates process state"
 [[small_debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 406
+# +2 calls/+0 files (gcf-toimd): the two orphan-sweep recheck helpers; see the
+# scope=all subprocess row at the top of this file.
+baseline_calls = 408
 baseline_files = 114
 reported_calls = 394
 reported_files = 105
