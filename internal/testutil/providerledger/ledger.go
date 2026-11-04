@@ -69,7 +69,7 @@ const (
 	// runtimeContractWaiverOwner owns the remaining production-runtime gaps.
 	// It is pinned by TestRuntimeWaiverOwnerIsPinnedAndWellFormed: changing it
 	// re-owns every runtime waiver at once, so it needs to be a deliberate edit.
-	runtimeContractWaiverOwner = "ga-80po0c.3"
+	runtimeContractWaiverOwner = "gcf-xbo8z"
 
 	// MarkdownStart begins the generated TESTING.md table.
 	MarkdownStart = "<!-- BEGIN CHECKED RUNTIME PROVIDER LEDGER -->"
@@ -186,7 +186,7 @@ func Catalog() []Entry {
 			"acp", "exact:acp", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/acp", "NewSeamBacked"),
-				time.Date(2026, time.October, 8, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.November, 18, 0, 0, 0, 0, time.UTC),
 				"TestACPDefaultDirConformance (internal/runtime/acp/conformance_test.go) calls "+
 					"NewSeamBacked directly through runtimetest.RunProviderTests with no dir injection, reusing "+
 					"the fakeacp fixture; verified clean on Linux (single run, -count=3 repeated, -race, and two "+
@@ -211,7 +211,7 @@ func Catalog() []Entry {
 			"t3bridge", "exact:t3bridge", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/t3bridge", "NewSeamBacked"),
-				time.Date(2026, time.November, 5, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.December, 9, 0, 0, 0, 0, time.UTC),
 				"the production T3 bridge composition has focused tests but no full shared runtime contract",
 			),
 		),
@@ -219,7 +219,7 @@ func Catalog() []Entry {
 			"k8s", "exact:k8s", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/k8s", "NewSeamBacked"),
-				time.Date(2026, time.November, 12, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.December, 16, 0, 0, 0, 0, time.UTC),
 				"no runnable harness proves NewSeamBacked() against a live Kubernetes API plus pod exec lifecycle; every k8s package test drives newProviderWithOps(fake) instead of the real constructor, and no kind/integration-tagged harness exists in internal/runtime/k8s",
 			),
 		),
@@ -227,7 +227,7 @@ func Catalog() []Entry {
 			"herdr", "exact:herdr", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/herdr", "New"),
-				time.Date(2026, time.September, 24, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.November, 25, 0, 0, 0, 0, time.UTC),
 				"the full conformance run is an opt-in live journey (make test-herdr-live, or GC_FAST_UNIT=0) and skips in the unit lane, in short mode, and when the herdr executable is absent",
 			),
 		),
@@ -235,7 +235,7 @@ func Catalog() []Entry {
 			"hybrid", "exact:hybrid", nil,
 			waivedRuntime(
 				repoSymbol("cmd/gc", "newHybridProvider"),
-				time.Date(2026, time.October, 22, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.December, 2, 0, 0, 0, 0, time.UTC),
 				"cmd/gc.newHybridProvider is the selected registry construction boundary; its internal tmux, K8s, and hybrid constructors are not claimed here, and the wrapper has no full shared runtime contract",
 			),
 		),
@@ -251,7 +251,7 @@ func Catalog() []Entry {
 			),
 			waivedRuntime(
 				repoSymbol("internal/runtime/t3bridge", "NewSeamBacked"),
-				time.Date(2026, time.November, 5, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.December, 9, 0, 0, 0, 0, time.UTC),
 				"the legacy gc-session-t3 prefix branch selects the T3 bridge composition, which has no full shared runtime contract",
 			),
 		),

@@ -16,16 +16,16 @@ var waiverOwnerPattern = regexp.MustCompile(`^[a-z]{2,4}-[a-z0-9]+(\.[0-9]+)*$`)
 // The catalog check only asserts that each waiver matches the constant, so
 // editing the constant silently re-owns all of them at once. Pinning the value
 // here makes that reassignment a deliberate edit with a diff a reviewer sees:
-// these waivers are waiting on ga-80po0c.3 ("H5: contract production runtime
-// compositions once"), and pointing them at a bead that does not resolve leaves
+// these waivers are waiting on gcf-xbo8z ("contract the remaining runtime.Provider
+// compositions"), and pointing them at a bead that does not resolve leaves
 // the fleet with eight dated waivers nobody is on the hook for.
 func TestRuntimeWaiverOwnerIsPinnedAndWellFormed(t *testing.T) {
-	const want = "ga-80po0c.3"
+	const want = "gcf-xbo8z"
 	if runtimeContractWaiverOwner != want {
 		t.Errorf("runtimeContractWaiverOwner = %q, want %q; re-owning the runtime waivers needs the new owner recorded here too", runtimeContractWaiverOwner, want)
 	}
 	if !waiverOwnerPattern.MatchString(runtimeContractWaiverOwner) {
-		t.Errorf("runtimeContractWaiverOwner = %q, want a bead id like ga-80po0c.3", runtimeContractWaiverOwner)
+		t.Errorf("runtimeContractWaiverOwner = %q, want a bead id like gcf-xbo8z", runtimeContractWaiverOwner)
 	}
 }
 
