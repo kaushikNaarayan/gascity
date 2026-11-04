@@ -11238,6 +11238,11 @@ case "$1" in
     if [ "$2" = "explain" ]; then
       n=$(bump explain)
       if [ "$n" -gt 1 ] && [ "`+mode+`" = "explain-empty" ]; then exit 0; fi
+      if [ "`+mode+`" = "big-agents-then-empty" ]; then
+        if [ "$n" -gt 1 ]; then exit 0; fi
+        awk 'BEGIN { print "Agent: rig/rig-crew.pm"; for (i = 0; i < 4000; i++) printf "Agent: filler/filler-crew.seat%05d\n", i }'
+        exit 0
+      fi
       printf 'Agent: other/other-crew.qa\n'
       exit 0
     fi
@@ -11254,6 +11259,7 @@ case "$1" in
       n=$(bump sessions)
       if [ "$n" -gt 2 ]; then
         if [ "`+mode+`" = "sessions-fail" ]; then exit 1; fi
+        if [ "`+mode+`" = "sessions-truncated" ]; then printf '{"sessions":[{"id":"gp-1","session_na'; exit 0; fi
         if [ "`+mode+`" = "session-visible" ]; then
           printf '{"sessions":[{"id":"gp-1","session_name":"rig/rig-crew.pm","state":"active","closed":false}],"summary":{}}\n'
           exit 0
@@ -11335,6 +11341,32 @@ func TestOrphanSweepRecheckUnreadableSessionListSkips(t *testing.T) {
 	}
 	if !strings.Contains(out, "skipped 1 unverifiable") {
 		t.Fatalf("unreadable session list not counted unverifiable:\n%s", out)
+	}
+}
+
+// A session list that exits 0 but is truncated JSON is unreadable: skip.
+func TestOrphanSweepRecheckTruncatedSessionJSONSkips(t *testing.T) {
+	out, log, _ := runOrphanSweepRecheckMode(t, "sessions-truncated", "0")
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("released on a truncated fresh session list:\n%s\n%s", out, log)
+	}
+	if !strings.Contains(out, "skipped 1 unverifiable") {
+		t.Fatalf("truncated session list not counted unverifiable:\n%s", out)
+	}
+}
+
+// A live seat that is the FIRST entry of an agents list over the 64 KB pipe
+// buffer must still be recognised by the first snapshot (is_known_agent).
+// The fresh re-read is empty, so if the first lookup fail-opens (printf|grep -q
+// SIGPIPE under pipefail) the sweep reaches the recheck and reports
+// "unverifiable"; a correct lookup never gets there.
+func TestOrphanSweepKnownAgentLookupSurvivesListOver64KB(t *testing.T) {
+	out, log, _ := runOrphanSweepRecheckMode(t, "big-agents-then-empty", "0")
+	if strings.Contains(log, "bd release-if-current ga-crew") {
+		t.Fatalf("released a configured seat:\n%s\n%s", out, log)
+	}
+	if strings.Contains(out, "unverifiable") {
+		t.Fatalf("known-agent lookup failed open on a >64 KB list (reached the recheck):\n%s", out)
 	}
 }
 
