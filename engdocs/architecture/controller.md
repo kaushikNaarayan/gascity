@@ -3,7 +3,7 @@ title: "Controller"
 ---
 
 
-> Last verified against code: 2026-08-03
+> Last verified against code: 2026-11-05
 
 ## Summary
 
@@ -17,16 +17,22 @@ automations, and garbage-collects expired wisps.
 
 ## Key Concepts
 
-- **Controller Loop**: The persistent `select` loop in `controllerLoop()`
-  that fires on a configurable ticker (default 30s) and on config file
-  changes. Each tick runs the full reconciliation, wisp GC, and order
-  dispatch pipeline. Implemented in `cmd/gc/controller.go`.
+- **Controller Loop**: The persistent `select` loop in
+  `CityRuntime.run()` (`cmd/gc/city_runtime.go`). It wakes on the patrol
+  ticker (default 30s, `patrol_interval`), on debounced pokes, and on
+  nudge, control-dispatcher, and convergence signals. Patrol and poke
+  wakes run `CityRuntime.tick()`, the full reconciliation pipeline; the
+  other wakes run narrower handlers. `controllerLoop()` in
+  `cmd/gc/controller.go` is a compatibility shim over the same runtime.
 
 - **Config Reload**: The debounced mechanism by which filesystem changes
   to `city.toml` and pack directories trigger a full config re-parse.
-  An `atomic.Bool` dirty flag is set by fsnotify; at the top of each tick,
-  if dirty is true, `tryReloadConfig()` re-parses and validates the config.
-  Rejects workspace name changes (requires controller restart).
+  An `atomic.Bool` dirty flag is set by fsnotify; near the top of each
+  tick, if dirty is true, `reloadConfigTraced()` re-parses and validates
+  the config via `tryReloadConfig()`. Rejects workspace name changes
+  (requires controller restart). Manual reload requests are accepted on a
+  separate goroutine so a slow tick cannot block acceptance; the reload
+  itself still runs on the reconciler goroutine in the next tick.
 
 - **Graceful Shutdown**: The two-pass agent termination sequence:
   (1) send Interrupt (Ctrl-C) to all sessions, (2) wait `shutdown_timeout`,
@@ -77,15 +83,12 @@ gc start --foreground
   │     ├─ acquireControllerLock()   →  flock LOCK_EX|LOCK_NB
   │     ├─ startControllerSocket()   →  Unix socket for IPC
   │     ├─ build trackers (crash, idle, wisp GC, order)
-  │     └─ controllerLoop()
+  │     └─ CityRuntime.run()
   │           ├─ watchConfigDirs()   →  fsnotify on config + pack dirs
-  │           ├─ initial reconciliation
-  │           └─ ticker loop:
-  │                 ├─ if dirty: tryReloadConfig() + rebuild trackers
-  │                 ├─ buildAgents(cfg)  →  evaluate pools in parallel
-  │                 ├─ reconcileSessionBeads()
-  │                 ├─ wispGC.runGC()
-  │                 └─ orderDispatcher.dispatch()
+  │           ├─ startup reconciliation
+  │           └─ select loop (patrol ticker, pokes, nudge/control/
+  │              convergence wakes):
+  │                 └─ tick()  →  see "Main Loop Detail"
   │
   └─ shutdown:
         ├─ orderDispatcher.drain(ctx) →  wait for in-flight order goroutines
@@ -96,51 +99,100 @@ gc start --foreground
 
 ### Main Loop Detail
 
-Each tick of `controllerLoop()` (`cmd/gc/controller.go:268-320`) performs:
+`CityRuntime.run()` (`cmd/gc/city_runtime.go`) blocks in a `select` over:
 
-1. **Dirty check** (`dirty.Swap(false)`): If config files changed since
-   the last tick, `tryReloadConfig()` re-parses `city.toml` with includes
-   and patches. On success, all four trackers are rebuilt from the new
-   config. On failure (parse error, validation error, name change), the
-   old config is kept and an error is logged.
+| Wake source | Handler |
+|---|---|
+| Patrol ticker (`patrol_interval`, default 30s) | `tick("patrol")`; drops pending debounced pokes because patrol is authoritative |
+| `pokeCh` (sling or API assigned work to a sleeping session) | Debounced (`tick_debounce`, default 0), then `tick("poke")` |
+| `nudgeWakeCh` (supervisor nudge dispatcher) | `nudgeDispatchTick()`; patrol ticks are the fallback if a wake is missed |
+| `controlDispatcherCh` | Debounced, then `controlDispatcherTick()` |
+| `convergenceReqCh` | Handles one convergence request between ticks |
+| `ctx.Done()` | Return, then shutdown |
 
-2. **Agent list build** (`buildAgents(cfg)`): Re-evaluates the desired
-   agent set. For pool agents, `evaluatePool()` runs `check` commands in
-   parallel via goroutines (`cmd/gc/pool.go:43`). Suspended agents and
-   agents in suspended rigs are excluded. Fixed agents are resolved
-   individually. Each agent gets its environment, prompt, hooks, overlay,
-   and session setup expanded.
+Each handler runs under `safeTick()`, which recovers panics. A tick that
+runs longer than `slowTickLogThreshold` (5s) logs `slow tick ... (event
+loop blocked)`, because every other wake waits behind it. Manual reload
+acceptance runs on its own goroutine, not in this loop.
 
-3. **Reconciliation** (`reconcileSessionBeads()`): Declarative convergence --
-   make session beads and running sessions match the desired list. See
+Each patrol or poke `tick()` performs these phases in order. Every phase
+checks `ctx.Err()` and each is recorded in the session-reconciler trace.
+
+1. **Pool death detection** (`reconcilePoolDeaths()`): compare pool
+   instance liveness against the previous tick.
+
+2. **Config reload**: if `dirty.Swap(false)` is true, `reloadConfigTraced()`
+   re-parses `city.toml` with includes and patches. On failure (parse,
+   validation, name change) the old config is kept and the error is
+   logged. A manual reload's reply is sent right after this step (soft
+   reloads that applied or changed nothing reply at end of tick).
+
+3. **Filesystem-pressure gate** (`shouldSkipTickForFSPressure()`,
+   `cmd/gc/fs_pressure.go`): when no config change is pending and PSI
+   "some avg60" is above 50, the tick skips everything below except
+   draining queued convergence requests. After 5 consecutive skips
+   (`maxConsecutiveFSPressureSkips`) the next tick is forced.
+
+4. **Managed-Dolt preflight** (`ensureManagedDoltPublishedForTick()`).
+
+5. **Order dispatch** (`dispatchOrders()`): evaluates trigger conditions
+   for all non-manual orders. It runs before the expensive session phases
+   so due formulas are not starved by slow startup or config drift. See
+   [Health Patrol](health-patrol.md) for trigger evaluation and dispatch.
+
+6. **Unrouted-work recovery** (`recoverUnroutedWorkRoutes()`): re-routes
+   ready work that has `gc.run_target` but no `gc.routed_to`, so the
+   autoscaler sees it as demand.
+
+7. **Session snapshot and reaping**: load the session bead snapshot, then
+   `cleanupDeadRuntimeSessionCorpses()`, `reapRuntimesBoundToClosedBeads()`,
+   `sweepProcessTableOrphans()`, `reapStaleSessionBeads()`, optional
+   closed-bead worktree reaping, and finalization of drain-ack stops.
+   The snapshot is reloaded after any step that changed it.
+
+8. **Demand and desired state**: `loadDemandSnapshot()` (pool checks and
+   routed-work demand), `refreshDesiredState()`, then
+   `syncBeadsAndUpdateIndex()` to reconcile session beads with desired
+   state. The snapshot is reloaded after the sync, stale external-message
+   bindings and group participants are re-pointed at respawned sessions,
+   and `refreshDesiredState()` runs again. Soft-reload acceptance is
+   applied here when requested.
+
+9. **Bead-driven reconciliation** (`beadReconcileTick()`): declarative
+   convergence of running sessions to the desired set. See
    [Health Patrol](health-patrol.md) for the reconciliation state machine,
-   crash loop quarantine, and idle tracking details.
+   crash loop quarantine, and idle tracking.
 
-4. **Wisp GC** (`wg.runGC()`): If enabled (`wisp_gc_interval` and
-   `wisp_ttl` both set), queries closed molecules via `bd list` and
-   deletes those older than the TTL cutoff.
+10. **Execution completions** (`reconcileExecutionCompletions()`): patrol
+    ticks only. Reconciles closed graph.v2 steps, since graph stores do
+    not emit `bead.closed`.
 
-5. **Order dispatch** (`ad.dispatch()`): Evaluates trigger conditions
-   for all non-manual orders. See
-   [Health Patrol](health-patrol.md) for trigger evaluation and dispatch
-   details.
+11. **Wisp GC** (`wg.runGC()`): if enabled (`wisp_gc_interval` and
+    `wisp_ttl` both set), purges closed molecules older than the TTL.
+
+12. **Workspace services** (`svc.Tick()`) and **chat auto-suspend**
+    (`autoSuspendChatSessions()`, when `chat_sessions.idle_timeout` is set).
+
+13. **Convergence**: `processConvergenceRequests()` drains queued CLI
+    requests first so user commands such as stop take precedence, then
+    `convergenceTick()` advances active convergence loops.
 
 ### Key Types
 
-- **`controllerLoop()`** (`cmd/gc/controller.go:226`): The main loop
-  function. Accepts all dependencies as parameters for testability:
-  config, build function, session provider, reconcile/drain ops, all four
-  trackers, event recorder, and I/O writers.
+- **`CityRuntime.run()` / `CityRuntime.tick()`** (`cmd/gc/city_runtime.go`):
+  The select loop and the per-tick reconciliation pipeline described
+  above. `controllerLoop()` in `cmd/gc/controller.go` remains as a
+  compatibility shim over the same runtime.
 
-- **`runController()`** (`cmd/gc/controller.go:335`): The top-level
+- **`runController()`** (`cmd/gc/controller.go`): The top-level
   orchestrator. Acquires the flock, opens the Unix socket, builds
   trackers, enters the loop, and performs graceful shutdown on exit.
 
-- **`tryReloadConfig()`** (`cmd/gc/controller.go:137`): Config reload
+- **`tryReloadConfig()`** (`cmd/gc/controller.go`): Config reload
   with validation. Rejects workspace name changes. Returns the new
   config, provenance, and revision hash on success.
 
-- **`gracefulStopAll()`** (`cmd/gc/controller.go:169`): Two-pass shutdown.
+- **`gracefulStopAll()`** (`cmd/gc/controller.go`): Two-pass shutdown.
   Interrupt all sessions, wait `shutdown_timeout`, then force-kill
   survivors.
 
