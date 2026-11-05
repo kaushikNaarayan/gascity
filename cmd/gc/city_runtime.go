@@ -208,6 +208,7 @@ type CityRuntime struct {
 	nudgeRetryMu        sync.Mutex                   // guards nudgeRetryTimer and nudgeRetryDelay
 	nudgeRetryTimer     *time.Timer                  // pending re-arm of the nudge dispatcher (gcf-adu3i)
 	nudgeRetryDelay     time.Duration                // current retry backoff; 0 = not retrying
+	nudgePassInFlight   atomic.Bool                  // a nudge dispatch pass is running (or was abandoned still running); single-flight (gcf-x6ne2)
 	reloadMu            sync.Mutex                   // guards activeReload
 	activeReload        *reloadRequest
 	onStarted           func()
@@ -3393,10 +3394,98 @@ const nudgeBudgetRewakeDelay = time.Second
 // phases, when given, receives the duration of each sub-step (session_snapshot,
 // dispatch_pass, retry_schedule) so a slow tick can be attributed (gcf-664rj:
 // the whole tick took a median 126s on 1.3.13 with only the total traced).
-func (cr *CityRuntime) nudgeDispatchTick(_ context.Context, phases ...func(name string, d time.Duration)) {
+//
+// The pass runs on its own goroutine and the tick waits for it at most
+// nudgeDispatchTickHardLimit (gcf-x6ne2). A Dolt read that never returns, even
+// under a context deadline (the mysql driver call ignored it for 45 min on 29
+// Oct), would otherwise freeze the reconciler goroutine and with it every
+// session start in the city. A pass that outlives the limit is abandoned: the
+// tick returns, later ticks skip while it is still in flight (single-flight, so
+// stuck reads cannot pile up), and when it finally returns it re-wakes the
+// dispatcher.
+func (cr *CityRuntime) nudgeDispatchTick(ctx context.Context, phases ...func(name string, d time.Duration)) {
 	if !nudgeDispatcherIsSupervisor(cr.cfg) {
 		return
 	}
+	if !cr.nudgePassInFlight.CompareAndSwap(false, true) {
+		cr.logNudgeTick("nudge dispatcher: previous pass still in flight, skipping tick")
+		return
+	}
+	var (
+		mu        sync.Mutex
+		abandoned bool
+		panicVal  any
+	)
+	// Spans are dropped once the tick has given up on the pass: the caller's
+	// trace callbacks are not safe to invoke after the tick returned.
+	guarded := make([]func(string, time.Duration), 0, len(phases))
+	for _, f := range phases {
+		guarded = append(guarded, func(name string, d time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !abandoned {
+				f(name, d)
+			}
+		})
+	}
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				mu.Lock()
+				panicVal = r
+				mu.Unlock()
+			}
+			cr.nudgePassInFlight.Store(false)
+			close(done)
+		}()
+		cr.nudgeDispatchPass(ctx, guarded...)
+	}()
+	limit := parseNudgeDispatchTickBudget(nil) + nudgeDispatchTickGrace
+	if nudgeDispatchTickHardLimitOverride > 0 {
+		limit = nudgeDispatchTickHardLimitOverride
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-done:
+		mu.Lock()
+		p := panicVal
+		mu.Unlock()
+		if p != nil {
+			panic(p)
+		}
+	case <-timer.C:
+		mu.Lock()
+		abandoned = true
+		mu.Unlock()
+		cr.logNudgeTick(fmt.Sprintf("nudge dispatcher: pass exceeded %s, abandoned (a store read is not returning); tick continues", limit))
+		go func() {
+			<-done
+			select {
+			case cr.nudgeWakeCh <- struct{}{}:
+			default:
+			}
+		}()
+	}
+}
+
+// nudgeDispatchTickGrace is added to the pass budget to form the hard limit the
+// tick waits for a pass: the budget is checked between targets, so one target in
+// flight may legitimately overrun it a little.
+const nudgeDispatchTickGrace = 15 * time.Second
+
+// nudgeDispatchTickHardLimitOverride lets tests shrink the hard limit.
+var nudgeDispatchTickHardLimitOverride time.Duration
+
+func (cr *CityRuntime) logNudgeTick(msg string) {
+	if cr.stderr != nil {
+		fmt.Fprintf(cr.stderr, "%s: %s\n", cr.logPrefix, msg) //nolint:errcheck
+	}
+}
+
+// nudgeDispatchPass is the body of one dispatch pass; see nudgeDispatchTick.
+func (cr *CityRuntime) nudgeDispatchPass(_ context.Context, phases ...func(name string, d time.Duration)) {
 	span := func(name string, start time.Time) {
 		for _, f := range phases {
 			f(name, time.Since(start))
