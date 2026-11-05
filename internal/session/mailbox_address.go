@@ -29,35 +29,12 @@ func MailboxAddress(b beads.Bead) string {
 }
 
 // MailboxAddresses returns every address a session bead can receive mail at —
-// its primary address, its bead id, and any retained alias history — deduped
-// and trimmed, falling back to session_name only when nothing else resolves. It
-// is the canonical home of the logic the mail CLI previously inlined as
-// sessionMailboxAddresses.
+// its primary address, its bead id, any retained alias history, and its runtime
+// session_name (appended last) — deduped and trimmed. It is the single
+// recipient-set rule shared by the mail CLI and the API inbox/count reads, so
+// mail persisted under a runtime session_name is visible to both
+// (guarded by TestMailAPIQueriesAllResolvedSessionMailboxAddresses).
 func MailboxAddresses(b beads.Bead) []string {
-	return mailboxAddresses(b, false)
-}
-
-// MailboxAddressesIncludingRuntimeName returns every mailbox address a session
-// bead can receive mail at, always including its runtime session_name (appended
-// last), even when other addresses already resolved. This is the API read
-// semantics introduced by bf576b04a ("fix: include runtime session mailboxes in
-// API reads"): mail persisted under a session's runtime name must stay
-// reachable via API inbox/count queries, guarded by
-// TestMailAPIQueriesAllResolvedSessionMailboxAddresses.
-//
-// It deliberately forks from MailboxAddresses, which appends session_name only
-// as a last-resort fallback. That CLI/API fork is a documented product decision
-// (the CLI inbox can miss mail persisted under a runtime session_name the API
-// finds); reconciling the two recipient views is tracked as a follow-up.
-func MailboxAddressesIncludingRuntimeName(b beads.Bead) []string {
-	return mailboxAddresses(b, true)
-}
-
-// mailboxAddresses is the shared body behind MailboxAddresses (CLI fallback-only
-// session_name) and MailboxAddressesIncludingRuntimeName (API unconditional
-// session_name). When includeRuntimeName is true the session_name is always
-// added; otherwise it is only added when nothing else resolved.
-func mailboxAddresses(b beads.Bead, includeRuntimeName bool) []string {
 	seen := map[string]bool{}
 	var addresses []string
 	add := func(value string) {
@@ -73,11 +50,7 @@ func mailboxAddresses(b beads.Bead, includeRuntimeName bool) []string {
 	for _, alias := range AliasHistory(b.Metadata) {
 		add(alias)
 	}
-	if includeRuntimeName {
-		add(b.Metadata["session_name"])
-	} else if len(addresses) == 0 {
-		add(strings.TrimSpace(b.Metadata["session_name"]))
-	}
+	add(b.Metadata["session_name"])
 	return addresses
 }
 
@@ -97,24 +70,10 @@ func MailboxAddressFromInfo(info Info) string {
 }
 
 // MailboxAddressesFromInfo is the Info-taking twin of MailboxAddresses: every
-// address a session can receive mail at (primary, bead id, alias history),
-// falling back to session_name only when nothing else resolves.
+// address a session can receive mail at (primary, bead id, alias history, and
+// the RAW SessionNameMetadata appended last), byte-identical to
+// MailboxAddresses.
 func MailboxAddressesFromInfo(info Info) []string {
-	return mailboxAddressesFromInfo(info, false)
-}
-
-// MailboxAddressesIncludingRuntimeNameFromInfo is the Info-taking twin of
-// MailboxAddressesIncludingRuntimeName: the API read semantics that always
-// include the runtime session_name (appended last), even when other addresses
-// resolved.
-func MailboxAddressesIncludingRuntimeNameFromInfo(info Info) []string {
-	return mailboxAddressesFromInfo(info, true)
-}
-
-// mailboxAddressesFromInfo is the Info-taking shared body behind the two Info
-// mailbox twins, byte-identical to mailboxAddresses: it reads Alias/ID
-// (via MailboxAddressFromInfo), AliasHistory, and the RAW SessionNameMetadata.
-func mailboxAddressesFromInfo(info Info, includeRuntimeName bool) []string {
 	seen := map[string]bool{}
 	var addresses []string
 	add := func(value string) {
@@ -130,11 +89,7 @@ func mailboxAddressesFromInfo(info Info, includeRuntimeName bool) []string {
 	for _, alias := range info.AliasHistory {
 		add(alias)
 	}
-	if includeRuntimeName {
-		add(info.SessionNameMetadata)
-	} else if len(addresses) == 0 {
-		add(strings.TrimSpace(info.SessionNameMetadata))
-	}
+	add(info.SessionNameMetadata)
 	return addresses
 }
 

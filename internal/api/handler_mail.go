@@ -142,7 +142,7 @@ func (s *Server) resolveMailQueryRecipientsWithContext(ctx context.Context, reci
 		return []string{recipient}
 	}
 	if bead, getErr := store.Get(resolved); getErr == nil {
-		if recipients := session.MailboxAddressesIncludingRuntimeName(bead); len(recipients) > 0 {
+		if recipients := session.MailboxAddresses(bead); len(recipients) > 0 {
 			return recipients
 		}
 	}
@@ -177,7 +177,7 @@ func (s *Server) mailRecipientsForNamedSession(store beads.Store, spec apiNamedS
 			continue
 		}
 		seen[b.ID] = true
-		recipients = append(recipients, session.MailboxAddressesIncludingRuntimeName(b)...)
+		recipients = append(recipients, session.MailboxAddresses(b)...)
 	}
 	recipients = uniqueNonEmptyMailRecipients(recipients)
 	sort.Strings(recipients)
@@ -216,7 +216,7 @@ type apiResolvedMailTarget struct {
 }
 
 // WI-6 residual: this resolver stays on raw store.List + the bead-form mailbox
-// accessors (MailboxAddressesIncludingRuntimeName / MailboxAddress). Its per-
+// accessors (MailboxAddresses / MailboxAddress). Its per-
 // identity read is a METADATA-filtered ListQuery (configured_named_identity ==
 // identity), which the session front door's ListAll(opts) does not model — ListAll
 // carries only IncludeClosed/Sort/Live/Limit, not a metadata predicate. Converting
@@ -259,7 +259,7 @@ func (s *Server) resolveLiveConfiguredNamedMailTarget(store beads.Store, identif
 		if identity == "" || session.TargetBasename(identity) != identifier {
 			continue
 		}
-		addresses := session.MailboxAddressesIncludingRuntimeName(b)
+		addresses := session.MailboxAddresses(b)
 		if len(addresses) == 0 {
 			continue
 		}
