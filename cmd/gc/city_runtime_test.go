@@ -98,6 +98,60 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	}
 }
 
+// A configured named seat (mode=always) that is asleep with no runtime and no
+// assigned work must survive the sweep: gc_swept closes are unrecoverable for
+// named seats (closedNamedSessionReopenEligible refuses them), so the reconciler
+// would never respawn the seat. The bead is otherwise sweep-eligible (ephemeral
+// origin stamped explicitly, pool markers, runtime missing; without an
+// explicit origin a named seat derives origin "named" and is skipped for that
+// reason alone), so only the named-session guard keeps it open.
+func TestSweepUndesiredPoolSessionBeads_KeepsConfiguredNamedAlwaysSeatOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:worker"},
+		Metadata: map[string]string{
+			"session_name":                     "worker-named-always",
+			"template":                         "worker",
+			"agent_name":                       "worker",
+			"pool_slot":                        "1",
+			poolManagedMetadataKey:             boolMetadata(true),
+			sessionpkg.NamedSessionMetadataKey: "true",
+			"configured_named_identity":        "worker",
+			"configured_named_mode":            "always",
+			"state":                            "asleep",
+			"continuation_epoch":               "1",
+			"generation":                       "1",
+			"session_origin":                   "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}}
+
+	closed := sweepUndesiredPoolSessionBeads(
+		beads.SessionStore{Store: store},
+		nil,
+		newSessionBeadSnapshot([]beads.Bead{bead}),
+		nil,
+		cfg,
+		runtime.NewFake(), // no runtime session: the bead is not running
+		false,
+	)
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0 for a configured named always seat", closed)
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" || got.Metadata["state"] == "gc_swept" {
+		t.Fatalf("configured named always seat was swept: %+v", got)
+	}
+}
+
 // wispBlockingStore blocks every wisp-tier read until unblocked, signaling each
 // attempt on hit. The undesired-pool-session sweep's per-candidate wisp probe
 // (sessionHasOpenAssignedWispWork -> List(TierWisps)) is the distinctive read it
