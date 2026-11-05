@@ -6,8 +6,12 @@
 # The git tag is the single source of truth.
 #
 # This script exists to move the CHANGELOG [Unreleased] section to a new
-# [X.Y.Z] section, commit, tag, and push. That's it. If future channels (npm,
-# Nix) get added, extend here.
+# [X.Y.Z] section, set GC_VERSION in the VERSIONS manifest, commit, tag, and
+# push. install.sh reads VERSIONS AT THE TAG, so GC_VERSION must be bumped in
+# the very commit the tag points at (gcf-g2czv: v1.3.18 was tagged with
+# GC_VERSION=1.3.16 and install.sh refused it). BD_*/DOLT_* pins are not
+# touched: they are the town's live bd/Dolt and are set by hand before the bump.
+# If future channels (npm, Nix) get added, extend here.
 #
 # QUICK START:
 #   ./scripts/bump-version.sh X.Y.Z --commit --tag --push
@@ -22,7 +26,9 @@ usage() {
     cat <<EOF
 Usage: $0 <version> [--commit] [--tag] [--push]
 
-Cut a Gas City release.
+Cut a Gas City release. Rewrites CHANGELOG.md and VERSIONS (GC_VERSION only;
+set BD_VERSION/BD_SHA256_* to the town's live bd beforehand and commit that
+first) so both land in the commit the tag points at.
 
 Arguments:
   <version>        Semantic version (e.g., 1.0.0, 1.1.0). No leading 'v', no pre-release suffix.
@@ -72,6 +78,25 @@ update_changelog() {
     # Insert a new "## [X.Y.Z] - DATE" header directly under "## [Unreleased]".
     # Portable across GNU and BSD sed via sed_i helper.
     sed_i "s/^## \[Unreleased\]$/## [Unreleased]\\n\\n## [$version] - $date/" CHANGELOG.md
+}
+
+# Set GC_VERSION in the VERSIONS manifest. Fails closed (before any commit or
+# tag) when the file or its single GC_VERSION line is missing.
+update_versions_manifest() {
+    local version=$1
+    if [ ! -f "VERSIONS" ]; then
+        printf '%bError: VERSIONS not found at repo root%b\n' "$RED" "$NC" >&2
+        exit 1
+    fi
+    if [ "$(grep -c '^GC_VERSION=' VERSIONS)" != 1 ]; then
+        printf '%bError: VERSIONS must contain exactly one GC_VERSION= line%b\n' "$RED" "$NC" >&2
+        exit 1
+    fi
+    sed_i "s/^GC_VERSION=.*$/GC_VERSION=$version/" VERSIONS
+    if ! grep -qx "GC_VERSION=$version" VERSIONS; then
+        printf '%bError: failed to set GC_VERSION=%s in VERSIONS%b\n' "$RED" "$version" "$NC" >&2
+        exit 1
+    fi
 }
 
 main() {
@@ -129,15 +154,17 @@ main() {
         exit 1
     fi
 
-    printf '%bBumping CHANGELOG to %s%b\n\n' "$YELLOW" "$NEW_VERSION" "$NC"
+    printf '%bBumping CHANGELOG and VERSIONS to %s%b\n\n' "$YELLOW" "$NEW_VERSION" "$NC"
+    # Validate VERSIONS first so a failure leaves CHANGELOG.md untouched.
+    update_versions_manifest "$NEW_VERSION"
     update_changelog "$NEW_VERSION"
 
-    printf '%b✓ CHANGELOG.md updated%b\n\n' "$GREEN" "$NC"
-    git diff --stat CHANGELOG.md
-    echo
+    printf '%b✓ CHANGELOG.md and VERSIONS updated%b\n\n' "$GREEN" "$NC"
+    git diff --stat CHANGELOG.md VERSIONS
+    printf 'Pinned for this release: %s\n\n' "$(grep -E '^(GC|BD)_VERSION=' VERSIONS | tr '\n' ' ')"
 
     if [ "$AUTO_COMMIT" = true ]; then
-        git add CHANGELOG.md
+        git add CHANGELOG.md VERSIONS
         git commit -m "chore: release v$NEW_VERSION"
         printf '%b✓ Commit created%b\n' "$GREEN" "$NC"
 
