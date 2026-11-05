@@ -290,6 +290,17 @@ func stampResolvedProviderSessionMetadata(meta map[string]string, resolved *conf
 // write-if-changed reconcile contract) and never clobbers a stored value with
 // an empty resolved one — a transient resolution failure must not wipe good
 // metadata.
+// resolvedProviderSwitched reports whether the resolved provider names a
+// different provider than the one persisted on the session bead.
+func resolvedProviderSwitched(existing map[string]string, resolved *config.ResolvedProvider) bool {
+	if resolved == nil {
+		return false
+	}
+	name := strings.TrimSpace(resolved.Name)
+	stored := strings.TrimSpace(existing["provider"])
+	return name != "" && stored != "" && name != stored
+}
+
 func queueChangedResolvedProviderSessionMetadata(existing map[string]string, queue func(string, string), resolved *config.ResolvedProvider) {
 	if queue == nil || resolved == nil {
 		return
@@ -2038,6 +2049,11 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 		// provider switch while command alone follows.
 		if tp.Command != "" && b.Metadata["command"] != tp.Command {
 			queueMeta("command", tp.Command)
+		} else if tp.Command == "" && b.Metadata["command"] != "" && resolvedProviderSwitched(b.Metadata, tp.ResolvedProvider) {
+			// The provider changed and the new one resolves no command: the
+			// stored command belongs to the previous provider and must not be
+			// relaunched under the new provider's name.
+			queueMeta("command", "")
 		}
 		if tp.ResolvedProvider != nil {
 			queueChangedResolvedProviderSessionMetadata(b.Metadata, queueMeta, tp.ResolvedProvider)
