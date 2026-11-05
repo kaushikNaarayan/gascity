@@ -1955,6 +1955,116 @@ func TestCompactScriptStalePendingPushMarkerAlertsDefaultMayorBeforeManualReview
 	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", pendingPush, "compact-pending-push", "pending_push marker is stale")
 }
 
+// staleCompactPendingPushFixture leaves a pending-push marker for "beads" whose
+// created_at is far past the retry window and returns the marker path with
+// the gc log reset, so each test counts only the alerts of its own cycles.
+func staleCompactPendingPushFixture(t *testing.T) (compactScriptFixture, string) {
+	t.Helper()
+	fixture := newCompactScriptFixture(t)
+	firstOut, err := fixture.run(t, "remote_push_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first compact should succeed locally despite remote push failure: %v\n%s", err, firstOut)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-push", "beads")
+	replaceCompactMarkerCreatedAt(t, marker, "1970-01-01T00:00:00Z")
+	resetCompactGCLog(t, fixture)
+	return fixture, marker
+}
+
+func runStaleCompactCycles(t *testing.T, fixture compactScriptFixture, cycles int) {
+	t.Helper()
+	for i := 0; i < cycles; i++ {
+		out, err := fixture.run(t, "remote_success", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+		if err == nil {
+			t.Fatalf("stale pending-push cycle %d succeeded without manual review:\n%s", i+1, out)
+		}
+	}
+}
+
+func assertCompactAlertCounts(t *testing.T, fixture compactScriptFixture, wantMails, wantEvents int) {
+	t.Helper()
+	log := readCompactGCLog(t, fixture)
+	if got := len(compactGCLogLinesWithPrefix(log, "gc mail send ")); got != wantMails {
+		t.Fatalf("operator mails = %d, want %d\nlog:\n%s", got, wantMails, log)
+	}
+	if got := len(compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine")); got != wantEvents {
+		t.Fatalf("dolt.compact.quarantine events = %d, want %d\nlog:\n%s", got, wantEvents, log)
+	}
+}
+
+func TestCompactScriptStalePendingPushAlertMailsOncePerDistinctState(t *testing.T) {
+	fixture, _ := staleCompactPendingPushFixture(t)
+	runStaleCompactCycles(t, fixture, 3)
+
+	// A stable stale marker pages once; the event stays unconditional so
+	// downstream automation still observes every cycle.
+	assertCompactAlertCounts(t, fixture, 1, 3)
+}
+
+func TestCompactScriptStalePendingPushAlertReMailsWhenReasonChanges(t *testing.T) {
+	fixture, marker := staleCompactPendingPushFixture(t)
+	runStaleCompactCycles(t, fixture, 2)
+	assertCompactAlertCounts(t, fixture, 1, 2)
+
+	replaceCompactMarkerField(t, marker, "last_notified_reason", "pending_push marker is stale (older state)")
+	runStaleCompactCycles(t, fixture, 1)
+	assertCompactAlertCounts(t, fixture, 2, 3)
+}
+
+func TestCompactScriptStalePendingPushAlertReNotifiesAfterADay(t *testing.T) {
+	fixture, marker := staleCompactPendingPushFixture(t)
+	runStaleCompactCycles(t, fixture, 1)
+	assertCompactAlertCounts(t, fixture, 1, 1)
+
+	recent := time.Now().UTC().Add(-23 * time.Hour).Format("2006-01-02T15:04:05Z")
+	replaceCompactMarkerField(t, marker, "last_notified_ts", recent)
+	runStaleCompactCycles(t, fixture, 1)
+	assertCompactAlertCounts(t, fixture, 1, 2)
+
+	old := time.Now().UTC().Add(-25 * time.Hour).Format("2006-01-02T15:04:05Z")
+	replaceCompactMarkerField(t, marker, "last_notified_ts", old)
+	runStaleCompactCycles(t, fixture, 1)
+	assertCompactAlertCounts(t, fixture, 2, 3)
+	if got := compactMarkerValue(t, marker, "last_notified_ts"); got == old {
+		t.Fatalf("re-notify must restamp last_notified_ts, still %q", got)
+	}
+}
+
+func TestCompactScriptStalePendingPushAlertRetriesAfterMailFailure(t *testing.T) {
+	fixture, _ := staleCompactPendingPushFixture(t)
+	if err := os.WriteFile(fixture.mailFailFile, nil, 0o644); err != nil {
+		t.Fatalf("arm mail-failure sentinel: %v", err)
+	}
+	runStaleCompactCycles(t, fixture, 1)
+	if err := os.Remove(fixture.mailFailFile); err != nil {
+		t.Fatalf("disarm mail-failure sentinel: %v", err)
+	}
+
+	// A mail that failed to send must not be recorded as delivered.
+	runStaleCompactCycles(t, fixture, 2)
+	assertCompactAlertCounts(t, fixture, 2, 3)
+}
+
+func TestCompactScriptStalePendingPushAlertNamesTrackingBead(t *testing.T) {
+	fixture, marker := staleCompactPendingPushFixture(t)
+	f, err := os.OpenFile(marker, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open marker: %v", err)
+	}
+	if _, err := f.WriteString("\ntracking_bead=gcf-iioe9\n"); err != nil {
+		t.Fatalf("append tracking_bead: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close marker: %v", err)
+	}
+	runStaleCompactCycles(t, fixture, 1)
+
+	mailLines := compactGCLogLinesWithPrefix(readCompactGCLog(t, fixture), "gc mail send ")
+	if len(mailLines) != 1 || !strings.Contains(mailLines[0], "tracking_bead=gcf-iioe9") {
+		t.Fatalf("stale pending-push mail must name the marker's tracking bead, got %v", mailLines)
+	}
+}
+
 func TestCompactScriptDryRunReportsStalePendingPushMarker(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	firstOut, err := fixture.run(t, "remote_push_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")

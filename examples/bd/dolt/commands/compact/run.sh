@@ -303,6 +303,7 @@ threshold_commits="${GC_DOLT_COMPACT_THRESHOLD_COMMITS:-2000}"
 call_timeout="${GC_DOLT_COMPACT_CALL_TIMEOUT_SECS:-1800}"
 push_timeout="${GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS:-120}"
 pending_push_max_age_secs="${GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS:-172800}"
+pending_push_renotify_secs="${GC_DOLT_COMPACT_PENDING_PUSH_RENOTIFY_SECS:-86400}"
 compact_remote="${GC_DOLT_COMPACT_REMOTE:-}"
 dry_run="${GC_DOLT_COMPACT_DRY_RUN:-}"
 only_dbs="${GC_DOLT_COMPACT_ONLY_DBS:-}"
@@ -1446,13 +1447,24 @@ write_compact_marker() {
   return 0
 }
 
+# compact_quarantine_alert_message DB TYPE MARKER REASON [CREATED_AT [TRACKING_BEAD]]
+#   Body shared by the quarantine event and mail. TRACKING_BEAD, when set,
+#   names the bead that owns the blocked state so the alert is actionable.
+compact_quarantine_alert_message() {
+  _cm_msg="db=$1 type=$2 marker=$3 reason=$4 created_at=${5:-<unknown>} recipient=$compact_alert_to"
+  if [ -n "${6:-}" ]; then
+    _cm_msg="$_cm_msg tracking_bead=$6"
+  fi
+  printf '%s' "$_cm_msg"
+}
+
 emit_compact_quarantine_event() {
   _ca_db="$1"
   _ca_type="$2"
   _ca_path="$3"
   _ca_reason="$4"
   _ca_created_at="${5:-<unknown>}"
-  _ca_msg="db=$_ca_db type=$_ca_type marker=$_ca_path reason=$_ca_reason created_at=$_ca_created_at recipient=$compact_alert_to"
+  _ca_msg=$(compact_quarantine_alert_message "$_ca_db" "$_ca_type" "$_ca_path" "$_ca_reason" "$_ca_created_at" "${6:-}")
   gc event emit dolt.compact.quarantine --actor controller --message "$_ca_msg" || true
 }
 
@@ -1462,7 +1474,7 @@ mail_compact_quarantine_alert() {
   _ca_path="$3"
   _ca_reason="$4"
   _ca_created_at="${5:-<unknown>}"
-  _ca_msg="db=$_ca_db type=$_ca_type marker=$_ca_path reason=$_ca_reason created_at=$_ca_created_at recipient=$compact_alert_to"
+  _ca_msg=$(compact_quarantine_alert_message "$_ca_db" "$_ca_type" "$_ca_path" "$_ca_reason" "$_ca_created_at" "${6:-}")
   if gc mail send "$compact_alert_to" --from controller -s "dolt compact quarantine: $_ca_db $_ca_type" -m "$_ca_msg"; then
     return 0
   fi
@@ -1474,28 +1486,37 @@ send_compact_quarantine_alert() {
   mail_compact_quarantine_alert "$@"
 }
 
-# quarantine_should_notify DB REASON
-#   Fail-open dedup check: EMIT (return 0) unless the quarantine marker's
+# quarantine_should_notify DB REASON [DIR [RENOTIFY_SECS]]
+#   Fail-open dedup check: EMIT (return 0) unless the marker's
 #   last_notified_reason already matches REASON, meaning a mail already went
-#   out for this exact quarantine state. A missing marker, missing field, or
-#   unreadable marker always emits — this must never wrongly suppress a real
-#   alert. Mirrors the notify-once-per-distinct-state marker shape in
+#   out for this exact state. DIR defaults to the quarantine marker dir.
+#   RENOTIFY_SECS (default 0 = never) lets a still-unchanged state page again
+#   once last_notified_ts is that old, so a stuck state cannot go permanently
+#   silent. A missing marker, missing field, unreadable marker, or
+#   unparseable timestamp always emits — this must never wrongly suppress a
+#   real alert. Mirrors the notify-once-per-distinct-state marker shape in
 #   gc-management's packs/maintainer-pr-review/scripts/hold-notice-lib.sh.
 quarantine_should_notify() {
   db="$1"
   reason="$2"
-  _qn_marker=$(compact_marker_path "$quarantine_dir" "$db")
+  _qn_dir="${3:-$quarantine_dir}"
+  _qn_renotify_secs="${4:-0}"
+  _qn_marker=$(compact_marker_path "$_qn_dir" "$db")
   [ -f "$_qn_marker" ] && [ -r "$_qn_marker" ] || return 0
-  _qn_prev_reason=$(compact_marker_value "$quarantine_dir" "$db" last_notified_reason || true)
+  _qn_prev_reason=$(compact_marker_value "$_qn_dir" "$db" last_notified_reason || true)
   [ -n "$_qn_prev_reason" ] || return 0
-  [ "$_qn_prev_reason" = "$reason" ] && return 1
-  return 0
+  [ "$_qn_prev_reason" = "$reason" ] || return 0
+  case "$_qn_renotify_secs" in ''|*[!0-9]*|0) return 1 ;; esac
+  _qn_last_epoch=$(compact_marker_timestamp_epoch "$_qn_dir" "$db" last_notified_ts || true)
+  [ -n "$_qn_last_epoch" ] || return 0
+  [ $(( $(date -u +%s) - _qn_last_epoch )) -ge "$_qn_renotify_secs" ] && return 0
+  return 1
 }
 
-# record_quarantine_notify_state DB REASON EMITTED
+# record_quarantine_notify_state DB REASON EMITTED [DIR]
 #   Patches only the notify-bookkeeping fields (seen_count, notify_count,
-#   last_notified_ts, last_notified_reason) onto DB's existing quarantine
-#   marker, preserving every other field byte-for-byte. EMITTED=1 bumps
+#   last_notified_ts, last_notified_reason) onto DB's existing marker in DIR
+#   (default: the quarantine marker dir), preserving every other field byte-for-byte. EMITTED=1 bumps
 #   notify_count and stamps last_notified_ts/last_notified_reason; EMITTED=0
 #   only bumps seen_count. A missing marker or write failure is a silent
 #   no-op — bookkeeping must never block or fail compaction.
@@ -1503,18 +1524,19 @@ record_quarantine_notify_state() {
   db="$1"
   reason="$2"
   _qn_emitted="$3"
+  _qn_dir="${4:-$quarantine_dir}"
 
-  _qn_marker=$(compact_marker_path "$quarantine_dir" "$db")
+  _qn_marker=$(compact_marker_path "$_qn_dir" "$db")
   [ -f "$_qn_marker" ] && [ -r "$_qn_marker" ] || return 0
 
-  _qn_seen_count=$(compact_marker_value "$quarantine_dir" "$db" seen_count || true)
+  _qn_seen_count=$(compact_marker_value "$_qn_dir" "$db" seen_count || true)
   case "$_qn_seen_count" in ''|*[!0-9]*) _qn_seen_count=0 ;; esac
   _qn_seen_count=$((_qn_seen_count + 1))
 
-  _qn_notify_count=$(compact_marker_value "$quarantine_dir" "$db" notify_count || true)
+  _qn_notify_count=$(compact_marker_value "$_qn_dir" "$db" notify_count || true)
   case "$_qn_notify_count" in ''|*[!0-9]*) _qn_notify_count=0 ;; esac
-  _qn_last_ts=$(compact_marker_value "$quarantine_dir" "$db" last_notified_ts || true)
-  _qn_last_reason=$(compact_marker_value "$quarantine_dir" "$db" last_notified_reason || true)
+  _qn_last_ts=$(compact_marker_value "$_qn_dir" "$db" last_notified_ts || true)
+  _qn_last_reason=$(compact_marker_value "$_qn_dir" "$db" last_notified_reason || true)
   if [ "$_qn_emitted" = "1" ]; then
     _qn_notify_count=$((_qn_notify_count + 1))
     _qn_last_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1523,7 +1545,7 @@ record_quarantine_notify_state() {
 
   _qn_old_umask=$(umask)
   umask 077
-  _qn_tmp=$(mktemp "$quarantine_dir/$db.tmp.XXXXXX") || {
+  _qn_tmp=$(mktemp "$_qn_dir/$db.tmp.XXXXXX") || {
     umask "$_qn_old_umask"
     return 0
   }
@@ -1707,18 +1729,47 @@ write_quarantine_marker() {
     "$@"
 }
 
-compact_marker_created_at_epoch() {
+# compact_marker_timestamp_epoch DIR DB KEY
+#   Epoch seconds of the RFC3339 UTC timestamp stored under KEY in DB's marker.
+compact_marker_timestamp_epoch() {
   dir="$1"
   db="$2"
-  created_at=$(compact_marker_value "$dir" "$db" created_at || true)
-  [ -n "$created_at" ] || return 1
-  case "$created_at" in
+  ts=$(compact_marker_value "$dir" "$db" "$3" || true)
+  [ -n "$ts" ] || return 1
+  case "$ts" in
     *[!0-9TZ:.-]*)
       return 1
       ;;
   esac
-  date -u -d "$created_at" +%s 2>/dev/null ||
-    date -ju -f "%Y-%m-%dT%H:%M:%SZ" "$created_at" +%s 2>/dev/null
+  date -u -d "$ts" +%s 2>/dev/null ||
+    date -ju -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null
+}
+
+compact_marker_created_at_epoch() {
+  compact_marker_timestamp_epoch "$1" "$2" created_at
+}
+
+# report_stale_remote_push_marker DIR DB MARKER_LABEL
+#   Event every cycle; operator mail once per distinct stale state, re-sent
+#   after pending_push_renotify_secs, naming the marker's tracking_bead when
+#   it carries one. Notify bookkeeping lives on the marker itself.
+report_stale_remote_push_marker() {
+  _sp_dir="$1"
+  _sp_db="$2"
+  _sp_reason="$3 marker is stale"
+  _sp_type=$(basename "$_sp_dir")
+  _sp_marker=$(compact_marker_path "$_sp_dir" "$_sp_db")
+  _sp_created_at=$(compact_marker_value "$_sp_dir" "$_sp_db" created_at || true)
+  _sp_tracking=$(compact_marker_value "$_sp_dir" "$_sp_db" tracking_bead || true)
+
+  emit_compact_quarantine_event "$_sp_db" "$_sp_type" "$_sp_marker" "$_sp_reason" "$_sp_created_at" "$_sp_tracking"
+  _sp_emitted=0
+  if quarantine_should_notify "$_sp_db" "$_sp_reason" "$_sp_dir" "$pending_push_renotify_secs"; then
+    if mail_compact_quarantine_alert "$_sp_db" "$_sp_type" "$_sp_marker" "$_sp_reason" "$_sp_created_at" "$_sp_tracking"; then
+      _sp_emitted=1
+    fi
+  fi
+  record_quarantine_notify_state "$_sp_db" "$_sp_reason" "$_sp_emitted" "$_sp_dir"
 }
 
 ensure_remote_push_retry_fresh() {
@@ -1740,7 +1791,7 @@ ensure_remote_push_retry_fresh() {
   if [ "$age_secs" -gt "$pending_push_max_age_secs" ]; then
     printf 'compact: db=%s %s marker is stale age=%ss max_age=%ss — manual review required before remote push retry\n' \
       "$db" "$marker_label" "$age_secs" "$pending_push_max_age_secs" >&2
-    send_compact_quarantine_alert "$db" "$(basename "$dir")" "$(compact_marker_path "$dir" "$db")" "$marker_label marker is stale" "$(compact_marker_value "$dir" "$db" created_at || true)" || true
+    report_stale_remote_push_marker "$dir" "$db" "$marker_label"
     return 1
   fi
   return 0
