@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 --root <cache-parent> [--min-age <seconds>] [--delete]" >&2
+  exit 2
+}
+
+parent="" min_age=86400 delete=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root) parent="${2:-}"; shift 2 ;;
+    --min-age) min_age="${2:-}"; shift 2 ;;
+    --delete) delete=1; shift ;;
+    *) usage ;;
+  esac
+done
+[[ -n "$parent" && "$min_age" =~ ^[0-9]+$ ]] || usage
+[[ -d "$parent" && ! -L "$parent" ]] || { echo "cache parent must be a real directory" >&2; exit 2; }
+[[ -d /proc ]] || { echo "task cache reaping requires Linux /proc process identity" >&2; exit 2; }
+
+start_ticks() {
+  local pid="$1" stat
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+  stat=$(<"/proc/$pid/stat")
+  stat="${stat##*) }"
+  set -- $stat
+  [[ "${20:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${20}"
+}
+
+metadata_value() {
+  local key="$1" file="$2"
+  awk -F= -v key="$key" '$1 == key { found++; if (found == 1) print substr($0, length(key) + 2) } END { exit found == 1 ? 0 : 1 }' "$file"
+}
+
+now="$(date +%s)"
+for root in "$parent"/gc-task-cache-*; do
+  [[ -e "$root" ]] || continue
+  [[ -d "$root" && ! -L "$root" && -f "$root/.gc-task-cache" && ! -L "$root/.gc-task-cache" ]] || continue
+  [[ "$(stat -c %u "$root")" == "$(id -u)" ]] || continue
+  metadata="$root/.gc-task-cache"
+  version="$(metadata_value version "$metadata")" || continue
+  owner="$(metadata_value owner "$metadata")" || continue
+  bead="$(metadata_value bead "$metadata")" || continue
+  session="$(metadata_value session "$metadata")" || continue
+  pid="$(metadata_value pid "$metadata")" || continue
+  recorded_ticks="$(metadata_value pid_start_ticks "$metadata")" || continue
+  created="$(metadata_value created_unix "$metadata")" || continue
+  [[ "$version" == 1 && "$owner" =~ ^[A-Za-z0-9._-]+$ && "$bead" =~ ^[A-Za-z0-9._-]+$ && "$session" =~ ^[A-Za-z0-9._-]+$ && "$pid" =~ ^[0-9]+$ && "$recorded_ticks" =~ ^[0-9]+$ && "$created" =~ ^[0-9]+$ ]] || continue
+  (( now >= created && now - created >= min_age )) || continue
+  current_ticks="$(start_ticks "$pid" || true)"
+  [[ "$current_ticks" != "$recorded_ticks" ]] || { printf 'preserve live %s\n' "$root"; continue; }
+  if (( delete )); then
+    rm -rf "$root"
+    printf 'reaped %s\n' "$root"
+  else
+    printf 'would reap %s\n' "$root"
+  fi
+done

@@ -111,7 +111,24 @@ esac
 }
 
 func (f goTestShardFixture) command(extraEnv ...string) *exec.Cmd {
-	cmd := goTestShardCommand(f.repoRoot, "./example", "1", "2")
+	return f.commandForShard("1", "2", extraEnv...)
+}
+
+func (f goTestShardFixture) commandForShard(shardIndex, shardTotal string, extraEnv ...string) *exec.Cmd {
+	return f.commandForShardWithBash("", shardIndex, shardTotal, extraEnv...)
+}
+
+func (f goTestShardFixture) commandForShardWithBash(bashPath, shardIndex, shardTotal string, extraEnv ...string) *exec.Cmd {
+	cmd := goTestShardCommand(f.repoRoot, "./example", shardIndex, shardTotal)
+	if bashPath != "" {
+		cmd = shardTestCommand(
+			bashPath,
+			filepath.Join(f.repoRoot, "scripts", "test-go-test-shard"),
+			"./example",
+			shardIndex,
+			shardTotal,
+		)
+	}
 	cmd.Dir = f.repoRoot
 	cmd.Env = append([]string{
 		"PATH=" + f.binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
@@ -125,8 +142,41 @@ func (f goTestShardFixture) command(extraEnv ...string) *exec.Cmd {
 	return cmd
 }
 
+// assertSeededGitConfig checks the runner pinned GIT_CONFIG_GLOBAL to the
+// seeded per-user config (scripts/test-gitconfig-path) rather than pinning the
+// exact path: the helper's name embeds uid and a repo hash, so the contract
+// here is containment in the fixture TMPDIR plus a real, writable file.
+func (f goTestShardFixture) assertSeededGitConfig(t *testing.T, env map[string]string) {
+	t.Helper()
+	gitConfig := env["GIT_CONFIG_GLOBAL"]
+	if gitConfig == "" {
+		t.Fatalf("direct product environment lacks GIT_CONFIG_GLOBAL:\n%#v", env)
+	}
+	if !strings.HasPrefix(gitConfig, f.tmpDir+string(os.PathSeparator)) {
+		t.Errorf("GIT_CONFIG_GLOBAL %q escapes the fixture TMPDIR %q", gitConfig, f.tmpDir)
+	}
+	if info, err := os.Stat(gitConfig); err != nil {
+		t.Errorf("GIT_CONFIG_GLOBAL %q does not exist: %v", gitConfig, err)
+	} else if info.Mode().Perm()&0o200 == 0 {
+		t.Errorf("GIT_CONFIG_GLOBAL %q is not writable (mode %v)", gitConfig, info.Mode())
+	}
+}
+
+func writeGoTestManifest(t *testing.T, dir string, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, "tests.manifest")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write test manifest: %v", err)
+	}
+	return path
+}
+
 func goTestShardCommand(repoRoot string, args ...string) *exec.Cmd {
-	return exec.Command(filepath.Join(repoRoot, "scripts", "test-go-test-shard"), args...)
+	return shardTestCommand(filepath.Join(repoRoot, "scripts", "test-go-test-shard"), args...)
+}
+
+func shardTestCommand(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
 }
 
 func runShardCommand(t *testing.T, cmd *exec.Cmd) (int, []byte) {
@@ -318,7 +368,8 @@ func TestGoTestShardWithoutTimingPreservesDirectProductContract(t *testing.T) {
 	wantEnv := map[string]string{
 		"PATH": fixture.binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME": fixture.homeDir, "USER": "", "LOGNAME": "", "SHELL": "/bin/sh",
-		"LANG": "C.UTF-8", "TMPDIR": fixture.tmpDir, "XDG_RUNTIME_DIR": "",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"LANG":                "C.UTF-8", "TMPDIR": fixture.tmpDir, "XDG_RUNTIME_DIR": "",
 		"GOPATH": filepath.Join(fixture.tmpDir, "gopath"), "GOCACHE": filepath.Join(fixture.tmpDir, "gocache"),
 		"GOMODCACHE": filepath.Join(fixture.tmpDir, "gomodcache"), "GOTMPDIR": filepath.Join(fixture.tmpDir, "gotmp"),
 		"GOROOT": filepath.Join(fixture.tmpDir, "goroot"), "GOENV": "", "GOFLAGS": "", "GO111MODULE": "",
@@ -326,13 +377,207 @@ func TestGoTestShardWithoutTimingPreservesDirectProductContract(t *testing.T) {
 		"GOSUMDB": "", "GOINSECURE": "", "GOVCS": "", "GOWORK": "", "GC_FAST_UNIT": "0",
 		"CGO_CPPFLAGS": "", "CGO_LDFLAGS": "", "GC_TEST_SHARD_INDEX": "1", "GC_TEST_SHARD_TOTAL": "2",
 	}
-	if got := fixtureEnvironment(t, readFixtureFile(t, fixture.productEnvFile)); !maps.Equal(got, wantEnv) {
+	got := fixtureEnvironment(t, readFixtureFile(t, fixture.productEnvFile))
+	fixture.assertSeededGitConfig(t, got)
+	delete(got, "GIT_CONFIG_GLOBAL")
+	if !maps.Equal(got, wantEnv) {
 		t.Fatalf("direct product environment = %#v, want %#v", got, wantEnv)
 	}
 	if probes, err := os.ReadFile(fixture.probeFile); err == nil {
 		t.Fatalf("timing-disabled shard ran metadata probes:\n%s", probes)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("inspect timing-disabled metadata probes: %v", err)
+	}
+}
+
+func TestGoTestShardManifestSkipsDiscoveryAndPreservesModuloSelection(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	manifest := writeGoTestManifest(t, fixture.tmpDir,
+		"# Source-checked fixture inventory.",
+		"",
+		"TestAlpha",
+		"TestBeta",
+		"TestGamma",
+		"TestDelta",
+		"TestEpsilon",
+	)
+	status, output := runShardCommand(t, fixture.commandForShard("2", "3", "GO_TEST_MANIFEST="+manifest))
+	if status != 23 {
+		t.Fatalf("manifest shard exit = %d, want product exit 23\n%s", status, output)
+	}
+
+	wantArgs := "test\n-timeout\n1m\n./example\n-run\n^(TestBeta|TestEpsilon)$\n"
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs {
+		t.Fatalf("manifest product argv:\n%s\nwant:\n%s", got, wantArgs)
+	}
+	if allArgs := readFixtureFile(t, fixture.allTestArgsFile); allArgs != wantArgs {
+		t.Fatalf("manifest mode ran discovery or extra go test invocations:\n%s\nwant exactly one final invocation:\n%s", allArgs, wantArgs)
+	}
+}
+
+func TestGoTestShardManifestFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		manifest  func(*testing.T, goTestShardFixture) string
+		wantError string
+	}{
+		{
+			name: "unreadable",
+			manifest: func(_ *testing.T, fixture goTestShardFixture) string {
+				return filepath.Join(fixture.tmpDir, "missing.manifest")
+			},
+			wantError: "go test manifest is not readable",
+		},
+		{
+			name: "empty",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "# comments are not entries", "")
+			},
+			wantError: "go test manifest contains no tests",
+		},
+		{
+			name: "invalid regex syntax",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "TestAlpha|TestBeta")
+			},
+			wantError: "invalid go test manifest entry",
+		},
+		{
+			name: "malformed whitespace",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "Test Alpha")
+			},
+			wantError: "invalid go test manifest entry",
+		},
+		{
+			name: "duplicate",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestAlpha")
+			},
+			wantError: "duplicate go test manifest entry: TestAlpha",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newGoTestShardFixtureWithExit(t, 0)
+			manifest := tt.manifest(t, fixture)
+			status, output := runShardCommand(t, fixture.command("GO_TEST_MANIFEST="+manifest))
+			if status == 0 {
+				t.Fatalf("invalid manifest unexpectedly succeeded:\n%s", output)
+			}
+			if !strings.Contains(string(output), tt.wantError) {
+				t.Fatalf("manifest error output:\n%s\nwant substring %q", output, tt.wantError)
+			}
+			if allArgs, err := os.ReadFile(fixture.allTestArgsFile); err == nil {
+				t.Fatalf("invalid manifest invoked go test:\n%s", allArgs)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("inspect invalid-manifest go test calls: %v", err)
+			}
+		})
+	}
+}
+
+func TestGoTestShardManifestRejectsNULBytesBeforeInvokingGo(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := filepath.Join(fixture.tmpDir, "nul.manifest")
+	if err := os.WriteFile(manifest, []byte("TestAl\x00pha\n"), 0o644); err != nil {
+		t.Fatalf("write NUL manifest: %v", err)
+	}
+
+	status, output := runShardCommand(t, fixture.command("GO_TEST_MANIFEST="+manifest))
+	if status == 0 {
+		t.Fatalf("NUL manifest unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "NUL bytes or could not be validated") {
+		t.Fatalf("NUL manifest error output:\n%s\nwant NUL/malformed diagnostic", output)
+	}
+	if allArgs, err := os.ReadFile(fixture.allTestArgsFile); err == nil {
+		t.Fatalf("NUL manifest invoked go test:\n%s", allArgs)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect NUL-manifest go test calls: %v", err)
+	}
+}
+
+func TestGoTestShardManifestAcceptsFirstEntryWithBash32Nounset(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha")
+	bashPath := findBash32(t)
+	if bashPath == "" {
+		assertManifestDuplicateScanGuardsEmptyArray(t, filepath.Join(fixture.repoRoot, "scripts", "test-go-test-shard"))
+	}
+
+	cmd := fixture.commandForShardWithBash(bashPath, "1", "1", "GO_TEST_MANIFEST="+manifest)
+	status, output := runShardCommand(t, cmd)
+	if status != 23 {
+		t.Fatalf("single-entry manifest shard exit = %d, want product exit 23 (bash=%q)\n%s", status, bashPath, output)
+	}
+	wantArgs := "test\n-timeout\n1m\n./example\n-run\n^(TestAlpha)$\n"
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs {
+		t.Fatalf("single-entry manifest product argv:\n%s\nwant:\n%s", got, wantArgs)
+	}
+	if allArgs := readFixtureFile(t, fixture.allTestArgsFile); allArgs != wantArgs {
+		t.Fatalf("single-entry manifest ran discovery or extra go test invocations:\n%s", allArgs)
+	}
+}
+
+func findBash32(t *testing.T) string {
+	t.Helper()
+	candidates := []string{os.Getenv("BASH32"), "bash3.2", "bash-3.2", "bash"}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		path, err := exec.LookPath(candidate)
+		if err != nil {
+			continue
+		}
+		if _, duplicate := seen[path]; duplicate {
+			continue
+		}
+		seen[path] = struct{}{}
+		output, err := shardTestCommand(path, "--version").CombinedOutput()
+		if err == nil && strings.Contains(string(output), "version 3.2") {
+			return path
+		}
+	}
+	return ""
+}
+
+func assertManifestDuplicateScanGuardsEmptyArray(t *testing.T, scriptPath string) {
+	t.Helper()
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read test-go-test-shard source: %v", err)
+	}
+	source := string(content)
+	if count := strings.Count(source, `for existing in "${tests[@]}"; do`); count != 1 {
+		t.Fatalf("manifest duplicate scans = %d, want exactly one", count)
+	}
+	countIndex := strings.Index(source, "manifest_test_count=0")
+	guardIndex := strings.Index(source, "if (( manifest_test_count > 0 )); then")
+	loopIndex := strings.Index(source, `for existing in "${tests[@]}"; do`)
+	appendIndex := strings.Index(source, `tests+=("$line")`)
+	incrementIndex := strings.Index(source, "manifest_test_count=$((manifest_test_count + 1))")
+	guardEnd := -1
+	if loopIndex >= 0 {
+		if relative := strings.Index(source[loopIndex:], "\n    fi\n"); relative >= 0 {
+			guardEnd = loopIndex + relative
+		}
+	}
+	if countIndex < 0 || countIndex >= guardIndex || guardIndex >= loopIndex || loopIndex >= guardEnd || guardEnd >= appendIndex || appendIndex >= incrementIndex {
+		t.Fatalf("manifest duplicate scan is not structurally guarded before the first array append")
 	}
 }
 

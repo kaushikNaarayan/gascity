@@ -303,6 +303,58 @@ func TestResolveTemplateRigScopedEnvCarriesRigRoots(t *testing.T) {
 	}
 }
 
+// TestResolveTemplateBeadsScopeCityPinsTownLedgerForRigInstantiatedAgent
+// proves a rig-instantiated agent (e.g. a witness) with beads_scope="city"
+// still identifies as belonging to the rig (GC_RIG/GC_RIG_ROOT) but resolves
+// bd/mail against the town ledger, not the rig's own ledger (gcf-2qd8).
+func TestResolveTemplateBeadsScopeCityPinsTownLedgerForRigInstantiatedAgent(t *testing.T) {
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "file")
+	rigRoot := filepath.Join(t.TempDir(), "demo")
+	if err := os.MkdirAll(rigRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	params := &agentBuildParams{
+		cityName:   "city",
+		cityPath:   cityPath,
+		workspace:  &config.Workspace{Provider: "test"},
+		providers:  map[string]config.ProviderSpec{"test": {Command: "echo", PromptMode: "none"}},
+		lookPath:   func(string) (string, error) { return "/bin/echo", nil },
+		fs:         fsys.OSFS{},
+		rigs:       []config.Rig{{Name: "demo", Path: rigRoot}},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+
+	agent := &config.Agent{Name: "witness", Dir: "demo", BeadsScope: "city"}
+	tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+
+	// Rig identity is preserved: this agent still belongs to "demo".
+	if tp.Env["GC_RIG"] != "demo" {
+		t.Fatalf("GC_RIG = %q, want %q", tp.Env["GC_RIG"], "demo")
+	}
+	if tp.Env["GC_RIG_ROOT"] != rigRoot {
+		t.Fatalf("GC_RIG_ROOT = %q, want %q", tp.Env["GC_RIG_ROOT"], rigRoot)
+	}
+	// But the beads/GT resolution stays pinned to the town ledger: BEADS_DIR
+	// is explicitly empty (the same city-scoped default a non-rig agent
+	// gets), never the rig's .beads dir.
+	if tp.Env["BEADS_DIR"] != "" {
+		t.Fatalf("BEADS_DIR = %q, want empty (town-scoped default, not rig ledger)", tp.Env["BEADS_DIR"])
+	}
+	if tp.Env["GC_BEADS_SCOPE_ROOT"] != cityPath {
+		t.Fatalf("GC_BEADS_SCOPE_ROOT = %q, want city root %q", tp.Env["GC_BEADS_SCOPE_ROOT"], cityPath)
+	}
+	if tp.Env["GT_ROOT"] != cityPath {
+		t.Fatalf("GT_ROOT = %q, want city root %q", tp.Env["GT_ROOT"], cityPath)
+	}
+}
+
 func TestResolveTemplateUsesCityManagedDoltPort(t *testing.T) {
 	cityPath := t.TempDir()
 	writeTemplateResolveCityConfig(t, cityPath, "")
@@ -482,5 +534,71 @@ dolt.auto-start: false
 	// Verify it's present and matches the parent process.
 	if got := tp.Env["HOME"]; got == "" {
 		t.Fatalf("HOME should be passed through to agent env")
+	}
+}
+
+// TestRediscoveredNamedBeadWorkDirUsesAliasNotTemplate is the end-to-end
+// regression for the named-session work_dir collision: a named-session bead
+// whose backing template is "demo/worker" but whose stored identity is
+// "demo/alpha" must resolve its work_dir to .gc/worktrees/demo/alpha, NOT
+// .gc/worktrees/demo/worker. It drives the exact reconciler seam
+// (canonicalSessionIdentity -> resolveTemplateForSessionBeadInfo) that
+// session-bead rediscovery uses for a woken on_demand named session.
+func TestRediscoveredNamedBeadWorkDirUsesAliasNotTemplate(t *testing.T) {
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "file")
+	rigRoot := filepath.Join(cityPath, "demo")
+	if err := os.MkdirAll(rigRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	params := &agentBuildParams{
+		cityName:   "city",
+		cityPath:   cityPath,
+		workspace:  &config.Workspace{Provider: "test"},
+		providers:  map[string]config.ProviderSpec{"test": {Command: "echo", PromptMode: "none"}},
+		lookPath:   func(string) (string, error) { return "/bin/echo", nil },
+		fs:         fsys.OSFS{},
+		rigs:       []config.Rig{{Name: "demo", Path: rigRoot}},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+
+	// The shared template that several [[named_session]] entries back onto.
+	templateAgent := &config.Agent{
+		Name:    "worker",
+		Dir:     "demo",
+		WorkDir: ".gc/worktrees/{{.Rig}}/{{.AgentBase}}",
+	}
+	namedBead := beads.Bead{
+		ID: "ga-alpha",
+		Metadata: map[string]string{
+			"template":                   "demo/worker",
+			"agent_name":                 "demo/alpha",
+			"session_name":               "demo--alpha",
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: "demo/alpha",
+		},
+	}
+
+	// Rediscovery seam: canonicalize the bead's identity, then resolve the
+	// template exactly as build_desired_state's rediscovery path does.
+	_, qn := canonicalSessionIdentity(templateAgent, namedBead)
+	if qn != "demo/alpha" {
+		t.Fatalf("canonicalSessionIdentity qn = %q, want demo/alpha", qn)
+	}
+	tp, err := resolveTemplateForSessionBeadInfo(params, templateAgent, qn, nil, seedSessionInfo(namedBead))
+	if err != nil {
+		t.Fatalf("resolveTemplateForSessionBeadInfo: %v", err)
+	}
+
+	wantWorkDir := filepath.Join(cityPath, ".gc", "worktrees", "demo", "alpha")
+	if tp.WorkDir != wantWorkDir {
+		t.Fatalf("WorkDir = %q, want %q (collapsed onto the template path?)", tp.WorkDir, wantWorkDir)
+	}
+	sharedWorkDir := filepath.Join(cityPath, ".gc", "worktrees", "demo", "worker")
+	if tp.WorkDir == sharedWorkDir {
+		t.Fatalf("WorkDir collapsed onto the shared template path %q", sharedWorkDir)
 	}
 }

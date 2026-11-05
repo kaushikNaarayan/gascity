@@ -109,6 +109,13 @@ Reference** (the contributor map lives in `engdocs/contributors/docs-organizatio
 - Concept material is unified on `how-gas-city-works`; don't reintroduce a separate
   "concepts" section.
 
+For a new or substantially rewritten capability page, use these sections in
+this order: **What it does**, **When to reach for it**, **Common questions**,
+and **It is working if**. Source each common question from a real repository
+question — a GitHub issue or `bd` mail/escalation — and cite that source in the
+page; do not invent FAQs. Omit a section only when the page's purpose makes it
+inapplicable, and record why in review.
+
 ## 5. Prose doctrine — cut words, sharpen points
 
 Most bloat is information stored in the wrong medium. Move it to a cheaper carrier,
@@ -186,8 +193,9 @@ freshness test (`TestCLIDocsFreshness`) fails if they drift.
 Run the gates in [references/verification.md](references/verification.md). The
 durable repo gates are **`make check-docs`** (nav↔file + local markdown links),
 **`make diagrams-excalidraw`** (if you touched diagrams), `go run ./cmd/genschema`
-(if you touched generated docs), and **`make dashboard-check`** (if you touched
-`internal/api/`, the OpenAPI spec, or the dashboard). Beyond the gates: every TOML
+(if you touched generated docs), and **`make dashboard-ci`** (if you touched
+`internal/api/`, the OpenAPI spec, or the dashboard — `dashboard-check` alone
+does not catch a stale generated client). Beyond the gates: every TOML
 fence must parse, every internal link and anchor must resolve, no page is orphaned
 from the nav, and no body H1 was introduced. Preview on the live site with `make
 docs-dev` (or `./mint.sh dev`) at `localhost:3000`.

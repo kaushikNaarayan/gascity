@@ -244,11 +244,19 @@ Gas City derived the rig name from the directory basename (`my-project`) and
 set up work tracking in it. The portable declaration lands in `city.toml`; the
 path binding stays machine-local in `.gc/site.toml`:
 
-```toml
-# city.toml — portable
+```shell
+~/my-city
+$ cat city.toml
+[workspace]
+provider = "claude"
+
+... # content elided
+
 [[rigs]]
 name = "my-project"
+```
 
+```toml
 # .gc/site.toml — machine-local
 [[rig]]
 name = "my-project"
@@ -300,12 +308,12 @@ Watch the bead progress with `--watch`:
 ```shell
 ~/my-project
 $ gc bd show mp-ff9 --watch
-○ mp-ff9 · Write hello world in python to the file hello.py   [● P2 · OPEN]
+○ mp-ff9 · Write hello world in python to the file hello.py   [P2 · OPEN]
 Owner: Chris Sells · Type: task
 Created: 2026-04-07 · Updated: 2026-04-07
 
 BLOCKS
-  ← ○ mp-4tl: input convoy for mp-ff9 ● P2
+  ← ○ mp-4tl: input convoy for mp-ff9 P2
 
 Watching for changes... (Press Ctrl+C to exit)
 ```

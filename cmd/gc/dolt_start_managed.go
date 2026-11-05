@@ -1112,7 +1112,7 @@ func terminateManagedDoltPIDGuarded(cityPath string, pid int, identityMatches fu
 		return nil
 	}
 	_ = process.Signal(syscall.SIGKILL)
-	time.Sleep(250 * time.Millisecond)
+	waitForManagedDoltProcessExit(pid, 250*time.Millisecond, pidAlive)
 	return nil
 }
 
@@ -1198,7 +1198,9 @@ func runManagedDoltTestWatchdog(args []string, stdout, stderr *os.File) int {
 	go func() { done <- cmd.Wait() }()
 
 	signals := make(chan os.Signal, 2)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	// SIGQUIT included so a `go test -timeout` signal wave reaching the
+	// watchdog still tears the dolt server down instead of orphaning it.
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer signal.Stop(signals)
 
 	ticker := time.NewTicker(100 * time.Millisecond)

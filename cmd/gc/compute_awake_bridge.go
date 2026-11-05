@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ func buildAwakeInputFromReconciler(
 	sessionInfos []session.Info,
 	poolDesired map[string]int,
 	namedSessionDemand map[string]bool,
+	namedRoutedDemand map[string]bool,
 	workSet map[string]bool,
 	readyWaitSet map[string]bool,
 	assignedWorkBeads []beads.Bead,
@@ -29,18 +31,45 @@ func buildAwakeInputFromReconciler(
 	sp runtime.Provider,
 	clk time.Time,
 ) AwakeInput {
+	input, _ := buildAwakeInputFromReconcilerWithObservationErrors(
+		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand,
+		workSet, readyWaitSet, assignedWorkBeads, readyAssignedFlags, wakeTargets, sp, clk,
+	)
+	return input
+}
+
+// buildAwakeInputFromReconcilerWithObservationErrors is the lifecycle form of
+// buildAwakeInputFromReconciler. It returns attachment uncertainty per session
+// so the reconciler can retain the target without mutating drain state.
+func buildAwakeInputFromReconcilerWithObservationErrors(
+	cfg *config.City,
+	cityPath string,
+	sessionInfos []session.Info,
+	poolDesired map[string]int,
+	namedSessionDemand map[string]bool,
+	namedRoutedDemand map[string]bool,
+	workSet map[string]bool,
+	readyWaitSet map[string]bool,
+	assignedWorkBeads []beads.Bead,
+	readyAssignedFlags []bool,
+	wakeTargets []wakeTarget,
+	sp runtime.Provider,
+	clk time.Time,
+) (AwakeInput, map[string]error) {
 	input := AwakeInput{
-		ScaleCheckCounts:   poolDesired,
-		NamedSessionDemand: cloneBoolMap(namedSessionDemand),
-		WorkSet:            workSet,
-		ReadyWaitSet:       readyWaitSet,
-		RunningSessions:    make(map[string]bool),
-		AttachedSessions:   make(map[string]bool),
-		PendingSessions:    make(map[string]bool),
-		ChatIdleTimeout:    cfg.ChatSessions.IdleTimeoutDuration(),
-		ManualGracePeriod:  cfg.ChatSessions.GracePeriodDuration(),
-		Now:                clk,
+		ScaleCheckCounts:         poolDesired,
+		NamedSessionDemand:       cloneBoolMap(namedSessionDemand),
+		NamedSessionRoutedDemand: cloneBoolMap(namedRoutedDemand),
+		WorkSet:                  workSet,
+		ReadyWaitSet:             readyWaitSet,
+		RunningSessions:          make(map[string]bool),
+		AttachedSessions:         make(map[string]bool),
+		PendingSessions:          make(map[string]bool),
+		ChatIdleTimeout:          cfg.ChatSessions.IdleTimeoutDuration(),
+		ManualGracePeriod:        cfg.ChatSessions.GracePeriodDuration(),
+		Now:                      clk,
 	}
+	observationErrors := make(map[string]error)
 
 	// Agents. Load runtime suspension state once against the in-scope
 	// city path so suspension resolves against the controlled city
@@ -50,7 +79,7 @@ func buildAwakeInputFromReconciler(
 		a := &cfg.Agents[i]
 		agent := AwakeAgent{
 			QualifiedName:     a.QualifiedName(),
-			Suspended:         isAgentEffectivelySuspendedWith(cfg, a, suspState),
+			Suspended:         isAgentEffectivelySuspendedWith(cfg, cityPath, a, suspState),
 			SleepAfterIdle:    parseSleepDuration(a.SleepAfterIdle),
 			MinActiveSessions: a.EffectiveMinActiveSessions(),
 		}
@@ -87,8 +116,15 @@ func buildAwakeInputFromReconciler(
 		a := strings.TrimSpace(wb.Assignee)
 		if a != "" && (wb.Status == "open" || wb.Status == "in_progress") {
 			ready := i < len(readyAssignedFlags) && readyAssignedFlags[i]
+			// Blocked mirrors #4726's hook-side fix on the wake side: an
+			// in_progress bead's IsBlocked projection (bd's denormalized
+			// ready-work verdict, which folds in open blocking dependencies
+			// and gates) tells WakeWork not to fire on a bead the hook would
+			// not dispatch. Only meaningful for in_progress -- open work's
+			// blocker state is already folded into `ready` above.
+			blocked := wb.Status == "in_progress" && wb.IsBlocked != nil && *wb.IsBlocked
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
-				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready,
+				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready, Blocked: blocked,
 			})
 		}
 	}
@@ -134,6 +170,7 @@ func buildAwakeInputFromReconciler(
 			ContinuationResetPending: strings.TrimSpace(info.ContinuationResetPending) == "true" &&
 				strings.TrimSpace(info.ResetCommittedAt) != "",
 			CurrentlyProcessingBeadID: strings.TrimSpace(info.CurrentlyProcessingBeadID),
+			PostCreateProtected:       poolSessionWithinPostCreateProtection(info, clk),
 		}
 		bead.HeldUntil = lifecycle.HeldUntil
 		bead.QuarantinedUntil = lifecycle.QuarantinedUntil
@@ -184,7 +221,11 @@ func buildAwakeInputFromReconciler(
 			input.RunningSessions[name] = true
 		}
 		if shouldProbeAttachmentForAwakeInput(info, target.alive, cfg, poolDesired) {
-			if attached, err := workerSessionTargetAttachedWithConfig("", nil, sp, nil, name); err == nil && attached {
+			attached, err := workerSessionTargetAttachedWithConfig("", nil, sp, nil, name)
+			if errors.Is(err, runtime.ErrRuntimeUnavailable) {
+				input.AttachedSessions[name] = true
+				observationErrors[name] = err
+			} else if err == nil && attached {
 				input.AttachedSessions[name] = true
 			}
 		}
@@ -193,7 +234,7 @@ func buildAwakeInputFromReconciler(
 		}
 	}
 
-	return input
+	return input, observationErrors
 }
 
 func shouldProbeAttachmentForAwakeInput(info session.Info, alive bool, cfg *config.City, poolDesired map[string]int) bool {
@@ -245,7 +286,7 @@ func awakeSetToWakeEvals(decisions map[string]AwakeDecision, sessionBeads []Awak
 				reasons = []WakeReason{WakePin}
 			case "wait-ready":
 				reasons = []WakeReason{WakeWait}
-			case "assigned-work", "named-demand", "work-query":
+			case "assigned-work", "named-demand", "routed-demand", "work-query":
 				reasons = []WakeReason{WakeWork}
 			case "min-active":
 				reasons = []WakeReason{WakeConfig}

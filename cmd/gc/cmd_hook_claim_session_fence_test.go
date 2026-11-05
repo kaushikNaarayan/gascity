@@ -477,7 +477,7 @@ func TestWriteHookClaimDrainStaleSessionWithDrainAck(t *testing.T) {
 	fakeAck := func(io.Writer) error { acked = true; return nil }
 
 	var stdout, stderr bytes.Buffer
-	code := writeHookClaimDrain(hookClaimReasonStaleSession, true, true, fakeAck, &stdout, &stderr)
+	code := writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, true, true, fakeAck, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 for an acknowledged drain; stderr=%s", code, stderr.String())
@@ -503,7 +503,7 @@ func TestWriteHookClaimDrainDoesNotAckWhenNotRequested(t *testing.T) {
 		return nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := writeHookClaimDrain(hookClaimReasonStaleSession, true, false, fakeAck, &stdout, &stderr)
+	code := writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, true, false, fakeAck, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 when drain is not acknowledged", code)
 	}
@@ -513,5 +513,351 @@ func TestWriteHookClaimDrainDoesNotAckWhenNotRequested(t *testing.T) {
 	}
 	if result.DrainAcknowledged {
 		t.Fatalf("result.DrainAcknowledged = true without --drain-ack")
+	}
+}
+
+// writeFenceTestCityAgents writes a minimal city with a caller-supplied agent
+// block, so a test can exercise the claim fence against a config that does NOT
+// contain the runtime's template, or contains it in a suspended state.
+func writeFenceTestCityAgents(t *testing.T, agentsTOML string) string {
+	t.Helper()
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[workspace]\nname = \"test-city\"\n\n" + agentsTOML
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cityDir
+}
+
+// TestHookCommandClaimStaleSessionMissingTemplateDrainsBeforeAgentResolution
+// proves a stale runtime whose template was removed from config is refused as
+// stale by the claim fence BEFORE the "agent not found in config" early return.
+// The startup wrapper invokes gc hook --claim --json --drain-ack; before the
+// fence was hoisted ahead of agent resolution, a stale session whose template
+// had been dropped hit the bare `return 1` with "not found in config" and its
+// wrapper retried that plain failure forever instead of seeing the terminal
+// stale-session drain result and exiting. This pins the ordering so the fence
+// always pre-empts the missing-template early return for a stale session.
+func TestHookCommandClaimStaleSessionMissingTemplateDrainsBeforeAgentResolution(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	// The city has no "worker" agent, so resolveAgentIdentity(template "worker")
+	// fails — the early return the fence must now pre-empt for a stale session.
+	cityDir := writeFenceTestCityAgents(t, "[[agent]]\nname = \"other\"\n")
+	sessionID := newFenceSessionBead(t, cityDir, session.StateFailedCreate, "failed-token")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "failed-token")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonStaleSession {
+		t.Fatalf("result = %+v, want action=drain reason=stale_session", result)
+	}
+	if !strings.Contains(stderr.String(), "refusing stale session") {
+		t.Fatalf("stderr = %q, want stale-session refusal", stderr.String())
+	}
+	// The reorder's whole point: the fence must pre-empt the missing-template
+	// early return, so its "not found in config" failure must NOT be reached.
+	if strings.Contains(stderr.String(), "not found in config") {
+		t.Fatalf("stale session hit the agent-not-found early return before the fence: %s", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran for a stale session with a missing template; stat error = %v", err)
+	}
+}
+
+// TestHookCommandClaimStaleSessionSuspendedAgentDrainsBeforeSuspensionCheck
+// proves a stale runtime whose agent is suspended is refused as stale by the
+// claim fence BEFORE the "agent is suspended" early return. As with the
+// missing-template case, the startup wrapper's gc hook --claim --json
+// --drain-ack must see the terminal stale-session drain instead of the bare
+// suspension failure it would otherwise retry forever.
+func TestHookCommandClaimStaleSessionSuspendedAgentDrainsBeforeSuspensionCheck(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	// The "worker" agent exists but is suspended, so isAgentEffectivelySuspendedWith
+	// returns true — the early return the fence must now pre-empt for a stale session.
+	cityDir := writeFenceTestCityAgents(t, "[[agent]]\nname = \"worker\"\nsuspended = true\n")
+	sessionID := newFenceSessionBead(t, cityDir, session.StateFailedCreate, "failed-token")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "failed-token")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonStaleSession {
+		t.Fatalf("result = %+v, want action=drain reason=stale_session", result)
+	}
+	if !strings.Contains(stderr.String(), "refusing stale session") {
+		t.Fatalf("stderr = %q, want stale-session refusal", stderr.String())
+	}
+	// The reorder's whole point: the fence must pre-empt the suspension early
+	// return, so its "is suspended" failure must NOT be reached.
+	if strings.Contains(stderr.String(), "is suspended") {
+		t.Fatalf("stale session hit the agent-suspended early return before the fence: %s", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran for a stale session with a suspended agent; stat error = %v", err)
+	}
+}
+
+// TestHookCommandClaimStaleSessionSuspendedCityDrainsBeforeSuspensionCheck
+// proves a stale runtime in a SUSPENDED CITY is refused as stale by the claim
+// fence BEFORE the bare "gc hook: city is suspended" early return. Before the
+// fence was hoisted ahead of the city-suspension check, a stale session in a
+// suspended city hit that bare `return 1` and its startup wrapper retried the
+// plain city-suspended failure forever instead of seeing the terminal
+// stale-session drain result and exiting. This pins the ordering so the fence
+// pre-empts the city-suspension early return for a stale session too.
+func TestHookCommandClaimStaleSessionSuspendedCityDrainsBeforeSuspensionCheck(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	// A normal, resolvable, non-suspended "worker" agent, so the only early
+	// return in play is the city-suspension one the fence must pre-empt.
+	cityDir := writeFenceTestCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateFailedCreate, "failed-token")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "failed-token")
+	// Suspend the whole city via the documented GC_SUSPENDED escape hatch so
+	// citySuspendedWithState fires the "gc hook: city is suspended" early return.
+	t.Setenv("GC_SUSPENDED", "1")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonStaleSession {
+		t.Fatalf("result = %+v, want action=drain reason=stale_session", result)
+	}
+	if !strings.Contains(stderr.String(), "refusing stale session") {
+		t.Fatalf("stderr = %q, want stale-session refusal", stderr.String())
+	}
+	// The reorder's whole point: the fence must pre-empt the city-suspended early
+	// return, so its "city is suspended" failure must NOT be reached.
+	if strings.Contains(stderr.String(), "city is suspended") {
+		t.Fatalf("stale session hit the city-suspended early return before the fence: %s", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran for a stale session in a suspended city; stat error = %v", err)
+	}
+}
+
+// setFenceClaimEnvMissingSessionID mirrors setFenceClaimEnv but for a runtime
+// that carries pool-membership identity (GC_TEMPLATE, set by
+// RuntimeEnvWithSessionContext alongside GC_SESSION_ID from the same session
+// Info) with no GC_SESSION_ID at all — the signature of a managed pool runtime
+// that bypassed the canonical session-creation front door and so has no
+// durable session bead to verify against.
+func setFenceClaimEnvMissingSessionID(t *testing.T) {
+	t.Helper()
+	t.Setenv("GC_TEMPLATE", "worker")
+	t.Setenv("GC_ALIAS", "worker-1")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_SESSION_NAME", "worker-1")
+	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+	t.Setenv("GC_INSTANCE_TOKEN", "")
+}
+
+// TestHookCommandClaimMissingSessionRegistrationDrainsBeforeWorkQuery proves a
+// managed pool runtime with no durable session bead at all — GC_TEMPLATE set
+// (pool membership) but GC_SESSION_ID empty (never registered, or registration
+// lost) — is refused as a structurally distinct case from a stale session,
+// before the work query, without any bead to mutate. This is the hermetic
+// regression for the bug this fence closes: previously an empty GC_SESSION_ID
+// made the whole session fence "un-fenceable" and fell through to normal claim
+// resolution, letting an unregistered pool slot have assignee/routing metadata
+// written onto it.
+func TestHookCommandClaimMissingSessionRegistrationDrainsBeforeWorkQuery(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	t.Setenv("GC_CITY", cityDir)
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnvMissingSessionID(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonMissingSessionRegistration {
+		t.Fatalf("result = %+v, want action=drain reason=missing_session_registration", result)
+	}
+	if result.BeadID != "" || result.Assignee != "" {
+		t.Fatalf("result = %+v, want no bead_id/assignee written for an unregistered runtime", result)
+	}
+	if !strings.Contains(stderr.String(), "refusing unregistered managed session") ||
+		!strings.Contains(stderr.String(), `"worker"`) {
+		t.Fatalf("stderr = %q, want unregistered-session refusal naming the pool template", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran for an unregistered managed session; stat error = %v", err)
+	}
+}
+
+// TestHookCommandClaimMissingSessionRegistrationCoversPoolInstances proves the
+// missing-registration fence applies per pool template, not just a single
+// hardcoded name: any managed pool slot whose runtime carries GC_TEMPLATE with
+// no GC_SESSION_ID is refused the same way, regardless of which pool it
+// belongs to (AC5: pool-instance coverage).
+func TestHookCommandClaimMissingSessionRegistrationCoversPoolInstances(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		template string
+	}{
+		{name: "worker-pool", template: "worker"},
+		{name: "reviewer-pool", template: "reviewer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearGCEnv(t)
+			disableManagedDoltRecoveryForTest(t)
+			t.Setenv("GC_BEADS", "file")
+			cityDir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cityTOML := "[workspace]\nname = \"test-city\"\n\n[[agent]]\nname = \"" + tc.template + "\"\n"
+			if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityTOML), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GC_CITY", cityDir)
+			queryMarker := installFenceWorkQueryProbe(t)
+			t.Setenv("GC_TEMPLATE", tc.template)
+			t.Setenv("GC_ALIAS", tc.template+"-1")
+			t.Setenv("GC_SESSION_ID", "")
+			t.Setenv("GC_SESSION_NAME", tc.template+"-1")
+			t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+			t.Setenv("GC_INSTANCE_TOKEN", "")
+
+			var stdout, stderr bytes.Buffer
+			code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+			if code != 1 {
+				t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+			}
+			var result hookClaimJSONResult
+			if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+				t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+			}
+			if result.Action != "drain" || result.Reason != hookClaimReasonMissingSessionRegistration {
+				t.Fatalf("result = %+v, want action=drain reason=missing_session_registration", result)
+			}
+			if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+				t.Fatalf("work query ran for pool template %q with no session bead; stat error = %v", tc.template, err)
+			}
+		})
+	}
+}
+
+// TestHookCommandClaimMissingSessionRegistrationSurvivesRestartWithoutBead
+// proves the missing-registration fence still refuses a runtime that is
+// re-invoked after a process restart (a fresh cmdHookWithOptions invocation,
+// simulating the wrapper's retry-on-relaunch behavior) as long as its
+// registration is still missing, rather than looping into a claim mutation on
+// any particular retry (AC3: no claim loop; AC5: restart/reconcile coverage).
+func TestHookCommandClaimMissingSessionRegistrationSurvivesRestartWithoutBead(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	t.Setenv("GC_CITY", cityDir)
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnvMissingSessionID(t)
+
+	for attempt := 0; attempt < 3; attempt++ {
+		var stdout, stderr bytes.Buffer
+		code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("attempt %d: code = %d, want 1; stdout=%q stderr=%s", attempt, code, stdout.String(), stderr.String())
+		}
+		var result hookClaimJSONResult
+		if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+			t.Fatalf("attempt %d: stdout is not a JSON drain result: %v\n%s", attempt, err, stdout.String())
+		}
+		if result.Action != "drain" || result.Reason != hookClaimReasonMissingSessionRegistration {
+			t.Fatalf("attempt %d: result = %+v, want action=drain reason=missing_session_registration", attempt, result)
+		}
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran across restart retries with no session bead; stat error = %v", err)
+	}
+}
+
+// TestHookCommandClaimGenuinelyUnmanagedRuntimeSkipsMissingRegistrationFence
+// pins the deliberate compatibility carve-out: a caller with NEITHER
+// GC_TEMPLATE nor GC_SESSION_ID is not a managed pool runtime at all (it never
+// carries pool-membership identity in the first place), so the new
+// missing-registration branch must leave it alone and let it fall through to
+// the existing un-fenceable path, exactly like
+// TestHookCommandClaimTokenlessRuntimeSkipsFence pins for the token-less case.
+func TestHookCommandClaimGenuinelyUnmanagedRuntimeSkipsMissingRegistrationFence(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	t.Setenv("GC_CITY", cityDir)
+	queryMarker := installFenceWorkQueryProbe(t)
+	// Deliberately leave GC_TEMPLATE and GC_SESSION_ID both unset/empty; identify
+	// the caller via GC_AGENT instead, the non-pool resolution path
+	// cmdHookWithOptions falls back to when there is no template/session context.
+	t.Setenv("GC_AGENT", "worker")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_SESSION_NAME", "")
+	t.Setenv("GC_SESSION_ORIGIN", "")
+	t.Setenv("GC_INSTANCE_TOKEN", "")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if _, err := os.Stat(queryMarker); err != nil {
+		t.Fatalf("work query did not run for a genuinely unmanaged runtime: %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "refusing unregistered managed session") {
+		t.Fatalf("genuinely unmanaged runtime was refused by the missing-registration fence: %s", stderr.String())
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (JSON no-work drain without --drain-ack); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonNoWork {
+		t.Fatalf("result = %+v, want action=drain reason=no_work (probe returns no work)", result)
 	}
 }

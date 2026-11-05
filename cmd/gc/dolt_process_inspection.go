@@ -33,8 +33,12 @@ func inspectManagedDoltProcess(cityPath, port string) (managedDoltProcessInspect
 	if err != nil {
 		return managedDoltProcessInspection{}, err
 	}
+	return inspectManagedDoltProcessWithLayout(layout, port, true), nil
+}
+
+func inspectManagedDoltProcessWithLayout(layout managedDoltRuntimeLayout, port string, removeStalePIDFile bool) managedDoltProcessInspection {
 	info := managedDoltProcessInspection{}
-	info.ManagedPID, info.ManagedSource = findManagedDoltPID(layout, port)
+	info.ManagedPID, info.ManagedSource = findManagedDoltPIDWithOptions(layout, port, removeStalePIDFile)
 	if info.ManagedPID > 0 {
 		info.ManagedOwned, info.ManagedDeletedInodes = inspectManagedDoltOwnership(info.ManagedPID, layout)
 	}
@@ -42,11 +46,15 @@ func inspectManagedDoltProcess(cityPath, port string) (managedDoltProcessInspect
 	if info.PortHolderPID > 0 {
 		info.PortHolderOwned, info.PortHolderDeletedInodes = inspectManagedDoltOwnership(info.PortHolderPID, layout)
 	}
-	return info, nil
+	return info
 }
 
 func findManagedDoltPID(layout managedDoltRuntimeLayout, port string) (int, string) {
-	if pid := managedPIDFromPIDFile(layout.PIDFile); pid > 0 {
+	return findManagedDoltPIDWithOptions(layout, port, true)
+}
+
+func findManagedDoltPIDWithOptions(layout managedDoltRuntimeLayout, port string, removeStalePIDFile bool) (int, string) {
+	if pid := managedPIDFromPIDFileWithOptions(layout.PIDFile, removeStalePIDFile); pid > 0 {
 		return pid, "pid-file"
 	}
 	if pid := findPortHolderPID(port); pid > 0 {
@@ -61,14 +69,16 @@ func findManagedDoltPID(layout managedDoltRuntimeLayout, port string) (int, stri
 	return 0, ""
 }
 
-func managedPIDFromPIDFile(pidFile string) int {
+func managedPIDFromPIDFileWithOptions(pidFile string, removeStale bool) int {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return 0
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil || !pidAlive(pid) {
-		_ = os.Remove(pidFile)
+		if removeStale {
+			_ = os.Remove(pidFile)
+		}
 		return 0
 	}
 	return pid
@@ -326,7 +336,19 @@ func deletedDataInodeTargetsFromFormattedLsof(pid int) []string {
 }
 
 func lsofOutput(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), lsofCommandTimeout)
+	return lsofOutputWithTimeout(lsofCommandTimeout, args...)
+}
+
+// lsofOutputWithTimeout runs lsof under the given deadline with the hardening
+// every caller needs: a WaitDelay so a child holding the pipes open cannot
+// outlive the deadline, and a cancel that kills the whole process group rather
+// than the direct child alone.
+//
+// A deadline hit is reported as an error wrapping context.DeadlineExceeded so
+// callers can distinguish a truncated listing from a complete one; whatever lsof
+// buffered before the kill is still returned alongside it.
+func lsofOutputWithTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "lsof", args...)
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -340,7 +362,11 @@ func lsofOutput(args ...string) ([]byte, error) {
 		}
 		return nil
 	}
-	return cmd.Output()
+	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return out, fmt.Errorf("lsof: %w", ctxErr)
+	}
+	return out, err
 }
 
 func processHasDeletedDataInodesWithin(pid int, dataDir string, timeout time.Duration) bool {

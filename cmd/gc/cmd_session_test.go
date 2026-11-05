@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
@@ -89,6 +90,29 @@ func TestFormatDuration(t *testing.T) {
 		got := formatDuration(tt.d)
 		if got != tt.want {
 			t.Errorf("formatDuration(%v) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+func TestSessionKillHelpDistinguishesProviderConversationContinuity(t *testing.T) {
+	long := newSessionKillCmd(io.Discard, io.Discard).Long
+	for _, want := range []string{
+		"Gas City bead continuity",
+		"provider resume",
+		"provider conversation continuity is not guaranteed",
+		"lifecycle state to asleep",
+	} {
+		if !strings.Contains(long, want) {
+			t.Fatalf("session kill help missing %q:\n%s", want, long)
+		}
+	}
+	for _, unwanted := range []string{
+		"without losing its conversation history",
+		"remains marked as active",
+		"without changing its bead state",
+	} {
+		if strings.Contains(long, unwanted) {
+			t.Fatalf("session kill help still carries stale claim %q:\n%s", unwanted, long)
 		}
 	}
 }
@@ -1993,7 +2017,7 @@ func TestCmdSessionListJSONNoSessionsReturnsEmptyEnvelope(t *testing.T) {
 	writeNamedSessionCityTOML(t, cityDir)
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", true, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList("", "", true, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList(--json) = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if stderr.Len() != 0 {
@@ -2038,7 +2062,7 @@ func TestRenderSessionListFromAPIJSONUsesSnakeCaseSessionFields(t *testing.T) {
 				LastOutput:  "ready",
 			},
 		},
-	}, true, &stdout)
+	}, true, nil, &stdout)
 	if code != 0 {
 		t.Fatalf("renderSessionListFromAPI(--json) = %d, want 0", code)
 	}
@@ -2088,7 +2112,7 @@ func TestRenderSessionListFromAPIHumanIncludesTitleAndWorkDir(t *testing.T) {
 				LastActive:  "2026-04-23T12:00:00Z",
 			},
 		},
-	}, false, &stdout)
+	}, false, nil, &stdout)
 	if code != 0 {
 		t.Fatalf("renderSessionListFromAPI() = %d, want 0", code)
 	}
@@ -2150,7 +2174,7 @@ func TestCmdSessionList_RendersLastNudgeColumn(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", false, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList("", "", false, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
@@ -2183,6 +2207,103 @@ func TestCmdSessionList_RendersLastNudgeColumn(t *testing.T) {
 	}
 	if got := lastField(quietRow); got != "-" {
 		t.Fatalf("quiet-session LAST NUDGE = %q, want %q; row=%q", got, "-", quietRow)
+	}
+}
+
+// TestParseSessionListColumns pins the --columns validation and normalization
+// contract: empty input defers to the caller's default, valid comma-separated
+// names are preserved in request order, and unknown names or an all-blank
+// list are rejected with an actionable error.
+func TestParseSessionListColumns(t *testing.T) {
+	cols, err := parseSessionListColumns("")
+	if err != nil || cols != nil {
+		t.Fatalf("parseSessionListColumns(\"\") = (%v, %v), want (nil, nil)", cols, err)
+	}
+
+	cols, err = parseSessionListColumns("target, state ,id")
+	if err != nil {
+		t.Fatalf("parseSessionListColumns(valid) error = %v", err)
+	}
+	want := []string{"target", "state", "id"}
+	if len(cols) != len(want) {
+		t.Fatalf("parseSessionListColumns(valid) = %v, want %v", cols, want)
+	}
+	for i, w := range want {
+		if cols[i] != w {
+			t.Fatalf("parseSessionListColumns(valid)[%d] = %q, want %q", i, cols[i], w)
+		}
+	}
+
+	if _, err := parseSessionListColumns("bogus"); err == nil {
+		t.Fatal("parseSessionListColumns(\"bogus\") = nil error, want error for unknown column")
+	}
+
+	if _, err := parseSessionListColumns(" , "); err == nil {
+		t.Fatal("parseSessionListColumns(all-blank) = nil error, want error")
+	}
+}
+
+// TestCmdSessionList_ColumnsFlagNarrowsTable pins the --columns behavior end
+// to end: a narrowed column set renders only the requested headers/fields
+// (dropping WORKDIR/TITLE), preserves the requested column order, and leaves
+// the default (nil columns) output as the full unchanged table.
+func TestCmdSessionList_ColumnsFlagNarrowsTable(t *testing.T) {
+	clearGCEnv(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "narrow-session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "narrow-session",
+			"template":     "worker",
+			"state":        "asleep",
+			"work_dir":     "/tmp/gc/workspaces/narrow",
+		},
+	}); err != nil {
+		t.Fatalf("store.Create(session bead): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionList("", "", false, []string{"target", "state"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionList(--columns) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) < 1 {
+		t.Fatalf("no output lines:\n%s", out)
+	}
+	header := strings.Fields(lines[0])
+	wantHeader := []string{"TARGET", "STATE"}
+	if len(header) != len(wantHeader) {
+		t.Fatalf("header = %v, want %v (full output:\n%s)", header, wantHeader, out)
+	}
+	for i, w := range wantHeader {
+		if header[i] != w {
+			t.Fatalf("header[%d] = %q, want %q (full output:\n%s)", i, header[i], w, out)
+		}
+	}
+	if strings.Contains(out, "WORKDIR") || strings.Contains(out, "TITLE") {
+		t.Fatalf("--columns=target,state must drop WORKDIR/TITLE, got:\n%s", out)
+	}
+
+	var stdoutDefault bytes.Buffer
+	if code := cmdSessionList("", "", false, nil, &stdoutDefault, &stderr); code != 0 {
+		t.Fatalf("cmdSessionList(no --columns) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdoutDefault.String(), "WORKDIR") {
+		t.Fatalf("omitting --columns must still render the full default table, got:\n%s", stdoutDefault.String())
 	}
 }
 
@@ -2230,7 +2351,7 @@ func TestCmdSessionListJSONOmitZeroLastNudgeDeliveredAt(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", true, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList("", "", true, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList(--json) = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"last_nudge_delivered_at": "0001-01-01`) {
@@ -2525,8 +2646,41 @@ func TestCmdSessionNew_IgnoresUnmanagedSupervisorSocket(t *testing.T) {
 	}
 }
 
+// namedSessionTestWorkspace is the workspace_name this fixture writes to
+// .gc/site.toml. gc derives the tmux socket from the workspace name, so any
+// test using this fixture that reaches the real tmux adapter drives a real
+// server on "tmux -L test-city".
+const namedSessionTestWorkspace = "test-city"
+
+// killNamedSessionTmuxServer tears down the real tmux server this fixture's
+// workspace name binds to.
+//
+// Registering it as a t.Cleanup is what keeps the server from outliving the
+// test. TestMain points TMUX_TMPDIR at a process-wide socket root
+// (tmuxtest.ConfigureProcessEnv, cmd/gc/main_test.go) that is removed only
+// after m.Run() returns, so this cleanup can always reach the server by
+// socket name no matter when it runs. What leaked before was servers
+// surviving until that end-of-package removal unlinked their sockets: at
+// that point no client can find them to kill by name, and they just sit
+// there.
+//
+// The "test-city" server is shared by every caller of this fixture, so the
+// teardown is only safe while none of them call t.Parallel(): a parallel
+// caller's cleanup would kill a server another test is still using.
+//
+// Kill failures are ignored: most tests never start a server, so "no server"
+// is the common case, not an error.
+func killNamedSessionTmuxServer(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		tm := tmux.NewTmuxWithConfig(tmux.Config{SocketName: namedSessionTestWorkspace})
+		_ = tm.TeardownServer()
+	})
+}
+
 func writeNamedSessionCityTOML(t *testing.T, dir string) {
 	t.Helper()
+	killNamedSessionTmuxServer(t)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatalf("MkdirAll(.gc): %v", err)
 	}
@@ -2547,8 +2701,8 @@ provider = "file"
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 	writeBuiltinImportsFixture(t, dir, "core")
-	if err := os.WriteFile(filepath.Join(dir, ".gc", "site.toml"), []byte(`workspace_name = "test-city"
-`), 0o644); err != nil {
+	siteTOML := fmt.Sprintf("workspace_name = %q\n", namedSessionTestWorkspace)
+	if err := os.WriteFile(filepath.Join(dir, ".gc", "site.toml"), []byte(siteTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile(.gc/site.toml): %v", err)
 	}
 	writeCatalogFile(t, dir, "agents/mayor/agent.toml", "provider = \"codex\"\nstart_command = \"echo\"\n")
@@ -3153,7 +3307,7 @@ func runSessionListProviderFailureHelper(t *testing.T, scenario, markerPath, std
 	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
 		return nil, errors.New("injected provider failure")
 	}
-	args := []string{"session", "list"}
+	args := []string{"--city", ".", "session", "list"}
 	if scenario == "json" {
 		args = append(args, "--json")
 	} else if scenario != "text" {
@@ -3275,7 +3429,7 @@ func TestRouteSessionList_SixRowMatrix(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			code := routeSessionList(cityPath, "", "", c, tc.nilReason, false, &stdout, &stderr)
+			code := routeSessionList(cityPath, "", "", c, tc.nilReason, false, nil, &stdout, &stderr)
 
 			if code != tc.wantExit {
 				t.Fatalf("exit = %d, want %d; stderr=%q stdout=%q", code, tc.wantExit, stderr.String(), stdout.String())
@@ -3318,7 +3472,7 @@ func TestRouteSessionList_APIJSONIncludesCacheAge(t *testing.T) {
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
 	var stdout, stderr bytes.Buffer
-	if code := routeSessionList(cityPath, "", "", c, "", true, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, "", "", c, "", true, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
 	}
 	var out map[string]any
@@ -3345,7 +3499,7 @@ func TestRouteSessionList_APIJSONIncludesCacheAge(t *testing.T) {
 	// fails; that itself proves the envelope is not present.
 	stdout.Reset()
 	stderr.Reset()
-	if code := routeSessionList(cityPath, "", "", nil, "controller-down", true, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, "", "", nil, "controller-down", true, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("fallback exit = %d, stderr=%q", code, stderr.String())
 	}
 	out = nil
@@ -3384,7 +3538,7 @@ func TestRouteSessionList_StaleBannerOver30s(t *testing.T) {
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
 	var stdout, stderr bytes.Buffer
-	if code := routeSessionList(cityPath, "", "", c, "", false, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, "", "", c, "", false, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "cache age: 45s") {

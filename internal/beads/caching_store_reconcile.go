@@ -256,8 +256,12 @@ func (c *CachingStore) nextReconcileDelay(now time.Time) time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.syncFailures >= maxCacheSyncFailures && !c.stats.LastProblemAt.IsZero() {
-		dueAt := c.stats.LastProblemAt.Add(cacheReconcileFailureBackoff)
+	if c.syncFailures > 0 && !c.stats.LastProblemAt.IsZero() {
+		backoff := cacheReconcileBaseBackoff << uint(c.syncFailures)
+		if backoff > cacheReconcileMaxBackoff || backoff <= 0 {
+			backoff = cacheReconcileMaxBackoff
+		}
+		dueAt := c.stats.LastProblemAt.Add(backoff)
 		if !now.Before(dueAt) {
 			return 0
 		}
@@ -298,6 +302,11 @@ func (c *CachingStore) runReconciliation() {
 		c.syncFailures++
 		if (IsPartialResult(err) || c.syncFailures >= maxCacheSyncFailures) && (c.state == cacheLive || c.state == cachePartial) {
 			c.state = cacheDegraded
+			if !c.circuitTripped {
+				c.circuitTripped = true
+				c.problemf(fmt.Sprintf("circuit-breaker tripped rig=%s syncFailures=%d", c.idPrefix, c.syncFailures))
+			}
+			c.advanceObservationLocked()
 		}
 		c.recordProblemLocked("reconcile cache", err)
 		c.recordReconcileLatencyLocked(bdLatency)
@@ -310,18 +319,18 @@ func (c *CachingStore) runReconciliation() {
 		recordCacheScanLarge(context.Background(), c.idPrefix, len(fresh),
 			cacheReconcileScanWarnThreshold, time.Since(bdStart))
 	}
-	enriched, enrichErr := c.enrichReadyProjectionForCache(fresh)
+	// The reconcile pass never marked the snapshot partial on an enrichment
+	// failure — the rows it just listed are whole either way — so it discards
+	// the completeness verdict applyReadyProjection returns and keeps only the
+	// problem-log entry it already recorded.
+	fresh, _ = c.applyReadyProjection("reconcile ready projection", fresh)
 	bdLatency := time.Since(bdStart)
-	if enrichErr != nil {
-		c.recordProblem("reconcile ready projection", enrichErr)
-	} else {
-		fresh = enriched
-	}
 
 	freshByID := make(map[string]Bead, len(fresh))
 	for _, b := range fresh {
 		freshByID[b.ID] = cloneBead(b)
 	}
+	c.revalidateDestructiveAssignmentRegressions(freshByID, startSeq, start)
 
 	confirmedClosed := c.recoverMissingFromList(freshByID)
 
@@ -345,6 +354,95 @@ func (c *CachingStore) runReconciliation() {
 		log.Print(logLine)
 	}
 	c.notifyChanges(res.notifications)
+}
+
+type destructiveAssignmentRegression struct {
+	cached Bead
+	listed Bead
+}
+
+// revalidateDestructiveAssignmentRegressions protects ownership from a
+// syntactically valid but stale full-scan row. A transition that clears an
+// assignee or reopens in-progress work is destructive enough to require an
+// authoritative point read before the cache publishes it. Point-read failure
+// is ambiguous, so the cache retains its prior row and retries next cycle.
+//
+// A confirmed transition still passes through. In particular, this does not
+// turn external assignments into leases the cache can never release.
+func (c *CachingStore) revalidateDestructiveAssignmentRegressions(
+	freshByID map[string]Bead, startSeq uint64, startedAt time.Time,
+) {
+	c.mu.RLock()
+	candidates := make(map[string]destructiveAssignmentRegression)
+	for id, listed := range freshByID {
+		cached, ok := c.beads[id]
+		if !ok || !destructivelyRegressesAssignment(cached, listed) {
+			continue
+		}
+		candidates[id] = destructiveAssignmentRegression{
+			cached: cloneBead(cached),
+			listed: cloneBead(listed),
+		}
+	}
+	c.mu.RUnlock()
+
+	for id, candidate := range candidates {
+		authoritative, err := c.backing.Get(id)
+		if err != nil {
+			freshByID[id] = candidate.cached
+			c.recordProblem(
+				"revalidate destructive assignment regression",
+				fmt.Errorf(
+					"source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q verdict=defer: %w",
+					startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+					candidate.cached.Status, candidate.cached.Assignee,
+					candidate.listed.Status, candidate.listed.Assignee, err,
+				),
+			)
+			continue
+		}
+		if authoritative.ID != id {
+			freshByID[id] = candidate.cached
+			c.recordProblem(
+				"revalidate destructive assignment regression",
+				fmt.Errorf(
+					"source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q get_id=%q verdict=defer",
+					startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+					candidate.cached.Status, candidate.cached.Assignee,
+					candidate.listed.Status, candidate.listed.Assignee,
+					authoritative.ID,
+				),
+			)
+			continue
+		}
+
+		verdict := "accept-confirmed"
+		if authoritative.Status == "closed" {
+			// The active-only scan should not contain a closed row. Remove the
+			// stale listed row and let recoverMissingFromList obtain the fresh
+			// close payload through its established close-verification path.
+			delete(freshByID, id)
+			verdict = "accept-confirmed-close"
+		} else {
+			freshByID[id] = cloneBead(authoritative)
+			if !destructivelyRegressesAssignment(candidate.cached, authoritative) {
+				verdict = "reject-stale-list"
+			}
+		}
+
+		log.Printf(
+			"beads cache: assignment regression revalidated rig=%s source=runReconciliation invocation=%s start_seq=%d bead=%s cached_status=%q cached_assignee=%q list_status=%q list_assignee=%q get_status=%q get_assignee=%q verdict=%s",
+			c.idPrefix, startedAt.UTC().Format(time.RFC3339Nano), startSeq, id,
+			candidate.cached.Status, candidate.cached.Assignee,
+			candidate.listed.Status, candidate.listed.Assignee,
+			authoritative.Status, authoritative.Assignee, verdict,
+		)
+	}
+}
+
+func destructivelyRegressesAssignment(cached, fresh Bead) bool {
+	return (cached.Assignee != "" && fresh.Assignee == "") ||
+		(cached.Status == "in_progress" && fresh.Status == "open")
 }
 
 // mergeAction is what the reconcile merge does with one id.
@@ -545,9 +643,15 @@ func (c *CachingStore) mergeSnapshotLocked(
 			})
 		}
 		c.absorbFreshLocked(id, freshBead, now, absorbOpts{
-			depsMode:   depsExplicit,
-			deps:       freshDeps,
-			seqMode:    seqClearGuarded,
+			depsMode: depsExplicit,
+			deps:     freshDeps,
+			seqMode:  seqClearGuarded,
+			// preserveCachedReadyProjectionLocked above already decided, per
+			// row, which cached verdicts survive this cycle — on the blocking
+			// targets' fresh statuses, which no single-row absorb can see. Its
+			// refusals are the rows whose verdict really may have changed, so
+			// they must land as unanswerable rather than be re-preserved here.
+			readyMode:  readyFromFresh,
 			clearDirty: true,
 		})
 	}
@@ -575,7 +679,7 @@ func (c *CachingStore) mergeSnapshotLocked(
 		res.removes++
 		if d.notification == "bead.closed" {
 			closed := cloneBead(cached)
-			closed.Status = "closed"
+			setBeadStatus(&closed, "closed")
 			if freshClosed, ok := confirmedClosed[id]; ok {
 				closed = cloneBead(freshClosed)
 			}
@@ -616,6 +720,7 @@ func (c *CachingStore) mergeSnapshotLocked(
 	c.syncFailures = 0
 	c.depsComplete = nextDepsComplete
 	c.primePartialErr = nil
+	c.advanceObservationLocked()
 	c.promoteLiveLocked()
 	c.stats.LastReconcileAt = now
 	c.stats.Adds += res.adds
@@ -674,6 +779,12 @@ func (c *CachingStore) orphanFenceIDsLocked(freshByID map[string]Bead) []string 
 // hold c.mu (write lock).
 func (c *CachingStore) promoteLiveLocked() {
 	c.state = cacheLive
+	// Re-arm the one-shot circuit-breaker signal. promoteLiveLocked is the single
+	// live-promotion point — both prime() and the reconcile success paths route
+	// through it — so resetting here ensures a store that recovers via reconcile
+	// (not just prime) will fire the trip log again on a subsequent re-degrade.
+	// Without this, a flapping store emits the breaker signal at most once.
+	c.circuitTripped = false
 }
 
 // reconcileSuccessLogLocked composes the per-reconcile success log line
