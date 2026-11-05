@@ -3,6 +3,8 @@
 #
 # A PR is merged when ALL hold:
 #   - open, not a draft
+#   - its base is the repo default branch (a PR stacked on a feature branch merges
+#     into that branch and moves its head past its qa sha; it waits for retarget)
 #   - carries label qa:pass
 #   - the newest qa comment "qa:pass sha=<40 hex>" names the CURRENT head sha
 #   - mergeStateStatus is CLEAN
@@ -46,7 +48,7 @@
 #   */5 * * * * /path/to/gascity/scripts/merge-bot.sh
 #
 # Usage: merge-bot.sh            run one pass over all repos
-#        merge-bot.sh decide PR_JSON FREEZE_FILE NOW_EPOCH
+#        merge-bot.sh decide PR_JSON FREEZE_FILE NOW_EPOCH DEFAULT_BRANCH
 #                              print "merge" or "skip <reason>" (pure; used by tests)
 
 set -euo pipefail
@@ -62,7 +64,7 @@ MERGE_BOT_UNKNOWN_SLEEP="${MERGE_BOT_UNKNOWN_SLEEP:-5}"
 # the full pattern pins it to ISO-8601 so e.g. "2026" can't parse as 20:26.
 FREEZE_TS_CHARS='^[0-9TZ:+-]+$'
 FREEZE_TS_ISO='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})$'
-PR_FIELDS="number,state,isDraft,headRefOid,mergeStateStatus,labels,comments,body"
+PR_FIELDS="number,state,isDraft,baseRefName,headRefOid,mergeStateStatus,labels,comments,body"
 
 log() {
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$MERGE_BOT_HOME/merge-bot.log"
@@ -97,11 +99,14 @@ in_freeze() {
     return 1
 }
 
-# decide PR_JSON FREEZE_FILE NOW_EPOCH: print "merge" or "skip <reason>".
+# decide PR_JSON FREEZE_FILE NOW_EPOCH DEFAULT_BRANCH: print "merge" or "skip <reason>".
+# An empty DEFAULT_BRANCH fails closed (skip default-branch-unknown).
 decide() {
-    local pr="$1" freeze="$2" now="$3" head qa_sha rc
+    local pr="$1" freeze="$2" now="$3" default="${4:-}" head qa_sha rc
     if [ "$(jq -r '.state' "$pr")" != "OPEN" ]; then echo "skip not-open"; return; fi
     if [ "$(jq -r '.isDraft' "$pr")" = "true" ]; then echo "skip draft"; return; fi
+    if [ -z "$default" ]; then echo "skip default-branch-unknown"; return; fi
+    if [ "$(jq -r '.baseRefName // ""' "$pr")" != "$default" ]; then echo "skip base-not-default"; return; fi
     if ! jq -e '.labels | map(.name) | index("qa:pass")' "$pr" >/dev/null; then
         echo "skip no-qa-pass-label"; return
     fi
@@ -134,14 +139,14 @@ announce() {
     fi
 }
 
-# decide_fresh REPO N PR_JSON FREEZE NOW: view the PR into PR_JSON and decide. A PR GitHub
+# decide_fresh REPO N PR_JSON FREEZE NOW DEFAULT_BRANCH: view the PR into PR_JSON and decide. A PR GitHub
 # still reports as mergeStateStatus UNKNOWN is re-read up to MERGE_BOT_UNKNOWN_RETRIES times,
 # MERGE_BOT_UNKNOWN_SLEEP seconds apart; any other verdict is final.
 decide_fresh() {
-    local repo="$1" n="$2" out="$3" freeze="$4" now="$5" verdict tries=0
+    local repo="$1" n="$2" out="$3" freeze="$4" now="$5" default="$6" verdict tries=0
     while :; do
         gh pr view "$n" --repo "$repo" --json "$PR_FIELDS" >"$out"
-        verdict=$(decide "$out" "$freeze" "$now")
+        verdict=$(decide "$out" "$freeze" "$now" "$default")
         if [ "$verdict" != "skip not-clean:UNKNOWN" ] || [ "$tries" -ge "$MERGE_BOT_UNKNOWN_RETRIES" ]; then
             printf '%s' "$verdict"; return 0
         fi
@@ -180,15 +185,23 @@ run_pass() {
         log "paused (MERGE-PAUSE present: $pf)"
         return 0
     fi
-    local repo n tmp verdict sha now g
+    local repo n tmp verdict sha now g default
     tmp=$(mktemp -d -p /var/tmp)
     trap "rm -rf '$tmp'" RETURN
     now=$(date -u +%s)
     log "pass start repos=$MERGE_BOT_REPOS"
     for repo in $MERGE_BOT_REPOS; do
+        if ! default=$(gh repo view "$repo" --json defaultBranchRef --jq '.defaultBranchRef.name') || [ -z "$default" ]; then
+            log "ERROR $repo default-branch-lookup-failed; skipping repo"
+            continue
+        fi
         for n in $(gh pr list --repo "$repo" --label qa:pass --state open --json number --jq '.[].number'); do
-            verdict=$(decide_fresh "$repo" "$n" "$tmp/pr.json" "$MERGE_BOT_HOME/merge-freeze.txt" "$now")
-            log "$repo#$n $verdict"
+            verdict=$(decide_fresh "$repo" "$n" "$tmp/pr.json" "$MERGE_BOT_HOME/merge-freeze.txt" "$now" "$default")
+            if [ "$verdict" = "skip base-not-default" ]; then
+                log "$repo#$n $verdict base=$(jq -r '.baseRefName' "$tmp/pr.json") default=$default"
+            else
+                log "$repo#$n $verdict"
+            fi
             [ "$verdict" = merge ] || continue
             [ -z "${MERGE_BOT_DRY_RUN:-}" ] || continue
             if ! g=$(gate); then
@@ -211,7 +224,7 @@ run_pass() {
 
 main() {
     if [ "${1:-}" = decide ]; then
-        decide "$2" "$3" "$4"
+        decide "$2" "$3" "$4" "${5:-}"
     else
         run_pass
     fi

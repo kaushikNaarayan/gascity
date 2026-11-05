@@ -25,14 +25,14 @@ NOW=$(date -u -d 2026-11-06T12:00:00Z +%s)
 pr_json() {
     jq -n --arg head "$HEAD" --arg st "$2" --argjson dr "$3" --arg ms "$4" \
         --argjson labels "$5" --arg qa "$6" '{
-        number: 1, state: $st, isDraft: $dr, headRefOid: $head, mergeStateStatus: $ms,
+        number: 1, state: $st, baseRefName: "main", isDraft: $dr, headRefOid: $head, mergeStateStatus: $ms,
         labels: $labels, body: "Bead: gcf-abc12",
         comments: [{body: "looks good"}, {body: ("qa:pass sha=" + $qa)}]}' >"$TMP/$1.json"
 }
 
 expect() {
     local name="$1" want="$2" freeze="${3:-$TMP/none.txt}" got
-    got=$("$BOT" decide "$TMP/$name.json" "$freeze" "$NOW")
+    got=$("$BOT" decide "$TMP/$name.json" "$freeze" "$NOW" "${DEFAULT:-main}")
     if [ "$got" = "$want" ]; then pass "$name -> $want"; else fail "$name: want '$want' got '$got'"; fi
 }
 
@@ -75,7 +75,7 @@ expect newer merge
 # pr2 NAME LABELS_JSON COMMENTS_JSON [MERGE_STATE]
 pr2() {
     jq -n --arg h "$HEAD" --argjson l "$2" --argjson c "$3" --arg ms "${4:-CLEAN}" \
-        '{number:1,state:"OPEN",isDraft:false,headRefOid:$h,mergeStateStatus:$ms,labels:$l,body:"Bead: gcf-x1",comments:$c}' \
+        '{number:1,state:"OPEN",isDraft:false,baseRefName:"main",headRefOid:$h,mergeStateStatus:$ms,labels:$l,body:"Bead: gcf-x1",comments:$c}' \
         >"$TMP/$1.json"
 }
 okc() { printf '[{"body":"qa:pass sha=%s"}]' "$1"; }
@@ -130,6 +130,7 @@ echo "gh \$*" >>"$d/calls"
 case "\$1 \$2" in
  "pr list") echo 1; echo 2;;
  "pr view") if [[ "\$*" == *mergeCommit* ]]; then echo deadbeef; else jq -c --argjson n "\$3" '.number=\$n' "$TMP/ok.json"; fi;;
+ "repo view") echo main;;
  "pr merge") [ "\$3" = 1 ] && [ -x "$d/on-merge-1" ] && "$d/on-merge-1"; exit 0;;
  "pr comment") exit 0;;
 esac
@@ -226,6 +227,7 @@ unk_env() {
 echo "gh \$*" >>"$d/calls"
 case "\$1 \$2" in
  "pr list") echo 1;;
+ "repo view") echo main;;
  "pr view")
    if [[ "\$*" == *mergeCommit* ]]; then echo deadbeef; exit 0; fi
    n=\$(cat "$d/n" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n >"$d/n"
@@ -256,5 +258,26 @@ else fail "BLOCKED must not be retried"; fi
 
 if grep -q "^gc cwd=$TMP/unk1/city bd comments add" "$TMP/unk1/calls"; then pass "bead comment runs from MERGE_BOT_CITY"
 else fail "bead comment cwd: $(grep '^gc ' "$TMP/unk1/calls" | head -1)"; fi
+
+# --- gcf-lkemx: only PRs whose base is the repo default branch merge ------------------------------------
+jq '.baseRefName="build/stack-s1"' "$TMP/ok.json" >"$TMP/stacked.json"
+expect stacked "skip base-not-default"
+jq 'del(.baseRefName)' "$TMP/ok.json" >"$TMP/nobase.json"
+expect nobase "skip base-not-default"
+expect ok merge # negative control: default base is unchanged
+if [ "$("$BOT" decide "$TMP/ok.json" "$TMP/none.txt" "$NOW" "")" = "skip default-branch-unknown" ]; then
+    pass "empty default branch fails closed"
+else fail "empty default branch must skip"; fi
+DEFAULT=trunk expect ok "skip base-not-default" # default is per repo, not hardcoded to main
+
+# Full pass: a stacked PR is skipped, never merged, and the log names base and default.
+unk_env "$TMP/stk" CLEAN
+jq '.baseRefName="build/stack-s1"' "$TMP/ok.json" >"$TMP/ok-stacked.json"
+sed -i "s#$TMP/ok.json#$TMP/ok-stacked.json#" "$TMP/stk/bin/gh"
+run_unk "$TMP/stk"
+if [ "$(merges "$TMP/stk")" = 0 ] \
+    && grep -q 'o/r#1 skip base-not-default base=build/stack-s1 default=main' "$TMP/stk/home/merge-bot.log"; then
+    pass "stacked PR is not merged and the skip is logged"
+else fail "stacked PR pass: merges=$(merges "$TMP/stk")"; fi
 
 exit "$FAILED"
