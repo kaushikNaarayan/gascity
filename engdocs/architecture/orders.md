@@ -3,7 +3,7 @@ title: "Orders"
 ---
 
 
-> Last verified against code: 2026-03-01
+> Last verified against code: 2026-03-01. Partially updated 2026-11-05 (gcf-e9x7u): trigger types, timeouts, file layout, open-work gate, cron syntax and the startup pass were re-checked; the rest of the page has not been.
 
 ## Summary
 
@@ -11,7 +11,7 @@ Orders are Gas City's derived mechanism (Layer 2-4, part of Formulas
 & Molecules) for scheduled and event-driven work dispatch without human
 intervention. Each order pairs a trigger condition (when to fire) with
 an action (a shell script or formula wisp), living as an
-`order.toml` file inside formula directories. The controller
+`<name>.toml` file in the `orders/` directory of a formula layer. The controller
 evaluates all non-manual triggers on every pass of its orders lane (about
 once per patrol interval, off the controller tick) and dispatches due
 orders -- exec orders run shell scripts directly with no LLM
@@ -20,24 +20,36 @@ agent pools.
 
 ## Key Concepts
 
-- **Order**: A parsed definition from an `order.toml` file with
-  a Name (derived from subdirectory name), a dispatch action (Formula or
+- **Order**: A parsed definition from an order `.toml` file with
+  a Name (derived from the file name), a dispatch action (Formula or
   Exec, mutually exclusive), a Trigger type, trigger-specific parameters, and
   optional Pool routing. Defined in the `Order` struct at
   `internal/orders/order.go`.
 
 - **Trigger**: The trigger condition that controls when an order fires.
-  Five types exist: `cooldown` (minimum interval since last run), `cron`
-  (5-field schedule matching), `condition` (shell command exits 0),
-  `event` (matching events after a cursor position), and `manual`
-  (explicit invocation only, never auto-fires). See
+  Six types exist: `cooldown` (minimum interval since last run), `cron`
+  (5-field schedule matching, evaluated in the order's `tz` or the
+  city's `[workspace]` timezone), `condition` (shell command exits 0),
+  `event` (matching events after a cursor position), `manual`
+  (explicit invocation only, never auto-fires), and `webhook` (fired only
+  by a webhook receiver passing dispatch args, never tick-fired; it
+  requires a non-empty `[order.params]` table). See
   `internal/orders/triggers.go`.
+
+- **Open-work gate**: Before dispatching a due order, the dispatcher
+  runs single-flight and open-work checks against the store so an order
+  does not overlap its own still-open run. A gate that stays shut for a
+  long unbroken run of checks emits `order.suppressed`, which is not a
+  failure but signals an order that has stopped running. `idempotent =
+  true` makes the order fail open (dispatch anyway) when the gate times
+  out under store contention; `no_work_gate = true` skips the gates
+  entirely for pure probes that track no bead work.
 
 - **Exec Order**: An order whose action is a shell command
   (`exec` field) run directly by the controller. No LLM, no agent, no
   wisp. The script receives `ORDER_DIR` in its environment, set to
-  the directory containing the `order.toml` file. Default timeout:
-  60 seconds.
+  the directory containing the order file. Default timeout:
+  300 seconds (`Order.TimeoutOrDefault`).
 
 - **Formula Order**: An order whose action is a formula name
   (`formula` field). When the trigger opens, the controller calls `MolCook`
@@ -50,10 +62,12 @@ agent pools.
   (e.g., `dolt-health:rig:demo-repo`). ScopedName drives independent
   cooldown tracking, event cursors, and label scoping.
 
-- **Formula Layer**: A directory scanned for `orders/*/order.toml`.
+- **Formula Layer**: A directory scanned for flat `orders/<name>.toml`
+  files. The older `orders/<name>/order.toml` directory form is rejected
+  at load with a migration error.
   Layers are ordered lowest to highest priority; a higher-priority layer's
   order definition overrides a lower-priority one with the same
-  subdirectory name (last-wins semantics).
+  file name (last-wins semantics).
 
 - **Tracking Bead**: A bead created synchronously before each dispatch
   goroutine launches, labeled `order-run:<scopedName>`. Serves dual
@@ -138,6 +152,11 @@ The order subsystem spans two packages:
    remaining rig-exclusive layers are scanned separately.
 3. Rig orders get their `Rig` field stamped with the rig name.
 4. Manual-trigger orders are filtered out (they never auto-dispatch).
+   Webhook orders are never tick-fired either.
+
+**Startup pass:** `CityRuntime.run` dispatches due orders once, in the
+`startup-orders` phase, before the first session reconcile, so due event
+and condition formulas do not wait behind a slow cold-start reconcile.
 5. If no auto-dispatchable orders remain, the dispatcher is nil
    (nil-guard pattern -- callers check before use).
 
@@ -232,11 +251,12 @@ the tick never waits on order gates.
 **Scanning (`orders.Scan()`):**
 
 1. For each formula layer (ordered lowest to highest priority), read
-   `<layer>/orders/*/order.toml`.
+   `<layer>/orders/*.toml`. A legacy `orders/<name>/order.toml`
+   directory is reported as an unsupported layout instead of loaded.
 2. Parse each TOML file into an `Order` struct. Set `Name` from the
-   subdirectory name, `Source` from the absolute file path.
+   file name without `.toml`, `Source` from the absolute file path.
 3. Higher-priority layers overwrite lower ones by name (map keyed on
-   subdirectory name).
+   file name).
 4. Exclude disabled orders (`enabled = false`) and those in the
    `skip` list.
 5. Return the result slice preserving discovery order.
@@ -295,7 +315,7 @@ Violations indicate bugs.
   evaluation.
 
 - **Higher-priority layers override lower by name**: When the same
-  order subdirectory name exists in multiple formula layers,
+  order file name exists in multiple formula layers,
   `Scan()` uses the definition from the highest-priority layer (last in
   the layers slice). The override is total (the entire TOML definition
   replaces the lower one).
@@ -373,12 +393,12 @@ Violations indicate bugs.
 
 ## Configuration
 
-Orders are defined as `order.toml` files inside formula
+Orders are defined as order `.toml` files inside formula
 directories following the structure
-`<formulaDir>/orders/<name>/order.toml`. The `[orders]`
+`<formulaDir>/orders/<name>.toml`. The `[orders]`
 section in `city.toml` controls global order behavior.
 
-### order.toml (per-order definition)
+### Order file (per-order definition)
 
 ```toml
 [order]
@@ -405,7 +425,7 @@ max_timeout = "120s"             # hard cap on per-order timeout (default: uncap
 
 ### Order layering (override priority, lowest to highest)
 
-The formula layer order determines which `order.toml` wins when the
+The formula layer order determines which order file wins when the
 same order name exists in multiple layers:
 
 1. **City pack formulas** -- from pack referenced in `city.toml`
@@ -456,9 +476,9 @@ boundaries.
   opening.
 
 - **Cron granularity is minutes**: The cron trigger operates at
-  minute-level granularity with simple field matching (`*`, exact
-  integer, comma-separated values). It does not support ranges (`1-5`),
-  steps (`*/5`), or sub-minute scheduling.
+  minute-level granularity. Each field accepts `*`, an integer, a range
+  (`1-5`), a comma-separated list of those, and a step suffix (`*/5`,
+  `1-30/5`). It does not support sub-minute scheduling.
 
 - **Condition trigger blocks the dispatch loop**: `checkCondition()` runs
   `sh -c <check>` synchronously during trigger evaluation. A slow check
@@ -490,7 +510,7 @@ boundaries.
 
 - **No hot-add of orders**: Order discovery runs on controller
   start and config reload (via fsnotify). Adding a new
-  `order.toml` file requires the config directory watcher to
+  order file requires the config directory watcher to
   trigger a reload; adding a new formula layer directory requires a
   `city.toml` change.
 

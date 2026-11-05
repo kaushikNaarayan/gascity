@@ -205,8 +205,9 @@ Notes per trigger:
 <Accordion title="Cron catch-up after a missed minute">
 If no orchestrator tick landed during a scheduled minute (the orchestrator was busy
 or down), the next tick fires the missed occurrence once — `gc order check`
-shows the reason `cron: caught up missed occurrence`. Orders that have never run
-don't backfill; they fire only on an exact match.
+shows the reason `cron: caught up missed occurrence`. An order that has never
+run looks back 25 hours, so an occurrence missed in that window still fires
+once; older occurrences don't backfill.
 </Accordion>
 
 ## Formula orders vs. exec orders
