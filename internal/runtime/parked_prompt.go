@@ -38,8 +38,10 @@ var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 //     the pane's last line is a status/spinner line, not a settled prompt --
 //     this mirrors the discriminator that correctly excluded a genuinely
 //     mid-turn seat during the bug's own reproduction), and
-//   - the bottom-most non-blank line (skipping any blank footer rows) is the
-//     ready prompt with non-empty trailing content.
+//   - the bottom-most line that is not blank composer chrome (horizontal
+//     rules framing the composer and the status footer beneath it, e.g.
+//     "⏵⏵ bypass permissions on") is the ready prompt with non-empty
+//     trailing content (gcf-wc5i).
 //
 // A prompt line with no trailing content (the ordinary idle state) and a
 // bottom-most line that isn't the prompt at all both return false -- this is
@@ -62,6 +64,9 @@ func ParkedPromptContent(lines []string, promptPrefix string) (string, bool) {
 			continue
 		}
 		trimmed = normalizeNBSP(trimmed)
+		if isComposerChromeLine(trimmed) {
+			continue
+		}
 		for _, cand := range []string{trimmed, stripLeadingBoxBorder(trimmed)} {
 			if strings.HasPrefix(cand, normalizedPrefix) {
 				text := strings.TrimSpace(strings.TrimPrefix(cand, normalizedPrefix))
@@ -77,6 +82,39 @@ func ParkedPromptContent(lines []string, promptPrefix string) (string, bool) {
 		return "", false
 	}
 	return "", false
+}
+
+// composerFooterMarkers are substrings of the status footer Claude Code draws
+// beneath the framed composer. None of them appear in a busy pane's footer in
+// a way that matters here: busy footers carry "esc to interrupt", which the
+// busy check has already rejected before chrome is skipped.
+var composerFooterMarkers = []string{
+	"⏵⏵",
+	"? for shortcuts",
+	"shift+tab to cycle",
+	"bypass permissions",
+	"accept edits on",
+	"plan mode on",
+}
+
+// isComposerChromeLine reports whether a trimmed, NBSP-normalized pane line is
+// decoration around the composer rather than composer or transcript content:
+// a horizontal rule (only box-drawing rule glyphs) or a status-footer line.
+// Skipping these lets ParkedPromptContent reach the prompt line of a framed
+// composer, which is never the bottom-most line of a real Claude Code pane.
+func isComposerChromeLine(trimmed string) bool {
+	if trimmed == "" {
+		return true
+	}
+	if strings.Trim(trimmed, "─━═-") == "" {
+		return true
+	}
+	for _, marker := range composerFooterMarkers {
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func paneHasBusyIndicator(lines []string) bool {

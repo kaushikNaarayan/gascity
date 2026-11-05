@@ -26,7 +26,11 @@ func TestCmdSessionSweepParked_ReportsParkedSeat(t *testing.T) {
 	writeNamedSessionCityTOML(t, cityDir)
 
 	fakeProvider := runtime.NewFake()
-	fakeProvider.SetPeekOutput("parked-session", "some output\nBaked for 1m 37s\n❯ gc prime\n")
+	fakeProvider.SetPeekOutput("parked-session", "some output\nBaked for 1m 37s\n"+
+		"────────────────────────────────────────\n"+
+		"❯ gc prime\n"+
+		"────────────────────────────────────────\n"+
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)\n")
 	oldBuild := buildSessionProviderByName
 	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
 		return fakeProvider, nil
