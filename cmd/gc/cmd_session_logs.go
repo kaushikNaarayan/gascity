@@ -107,7 +107,7 @@ func cmdSessionLogs(args []string, follow bool, tail int, jsonOutput bool, stdou
 	if jsonOutput {
 		return doSessionLogsJSON(path, provider, identifier, follow, tail, stdout, stderr)
 	}
-	return doSessionLogs(path, provider, follow, tail, stdout, stderr)
+	return doSessionLogs(path, provider, identifier, follow, tail, stdout, stderr)
 }
 
 func resolveSessionLogPath(searchPaths []string, logCtx sessionLogContext) string {
@@ -128,6 +128,11 @@ type sessionLogContext struct {
 	sessionKey string
 	provider   string
 	createdAt  time.Time
+	// reusedIdentity is true when this session's template is a pool agent
+	// whose work_dir is shared across every concrete instance that has ever
+	// occupied the slot -- see templateReusesWorkDirAcrossInstances
+	// (gcf-evp4 AC2).
+	reusedIdentity bool
 }
 
 func sessionLogPathFreshEnough(path string, sessionCreatedAt time.Time) bool {
@@ -208,7 +213,7 @@ func resolveConfiguredSessionLogContext(cityPath string, cfg *config.City, ident
 // The tail parameter specifies how many of the most recent log entries to
 // print (0 = all). Semantics match the conventional Unix `tail -n` flag:
 // `--tail 5` prints the LAST 5 entries of the transcript, not the first 5.
-func doSessionLogs(path, provider string, follow bool, tail int, stdout, stderr io.Writer) int {
+func doSessionLogs(path, provider, identifier string, follow bool, tail int, stdout, stderr io.Writer) int {
 	if tail < 0 {
 		fmt.Fprintln(stderr, "gc session logs: --tail must be >= 0") //nolint:errcheck // best-effort stderr
 		return 1
@@ -219,7 +224,23 @@ func doSessionLogs(path, provider string, follow bool, tail int, stdout, stderr 
 		return 1
 	}
 
+	printSessionLogAttribution(path, identifier, stderr)
 	return runSessionLogs(factory, provider, path, follow, tail, stdout, stderr, time.Sleep, readSessionFile)
+}
+
+// printSessionLogAttribution prints, to stderr so it never mixes into
+// parseable stdout content, which session was asked for and when the served
+// transcript file was last written -- so a reader can see at a glance
+// whether the content in front of them could possibly belong to the session
+// they asked about (gcf-evp4 AC4). Best-effort: a stat failure is silent
+// here, not fatal -- the read that follows will surface its own error.
+func printSessionLogAttribution(path, identifier string, stderr io.Writer) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(stderr, "gc session logs: %s -> %s (transcript last written %s)\n", //nolint:errcheck // best-effort stderr
+		identifier, path, info.ModTime().UTC().Format(time.RFC3339))
 }
 
 type sessionLogsReader func(factory *worker.Factory, provider, path string) (*worker.TranscriptSession, error)

@@ -89,7 +89,7 @@ func TestDoSessionLogsBasic(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -137,7 +137,7 @@ func TestDoSessionLogsTailReturnsLastNEntries(t *testing.T) {
 
 	// --tail 2 must return the LAST 2 entries: "third" + "reply-3".
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 2, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 2, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -185,7 +185,7 @@ func TestDoSessionLogsTailIgnoresCompactBoundaries(t *testing.T) {
 	// --tail 1 should print exactly the last entry ("reply2"), not "the last
 	// compaction segment."
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 1, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 1, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -204,7 +204,7 @@ func TestDoSessionLogsTailIgnoresCompactBoundaries(t *testing.T) {
 	// dividers.
 	stdout.Reset()
 	stderr.Reset()
-	code = doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code = doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("tail=0 code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -232,7 +232,7 @@ func TestDoSessionLogsToolUse(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -262,7 +262,7 @@ func TestDoSessionLogsStringEncodedMessage(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -287,7 +287,7 @@ func TestDoSessionLogsToolResultError(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -336,7 +336,7 @@ func TestDoSessionLogsTailNeverRendersEmpty(t *testing.T) {
 
 			// --tail 1 lands entirely on the non-rendering last entry.
 			var stdout, stderr bytes.Buffer
-			code := doSessionLogs(path, "", false, 1, &stdout, &stderr)
+			code := doSessionLogs(path, "", "test-session", false, 1, &stdout, &stderr)
 			if code != 0 {
 				t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 			}
@@ -680,7 +680,7 @@ func TestCanFallbackStoredSessionLogByWorkDirIgnoresAsleepPeersForLiveTarget(t *
 
 func TestDoSessionLogsNegativeTail(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs("/nonexistent", "", false, -1, &stdout, &stderr)
+	code := doSessionLogs("/nonexistent", "", "test-session", false, -1, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 for negative tail", code)
 	}
@@ -952,7 +952,7 @@ func TestPrintLogEntryTimestamp(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doSessionLogs(path, "", false, 0, &stdout, &stderr)
+	code := doSessionLogs(path, "", "test-session", false, 0, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}

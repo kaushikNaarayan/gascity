@@ -92,15 +92,44 @@ func resolveSessionLogContext(cityPath string, cfg *config.City, sessFront *sess
 		provider = strings.TrimSpace(info.Provider)
 	}
 	return sessionLogContext{
-		sessionID:  sessionID,
-		workDir:    workDir,
-		sessionKey: strings.TrimSpace(info.SessionKey),
-		provider:   provider,
-		createdAt:  info.CreatedAt,
+		sessionID:      sessionID,
+		workDir:        workDir,
+		sessionKey:     strings.TrimSpace(info.SessionKey),
+		provider:       provider,
+		createdAt:      info.CreatedAt,
+		reusedIdentity: templateReusesWorkDirAcrossInstances(cfg, info.Template),
 	}, true
 }
 
+// templateReusesWorkDirAcrossInstances reports whether template names a pool
+// agent (SupportsInstanceExpansion): its concrete instances share the same
+// physical work_dir across every incarnation at the same identity slot
+// (gastown.furiosa, gastown.rictus, ...), so a workdir-only transcript scan
+// cannot distinguish the CURRENT occupant's file from a prior one left behind
+// at the same path (gcf-evp4 AC2).
+func templateReusesWorkDirAcrossInstances(cfg *config.City, template string) bool {
+	if cfg == nil || strings.TrimSpace(template) == "" {
+		return false
+	}
+	for i := range cfg.Agents {
+		if cfg.Agents[i].QualifiedName() == template {
+			return cfg.Agents[i].SupportsInstanceExpansion()
+		}
+	}
+	return false
+}
+
 func canFallbackStoredSessionLogByWorkDir(sessFront *sessionpkg.Store, logCtx sessionLogContext) bool {
+	if logCtx.reusedIdentity {
+		// A pool identity's work_dir is reused across every concrete instance
+		// that has ever occupied that slot. The workdir-wide "most recent
+		// .jsonl" scan (findSlugSessionFileForCandidates) has no way to tell
+		// the current session's file from a prior occupant's leftover one, so
+		// for these identities ONLY the exact session-ID-keyed lookup
+		// (already tried above) may be trusted. Fail closed rather than risk
+		// serving a stranger's transcript as this session's own (gcf-evp4).
+		return false
+	}
 	if !sessFront.Backed() || strings.TrimSpace(logCtx.sessionID) == "" || strings.TrimSpace(logCtx.workDir) == "" {
 		return false
 	}
