@@ -129,10 +129,15 @@ pr_fallback() {
     echo "base_branch is protected — opening a PR instead of a direct push"
     FEATURE_BRANCH="polecat/${WORK_BEAD_ID}"
     git push origin "HEAD:refs/heads/${FEATURE_BRANCH}"
-    PR_URL=$(gh pr create --base {{base_branch}} --head "$FEATURE_BRANCH" \
+    # `gh pr create` writes the created PR URL to stdout. Unlike `gh pr view`,
+    # it does not support --json or -q; keep this command to its documented
+    # create flags so the fallback works with the workspace's installed gh.
+    if ! PR_URL=$(gh pr create --base {{base_branch}} --head "$FEATURE_BRANCH" \
         --title "${WORK_BEAD_ID}: $(git log -1 --format=%s)" \
         --body "Landed by polecat for ${WORK_BEAD_ID}. base_branch is protected; direct push was rejected." \
-        --json url -q .url)
+    ); then
+        PR_URL=""
+    fi
     if [ -z "$PR_URL" ]; then
         echo "PR creation failed" >&2
         gc mail send {{escalation_target}} -s "HELP: protected {{base_branch}}, PR creation failed" \

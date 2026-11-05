@@ -250,6 +250,12 @@ func TestMolPolecatCommitFallsBackToPRWhenBaseBranchIsProtected(t *testing.T) {
 		t.Fatal("could not locate the end of pr_fallback()'s body")
 	}
 	fallbackBody := step[fallbackAt : fallbackAt+bodyEnd]
+	if strings.Contains(fallbackBody, "--json url") || strings.Contains(fallbackBody, "-q .url") {
+		t.Error("pr_fallback must not pass --json/-q to `gh pr create`: gh create emits the PR URL on stdout and rejects those view-only flags")
+	}
+	if !strings.Contains(fallbackBody, "if ! PR_URL=$(gh pr create") {
+		t.Error("pr_fallback must capture the supported stdout URL and detect gh pr create failure")
+	}
 	closeAt := strings.Index(fallbackBody, "gc bd close")
 	exitAt := strings.Index(fallbackBody, "exit 0")
 	if closeAt >= 0 && (exitAt < 0 || closeAt < exitAt) {
@@ -257,5 +263,17 @@ func TestMolPolecatCommitFallsBackToPRWhenBaseBranchIsProtected(t *testing.T) {
 	}
 	if !strings.Contains(fallbackBody, "Left OPEN pending merge") && !strings.Contains(fallbackBody, `pr_url=`) {
 		t.Error("pr_fallback must record the PR URL as bead metadata so a strand is discoverable from the bead, per gcf-q5e8 AC3")
+	}
+	if !strings.Contains(fallbackBody, "PR creation failed") || !strings.Contains(fallbackBody, "exit 1") {
+		t.Error("a failed PR create must leave the bead open with a distinct diagnostic, not continue toward close")
+	}
+
+	// Negative control: direct push remains the normal path. The PR fallback
+	// may only be reached from a verified protected-branch rejection, never
+	// from an ordinary push failure or a successful unprotected push.
+	protectedAt := strings.Index(step, "if is_protected_rejection \"$PUSH_LOG\"; then")
+	callAt := strings.Index(step, "        pr_fallback")
+	if protectedAt < 0 || callAt < 0 || callAt < protectedAt {
+		t.Error("only a protected-branch rejection may invoke pr_fallback; unprotected branches must retain direct push")
 	}
 }
