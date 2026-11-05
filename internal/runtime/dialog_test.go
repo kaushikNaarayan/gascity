@@ -1345,7 +1345,7 @@ func TestPollsUntilDialogAppears(t *testing.T) {
 			if n < 3 {
 				return "starting up...", nil
 			}
-			return "Quick safety check\ntrust this folder", nil
+			return "Quick safety check\n❯ Yes, I trust this folder\n  No, exit", nil
 		},
 		func(...string) error {
 			return nil

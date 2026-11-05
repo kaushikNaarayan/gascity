@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,11 @@ func AcceptStartupDialogsFromStreamWithStatus(
 		return observed, err
 	}
 	phaseObserved, err = acceptWorkspaceTrustDialogFromStream(ctx, timeout, stream, trackingSendKeys)
+	if errors.Is(err, errStartupDialogStreamInconclusive) {
+		// The trust dialog is up and needs a selection move. Report the stream
+		// as inconclusive so the caller answers it with peeks.
+		return false, nil
+	}
 	if err != nil {
 		return observed, fmt.Errorf("workspace trust dialog: %w", err)
 	}
@@ -442,11 +448,42 @@ func containsPostUpdateStartupDialog(content string) bool {
 		ContainsRateLimitDialog(content)
 }
 
+// maxTrustDialogMoveAttempts bounds how many times the workspace-trust
+// handler moves the selection and re-reads the dialog before giving up. Each
+// attempt derives the movement from the frame actually on screen, so a dropped
+// keystroke is corrected by the next attempt; running out means the cursor
+// never reached the trust row and the dialog is left unconfirmed.
+const maxTrustDialogMoveAttempts = 3
+
+// ErrWorkspaceTrustUnconfirmed reports that a workspace-trust dialog was left
+// on screen because no frame ever showed the cursor on the trust row. The
+// handler returns it rather than pressing Enter on whatever is selected, which
+// could be "No, exit" (gcf-txw2g: a bare Enter killed every fresh pool session).
+var ErrWorkspaceTrustUnconfirmed = errors.New("cursor never reached the trust option; left the dialog unconfirmed")
+
+// errStartupDialogStreamInconclusive reports that a stream handler found a
+// dialog whose selection must move before it can be confirmed. A snapshot
+// stream cannot be re-read on demand (frames lag, Claude's trust cursor wraps
+// and it re-renders right after first paint), so the stream handler sends
+// nothing and the caller falls back to synchronous peeks, which run the closed
+// loop in acceptWorkspaceTrustDialog.
+var errStartupDialogStreamInconclusive = errors.New("startup dialog needs a selection move; stream cannot re-read the screen")
+
 // acceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
 // agents. Claude shows "Quick safety check"; Codex shows
 // "Do you trust the contents of this directory?"; pi (>= 0.79) shows
-// "Trust project folder?". In all cases the safe continue option is
-// pre-selected, so Enter accepts.
+// "Trust project folder?". The safe option is NOT reliably pre-selected -
+// current Claude Code defaults the cursor to "No, exit" - so the handler
+// locates the cursor and the trust option in the rendered content and moves the
+// selection before confirming; it never blind-sends Enter. When it cannot
+// locate both rows it sends nothing and keeps polling until the timeout.
+//
+// Selection and confirmation are a closed loop: movement keys are sent alone,
+// the pane is re-read, and Enter is sent only from a frame whose cursor is on
+// the trust row, and only once that row has held on two consecutive frames (a
+// late move, or the re-render that resets Claude's cursor after first paint,
+// must not land between the frame and the Enter). Moves are bounded by
+// maxTrustDialogMoveAttempts.
 func acceptWorkspaceTrustDialog(
 	ctx context.Context,
 	timeout time.Duration,
@@ -454,6 +491,8 @@ func acceptWorkspaceTrustDialog(
 	sendKeys func(keys ...string) error,
 ) error {
 	deadline := time.Now().Add(timeout)
+	moves := 0
+	trustFrames := 0 // consecutive frames showing the cursor on the trust row
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -465,12 +504,33 @@ func acceptWorkspaceTrustDialog(
 		}
 
 		if containsWorkspaceTrustDialog(content) {
-			if err := sendKeys("Enter"); err != nil {
-				return err
+			if keys, ok := workspaceTrustConfirmKeys(content); ok {
+				if len(keys) > 1 {
+					trustFrames = 0
+					moves++
+					if moves > maxTrustDialogMoveAttempts {
+						return fmt.Errorf("%w after %d selection moves", ErrWorkspaceTrustUnconfirmed, maxTrustDialogMoveAttempts)
+					}
+					if err := sendKeys(keys[:len(keys)-1]...); err != nil {
+						return err
+					}
+					sleep(ctx, startupDialogAcceptDelay)
+					continue
+				}
+				trustFrames++
+				if trustFrames < 2 {
+					sleep(ctx, startupDialogAcceptDelay)
+					continue
+				}
+				if err := sendKeys(keys...); err != nil {
+					return err
+				}
+				sleep(ctx, startupDialogAcceptDelay)
+				return nil
 			}
-			sleep(ctx, startupDialogAcceptDelay)
-			return nil
 		}
+
+		trustFrames = 0
 
 		if containsPromptIndicator(content) {
 			return nil
@@ -497,11 +557,14 @@ func acceptWorkspaceTrustDialogFromStream(
 	sendKeys func(keys ...string) error,
 ) (bool, error) {
 	return acceptDialogFromStream(ctx, timeout, snapshots, sendKeys, streamDialogSpec{
-		match:       containsWorkspaceTrustDialog,
-		matchKeys:   []string{"Enter"},
-		matchDelay:  startupDialogAcceptDelay,
-		ready:       containsPromptIndicator,
-		readyOrNext: containsPostTrustStartupDialog,
+		match:        containsWorkspaceTrustDialog,
+		matchKeysFor: workspaceTrustConfirmKeys,
+		matchDelay:   startupDialogAcceptDelay,
+		ready:        containsPromptIndicator,
+		readyOrNext:  containsPostTrustStartupDialog,
+		// When the selection has to move, the stream hands off to synchronous
+		// peeks, which run the closed loop (errStartupDialogStreamInconclusive).
+		confirmOnlyFromSelectedFrame: true,
 	})
 }
 
@@ -511,6 +574,152 @@ func containsWorkspaceTrustDialog(content string) bool {
 		strings.Contains(content, "Do you trust the contents of this directory?") ||
 		strings.Contains(content, "Do you trust the files in this folder?") ||
 		strings.Contains(content, "Trust project folder?")
+}
+
+// trustDialogLayout describes how one coding agent renders its
+// workspace-trust confirmation as a cursor-selectable option list: the
+// marker glyphs that can mark the selected row, and how to recognize the
+// row whose label is the safe "trust this workspace" option.
+type trustDialogLayout struct {
+	markers    []string
+	isTrustRow func(label string) bool
+}
+
+var claudeTrustDialogLayout = trustDialogLayout{
+	// Only "❯": a bare ">" is the most common false cursor in terminal
+	// scrollback (shell prompts, quoted text, diff context), and the real
+	// captured pane uses "❯".
+	markers: []string{"❯"},
+	isTrustRow: func(label string) bool {
+		return strings.Contains(strings.ToLower(label), "trust this folder") && !strings.HasPrefix(label, "No")
+	},
+}
+
+var geminiTrustDialogLayout = trustDialogLayout{
+	markers: []string{"●"},
+	isTrustRow: func(label string) bool {
+		return strings.Contains(strings.ToLower(label), "trust folder")
+	},
+}
+
+var piTrustDialogLayout = trustDialogLayout{
+	markers: []string{"→"},
+	isTrustRow: func(label string) bool {
+		return strings.EqualFold(strings.TrimSpace(label), "Trust")
+	},
+}
+
+// workspaceTrustConfirmKeys locates the cursor row and the safe trust
+// option in a rendered workspace-trust dialog and returns the keys that
+// move the selection onto that option and confirm it. Claude, Gemini, and
+// pi each render the confirmation as a cursor-navigable option list, but
+// with their own marker glyph and label wording (Claude: "❯"/"trust this
+// folder"; Gemini: "●"/"trust folder"; pi: "→"/"Trust"), so which layout to
+// scan with is chosen by which question text matched. Codex's trust prompt
+// has no rendered option list at all, so it's answered unconditionally —
+// there is no wrong selection to guard against.
+//
+// For the list-style layouts, it reports ok=false when the cursor or the
+// trust row can't be located — a layout still mid-render, or one none of
+// the known layouts match — so the caller sends nothing rather than
+// guessing: a fixed key sequence would confirm whichever option happens to
+// be pre-selected, including a "don't trust" option (the original bug, for
+// Claude).
+func workspaceTrustConfirmKeys(content string) ([]string, bool) {
+	switch {
+	case strings.Contains(content, "trust this folder") || strings.Contains(content, "Quick safety check"):
+		// "Quick safety check" is the dialog's header line, so it anchors the
+		// scan above every option row. "trust this folder" is itself an option
+		// label, so it only anchors when the header isn't rendered.
+		question := "Quick safety check"
+		if !strings.Contains(content, question) {
+			question = "trust this folder"
+		}
+		return deriveTrustDialogKeys(content, question, claudeTrustDialogLayout)
+	case strings.Contains(content, "Do you trust the files in this folder?"):
+		return deriveTrustDialogKeys(content, "Do you trust the files in this folder?", geminiTrustDialogLayout)
+	case strings.Contains(content, "Trust project folder?"):
+		return deriveTrustDialogKeys(content, "Trust project folder?", piTrustDialogLayout)
+	case strings.Contains(content, "Do you trust the contents of this directory?"):
+		return []string{"Enter"}, true
+	default:
+		return nil, false
+	}
+}
+
+// deriveTrustDialogKeys locates the cursor row and the trust row in a
+// rendered option-list trust dialog and returns the keys that move the
+// selection onto the trust row and confirm it. question is the literal that
+// identified the dialog; the scan is scoped to the dialog itself so
+// scrollback can't supply a false cursor row.
+func deriveTrustDialogKeys(content, question string, layout trustDialogLayout) ([]string, bool) {
+	content = trustDialogWindow(content, question)
+	lines := strings.Split(content, "\n")
+	cutset := strings.Join(layout.markers, "") + " "
+
+	cursorIdx, trustIdx := -1, -1
+	for i, line := range lines {
+		// Strip a leading box-drawing border the same way
+		// containsPromptIndicator does, so a trust dialog a TUI renders inside
+		// a bordered box ("│ ❯ Yes, I trust this folder") still yields both a
+		// cursor row and a label instead of no keys at all.
+		trimmed := stripLeadingBoxBorder(strings.TrimSpace(line))
+		if trimmed == "" {
+			continue
+		}
+
+		if cursorIdx == -1 {
+			for _, marker := range layout.markers {
+				if strings.HasPrefix(trimmed, marker) {
+					cursorIdx = i
+					break
+				}
+			}
+		}
+
+		if trustIdx == -1 {
+			label := strings.TrimSpace(strings.TrimLeft(trimmed, cutset))
+			if layout.isTrustRow(label) {
+				trustIdx = i
+			}
+		}
+	}
+
+	if cursorIdx == -1 || trustIdx == -1 {
+		return nil, false
+	}
+
+	switch delta := trustIdx - cursorIdx; {
+	case delta > 0:
+		keys := make([]string, 0, delta+1)
+		for i := 0; i < delta; i++ {
+			keys = append(keys, "Down")
+		}
+		return append(keys, "Enter"), true
+	case delta < 0:
+		keys := make([]string, 0, -delta+1)
+		for i := 0; i < -delta; i++ {
+			keys = append(keys, "Up")
+		}
+		return append(keys, "Enter"), true
+	default:
+		return []string{"Enter"}, true
+	}
+}
+
+// trustDialogWindow narrows content to the rendered dialog by starting at the
+// line carrying the last occurrence of question. peek returns the whole pane
+// (capture-pane -S -120), so index 0 is up to 120 lines of scrollback above
+// the dialog, any of which could otherwise be mistaken for the cursor row.
+func trustDialogWindow(content, question string) string {
+	i := strings.LastIndex(content, question)
+	if i < 0 {
+		return content
+	}
+	if start := strings.LastIndexByte(content[:i], '\n'); start >= 0 {
+		return content[start+1:]
+	}
+	return content
 }
 
 func containsPostTrustStartupDialog(content string) bool {
@@ -1036,7 +1245,18 @@ type streamDialogSpec struct {
 	ready       func(string) bool
 	readyOrNext func(string) bool
 	matchKeys   []string
-	matchDelay  time.Duration
+	// matchKeysFor, when set, computes the keys to send from the matched
+	// content instead of using the static matchKeys (e.g. the cursor movement
+	// a dialog needs when its safe option is not pre-selected). A false second
+	// return means the content matched but the correct keys could not be
+	// determined: nothing is sent for that snapshot rather than guessing.
+	matchKeysFor func(string) ([]string, bool)
+	// confirmOnlyFromSelectedFrame limits the stream to single-key matches: a
+	// match whose keys move the selection returns
+	// errStartupDialogStreamInconclusive and sends nothing, so the caller
+	// answers it with synchronous peeks.
+	confirmOnlyFromSelectedFrame bool
+	matchDelay                   time.Duration
 }
 
 type replayableSnapshotStream struct {
@@ -1173,8 +1393,17 @@ func acceptDialogFromStream(
 		if len(history) > 0 {
 			for idx, content := range history {
 				if spec.match != nil && spec.match(content) {
-					snapshots.replay(history[idx+1:])
-					return true, sendDialogKeys(ctx, sendKeys, spec.matchKeys, spec.matchDelay)
+					keys, ok := spec.matchKeys, true
+					if spec.matchKeysFor != nil {
+						keys, ok = spec.matchKeysFor(content)
+					}
+					if ok && spec.confirmOnlyFromSelectedFrame && len(keys) > 1 {
+						return true, errStartupDialogStreamInconclusive
+					}
+					if ok {
+						snapshots.replay(history[idx+1:])
+						return true, sendDialogKeys(ctx, sendKeys, keys, spec.matchDelay)
+					}
 				}
 				if spec.readyOrNext != nil && spec.readyOrNext(content) {
 					snapshots.replay(history[idx:])
