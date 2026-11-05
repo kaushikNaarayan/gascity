@@ -79,6 +79,8 @@ jobs:
         run: go vet ./...
       - name: cipolicy — CI execution hash must match workflow reality
         run: go test ./scripts/cipolicy/... -count=1 -v
+      - name: Release guard — release.yml must fail when VERSIONS GC_VERSION != tag (gcf-fag5s)
+        run: bash scripts/test-release-versions-guard.sh
       - name: Unit tests — cross-store work delivery
         run: go test ./cmd/gc/ -run 'TestFilterAssignedWorkBeads|TestAssignedWork|TestFirstStoreWithWork|TestCrossStoreClaimDir|TestRunBDForBead|TestGateOpenWorkBounded|TestCrossStorePipeline' -count=1 -v
       - name: Unit tests — cross-store reachability predicate + fail-loud guard
