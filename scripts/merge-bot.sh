@@ -7,6 +7,12 @@
 #     into that branch and moves its head past its qa sha; it waits for retarget)
 #   - carries label qa:pass
 #   - the newest qa comment "qa:pass sha=<40 hex>" names the CURRENT head sha
+#   - no open qa reject: every "qa:reject <sha>" / "NEEDS-FIX" comment must be named by a
+#     LATER qa:pass comment saying "clears qa:reject <sha|comment-url>" (also "clears
+#     NEEDS-FIX <ref>"), regardless of which sha the reject was on. A sha ref matches by
+#     prefix (>= 7 hex); a comment-url ref matches the reject comment's url. A pass that
+#     does not name a standing reject does not clear it. Comments starting "merge-bot:"
+#     are the bot's own and never count as rejects.
 #   - mergeStateStatus is CLEAN
 #   - no label starting with hold:
 #   - now is outside every window in the freeze file
@@ -99,10 +105,31 @@ in_freeze() {
     return 1
 }
 
+# OPEN_REJECTS_JQ: reads a PR json, prints the labels of qa:reject / NEEDS-FIX comments not named
+# by a later qa:pass comment (a sha label is the first 7 hex; a reject with no sha is labelled by
+# its comment url, or "unnamed"). Comments are in time order, as gh returns them.
+OPEN_REJECTS_JQ='
+def hexref: "(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])";
+def ispass: test("qa:pass sha=[0-9a-f]{40}(?![0-9A-Za-z])");
+def matches($ref): . as $r
+    | ($r.url != "" and $r.url == $ref)
+    | . or ($r.sha != "" and ($ref | test("^[0-9a-f]{7,40}$"))
+            and (($r.sha | startswith($ref)) or ($ref | startswith($r.sha))));
+reduce (.comments // [])[] as $c ([];
+    ($c.body // "") as $b | ($c.url // "") as $u
+    | if ($b | startswith("merge-bot:")) then .
+      elif ($b | ispass) then
+        ([$b | scan("(?i)clears[[:space:]]+(?:qa:reject|needs-fix)[[:space:]:]+([^[:space:]]+)") | .[0]]) as $refs
+        | map(select(. as $r | any($refs[]; . as $ref | $r | matches($ref)) | not))
+      elif ($b | test("qa:reject|needs-fix"; "i")) then
+        . + [{sha: ($b | [match(hexref; "g").string] | first // ""), url: $u}]
+      else . end)
+| .[] | if .sha != "" then .sha[0:7] elif .url != "" then .url else "unnamed" end'
+
 # decide PR_JSON FREEZE_FILE NOW_EPOCH DEFAULT_BRANCH: print "merge" or "skip <reason>".
 # An empty DEFAULT_BRANCH fails closed (skip default-branch-unknown).
 decide() {
-    local pr="$1" freeze="$2" now="$3" default="${4:-}" head qa_sha rc
+    local pr="$1" freeze="$2" now="$3" default="${4:-}" head qa_sha rc open_reject
     if [ "$(jq -r '.state' "$pr")" != "OPEN" ]; then echo "skip not-open"; return; fi
     if [ "$(jq -r '.isDraft' "$pr")" = "true" ]; then echo "skip draft"; return; fi
     if [ -z "$default" ]; then echo "skip default-branch-unknown"; return; fi
@@ -113,6 +140,8 @@ decide() {
     if jq -e '.labels | map(.name | ascii_downcase) | any(startswith("hold:"))' "$pr" >/dev/null; then
         echo "skip hold-label"; return
     fi
+    open_reject=$(jq -r "$OPEN_REJECTS_JQ" "$pr" | head -1)
+    if [ -n "$open_reject" ]; then echo "skip open-qa-reject:$open_reject"; return; fi
     head=$(jq -r '.headRefOid' "$pr")
     qa_sha=$(jq -r '[.comments[].body
         | capture("qa:pass sha=(?<sha>[0-9a-f]{40})(?![0-9A-Za-z])"; "g")?
@@ -137,6 +166,18 @@ announce() {
         (cd "$MERGE_BOT_CITY" && gc bd comments add "$bead" "merge-bot: $repo#$pr merged as $sha") >/dev/null \
             || log "WARN $repo#$pr bead-comment-failed bead=$bead"
     fi
+}
+
+# announce_block REPO PR LABEL PR_JSON: comment once per reject that merge-bot is blocked on it.
+announce_block() {
+    local repo="$1" pr="$2" label="$3" json="$4" prefix
+    prefix="merge-bot: blocked, open qa:reject $label "
+    if jq -e --arg p "$prefix" '[(.comments // [])[].body // "" | startswith($p)] | any' "$json" >/dev/null; then
+        return 0
+    fi
+    gh pr comment "$pr" --repo "$repo" \
+        --body "${prefix}not cleared by a later qa:pass. A qa:pass must say 'clears qa:reject <sha|comment-url>' for every standing reject / NEEDS-FIX." >/dev/null \
+        || log "WARN $repo#$pr block-comment-failed reject=$label"
 }
 
 # decide_fresh REPO N PR_JSON FREEZE NOW DEFAULT_BRANCH: view the PR into PR_JSON and decide. A PR GitHub
@@ -202,6 +243,10 @@ run_pass() {
             else
                 log "$repo#$n $verdict"
             fi
+            case "$verdict" in
+                "skip open-qa-reject:"*)
+                    [ -n "${MERGE_BOT_DRY_RUN:-}" ] || announce_block "$repo" "$n" "${verdict#skip open-qa-reject:}" "$tmp/pr.json" ;;
+            esac
             [ "$verdict" = merge ] || continue
             [ -z "${MERGE_BOT_DRY_RUN:-}" ] || continue
             if ! g=$(gate); then

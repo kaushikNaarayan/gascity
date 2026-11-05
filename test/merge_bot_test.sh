@@ -280,4 +280,75 @@ if [ "$(merges "$TMP/stk")" = 0 ] \
     pass "stacked PR is not merged and the skip is logged"
 else fail "stacked PR pass: merges=$(merges "$TMP/stk")"; fi
 
+# --- gcf-klozm: an open qa:reject / NEEDS-FIX blocks until a LATER qa:pass names it -----------------------
+REJ="${OLD:0:7}"       # a reject sha, short form
+PASS="qa:pass sha=$HEAD"
+RURL="https://github.com/o/r/pull/1#issuecomment-111"
+# cm BODY [URL]: one comment object
+cm() { jq -nc --arg b "$1" --arg u "${2:-}" '{body:$b,url:$u}'; }
+# rejcase NAME COMMENT...: PR with qa:pass label, head HEAD, the given comments in time order
+rejcase() { local n="$1"; shift; pr2 "$n" "$QA" "$(printf '%s\n' "$@" | jq -sc .)"; }
+BLK="skip open-qa-reject"
+
+rejcase rj-none "$(cm "$PASS")"
+expect rj-none merge
+rejcase rj-blocked "$(cm "qa:reject $REJ fixtures RED" "$RURL")" "$(cm "$PASS")"
+expect rj-blocked "$BLK:$REJ"
+rejcase rj-clears-sha "$(cm "qa:reject $REJ fixtures RED" "$RURL")" "$(cm "$PASS clears qa:reject $REJ")"
+expect rj-clears-sha merge
+rejcase rj-clears-url "$(cm "qa:reject $REJ fixtures RED" "$RURL")" "$(cm "$PASS clears qa:reject $RURL")"
+expect rj-clears-url merge
+# reject on an older sha, pass on the new head clears it by naming it
+rejcase rj-old-cleared "$(cm "qa:reject ${OLD}")" "$(cm "$PASS clears qa:reject $OLD")"
+expect rj-old-cleared merge
+# a pass BEFORE the reject does not clear it, even if it names it
+rejcase rj-pass-first "$(cm "$PASS clears qa:reject $REJ")" "$(cm "qa:reject $REJ again")" "$(cm "$PASS")"
+expect rj-pass-first "$BLK:$REJ"
+# wrong sha named -> still blocked
+rejcase rj-wrong "$(cm "qa:reject $REJ")" "$(cm "$PASS clears qa:reject ccccccc")"
+expect rj-wrong "$BLK:$REJ"
+# NEEDS-FIX, with and without a sha; case-insensitive
+rejcase rj-nf "$(cm "NEEDS-FIX: tests broken $REJ")" "$(cm "$PASS")"
+expect rj-nf "$BLK:$REJ"
+rejcase rj-nf-clear "$(cm "NEEDS-FIX: tests broken $REJ")" "$(cm "$PASS clears NEEDS-FIX $REJ")"
+expect rj-nf-clear merge
+rejcase rj-nf-nosha "$(cm "needs-fix: see thread" "$RURL")" "$(cm "$PASS")"
+expect rj-nf-nosha "$BLK:$RURL"
+rejcase rj-nf-nosha-clear "$(cm "needs-fix: see thread" "$RURL")" "$(cm "$PASS clears qa:reject $RURL")"
+expect rj-nf-nosha-clear merge
+# two qa seats: seat B rejects after seat A passes; seat A's earlier pass does not clear it
+rejcase rj-two-seats "$(cm "$PASS")" "$(cm "qa:reject $REJ" )" "$(cm "$PASS")"
+expect rj-two-seats "$BLK:$REJ"
+# two standing rejects: clearing one is not enough; clearing both merges
+R2="${HEAD:0:7}"
+rejcase rj-two-open "$(cm "qa:reject $REJ")" "$(cm "qa:reject $R2")" "$(cm "$PASS clears qa:reject $REJ")"
+expect rj-two-open "$BLK:$R2"
+rejcase rj-two-clear "$(cm "qa:reject $REJ")" "$(cm "qa:reject $R2")" "$(cm "$PASS clears qa:reject $REJ clears qa:reject $R2")"
+expect rj-two-clear merge
+# a later reject after a clearing pass reopens the block
+rejcase rj-reopen "$(cm "qa:reject $REJ")" "$(cm "$PASS clears qa:reject $REJ")" "$(cm "qa:reject $REJ regression")"
+expect rj-reopen "$BLK:$REJ"
+# blocking is regardless of sha: a reject on the current head blocks too
+rejcase rj-head "$(cm "$PASS")" "$(cm "qa:reject ${HEAD}")" "$(cm "$PASS")"
+expect rj-head "$BLK:${HEAD:0:7}"
+
+# Full pass: a blocked PR is not merged, the block is logged and commented once (not every run).
+unk_env "$TMP/rjp" CLEAN
+jq --arg r "qa:reject $REJ" --arg p "$PASS" \
+    '.comments=[{body:$r,url:"u1"},{body:$p,url:"u2"}]' "$TMP/ok.json" >"$TMP/ok-rej.json"
+sed -i "s#$TMP/ok.json#$TMP/ok-rej.json#" "$TMP/rjp/bin/gh"
+run_unk "$TMP/rjp"
+if [ "$(merges "$TMP/rjp")" = 0 ] \
+    && grep -q "o/r#1 $BLK:$REJ" "$TMP/rjp/home/merge-bot.log" \
+    && grep -q "^gh pr comment 1 .*open qa:reject $REJ" "$TMP/rjp/calls"; then
+    pass "open reject: PR not merged, logged, PR comment names the reject"
+else fail "open reject pass: merges=$(merges "$TMP/rjp")"; fi
+jq --arg r "qa:reject $REJ" --arg p "$PASS" \
+    '.comments=[{body:$r,url:"u1"},{body:$p,url:"u2"},{body:"merge-bot: blocked, open qa:reject '"$REJ"' not cleared by a later qa:pass",url:"u3"}]' \
+    "$TMP/ok.json" >"$TMP/ok-rej2.json"
+sed -i "s#$TMP/ok-rej.json#$TMP/ok-rej2.json#" "$TMP/rjp/bin/gh"
+: >"$TMP/rjp/calls"; run_unk "$TMP/rjp"
+if ! grep -q '^gh pr comment' "$TMP/rjp/calls"; then pass "block comment is not repeated when already posted"
+else fail "block comment repeated"; fi
+
 exit "$FAILED"
