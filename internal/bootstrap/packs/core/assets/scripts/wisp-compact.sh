@@ -21,6 +21,12 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$__SCRIPT_DIR/_bd_trace.sh" "wisp-compact"
 
+# Run the whole compaction (and every gc/bd child it forks per wisp) at
+# background CPU and IO priority so it never competes with interactive agent
+# work. Best-effort: hosts without renice/ionice still run the compaction.
+renice -n 10 -p "$$" >/dev/null 2>&1 || true
+ionice -c3 -p "$$" >/dev/null 2>&1 || true
+
 CITY="${GC_CITY:-.}"
 
 # Get all ephemeral beads. `gc bd list --json` does not project the
