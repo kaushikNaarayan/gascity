@@ -2,6 +2,26 @@
 title: "Worktree Isolation Roadmap"
 ---
 
+> **Archived; the "Current state" and "What's already fixed" sections below
+> are out of date (checked against code 2026-11-05).** The functions and flag
+> they name (`createAgentWorktree`, `cleanupWorktrees`, `removeAgentWorktree`,
+> `setupBeadsRedirect`, `gc stop --clean`) no longer exist in the Go source.
+> `HasUncommittedWork` still exists as `(*Git).HasUncommittedWork`
+> (`internal/git/git.go`) and is the live-work probe the replacements below
+> call; only its old `gc stop --clean` call site is gone. Current replacements:
+>
+> | Concern | Where it lives now |
+> |---|---|
+> | Worktree creation | pack `pre_start` script `examples/lifecycle/packs/lifecycle/assets/scripts/worktree-setup.sh` |
+> | Per-bead cleanup | `reapClosedBeadWorktrees` (`cmd/gc/bead_worktree_reaper.go`) |
+> | Live-work guard | `cmd/gc/bead_worktree_liveness.go` |
+> | Agent-home cleanup | `cleanupClosedBeadAgentHomeWorktrees` (`cmd/gc/agent_home_worktree_cleanup.go`) |
+> | Session-end prune and `.worktree-stale` marker | `pruneAgentHomeWorktreeIfSafe` (`cmd/gc/session_worktree_prune.go`) |
+>
+> The roadmap checklist (Tutorial 03 through 05d) has not been re-verified
+> and should be read as historical. Treat this file as evidence, not as a
+> description of current behavior.
+
 ## Current state (what's implemented)
 
 Gas City has basic worktree isolation:
