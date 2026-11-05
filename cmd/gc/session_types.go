@@ -70,20 +70,29 @@ type idleProbeState struct {
 
 // drainTracker manages in-memory drain states for all sessions.
 type drainTracker struct {
-	mu               sync.Mutex
-	drains           map[string]*drainState     // session bead ID -> drain state
-	idleProbes       map[string]*idleProbeState // session bead ID -> async idle probe
-	resetStalls      map[string]bool            // session bead ID -> reset stall event emitted
-	suspendDeferrals map[string]int             // session bead ID -> consecutive ticks a named session has been suspend-drain-eligible with its spec absent (#3630)
-	idleProbeCursor  int
+	mu          sync.Mutex
+	drains      map[string]*drainState     // session bead ID -> drain state
+	idleProbes  map[string]*idleProbeState // session bead ID -> async idle probe
+	resetStalls map[string]bool            // session bead ID -> reset stall event emitted
+	// resetStallStreak counts consecutive reset-stall evaluations per session
+	// bead; resetStallEscalated marks beads already escalated this episode.
+	resetStallStreak    map[string]int
+	resetStallEscalated map[string]bool
+	// escalateResetStall is invoked once per stall episode, on the
+	// resetStallEscalateAfter-th consecutive stall. nil = event only.
+	escalateResetStall func(name, template, beadID string, stalls int)
+	suspendDeferrals   map[string]int // session bead ID -> consecutive ticks a named session has been suspend-drain-eligible with its spec absent (#3630)
+	idleProbeCursor    int
 }
 
 func newDrainTracker() *drainTracker {
 	return &drainTracker{
-		drains:           make(map[string]*drainState),
-		idleProbes:       make(map[string]*idleProbeState),
-		resetStalls:      make(map[string]bool),
-		suspendDeferrals: make(map[string]int),
+		drains:              make(map[string]*drainState),
+		idleProbes:          make(map[string]*idleProbeState),
+		resetStalls:         make(map[string]bool),
+		resetStallStreak:    make(map[string]int),
+		resetStallEscalated: make(map[string]bool),
+		suspendDeferrals:    make(map[string]int),
 	}
 }
 
@@ -236,10 +245,47 @@ func (dt *drainTracker) clearResetStall(beadID string) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 	delete(dt.resetStalls, beadID)
+	delete(dt.resetStallStreak, beadID)
+	delete(dt.resetStallEscalated, beadID)
+}
+
+// breakResetStallStreak ends a run of consecutive stall evaluations without
+// ending the episode: the dedup mark and the escalated flag stay until the
+// pending flag clears (clearResetStall).
+func (dt *drainTracker) breakResetStallStreak(beadID string) {
+	if dt == nil || strings.TrimSpace(beadID) == "" {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	delete(dt.resetStallStreak, beadID)
+}
+
+// noteResetStallEval counts one more consecutive stall evaluation and reports
+// the streak and whether this evaluation is the one that escalates: exactly the
+// resetStallEscalateAfter-th, once per episode.
+func (dt *drainTracker) noteResetStallEval(beadID string) (streak int, escalate bool) {
+	if dt == nil || strings.TrimSpace(beadID) == "" {
+		return 0, false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.resetStallStreak[beadID]++
+	streak = dt.resetStallStreak[beadID]
+	if streak >= resetStallEscalateAfter && !dt.resetStallEscalated[beadID] {
+		dt.resetStallEscalated[beadID] = true
+		return streak, true
+	}
+	return streak, false
 }
 
 // Reconciler tuning defaults.
 const (
+	// resetStallEscalateAfter is the number of consecutive reset-stall
+	// evaluations in one episode after which the stall is escalated once
+	// (gcf-09i).
+	resetStallEscalateAfter = 3
+
 	// stabilityThreshold is how long a session must survive after wake
 	// before it's considered stable (not a rapid exit / crash).
 	stabilityThreshold = 30 * time.Second

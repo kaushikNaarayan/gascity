@@ -200,6 +200,55 @@ func resetPendingCommittedAtInfo(info sessionpkg.Info) (string, time.Time, bool)
 	return raw, committedAt, true
 }
 
+// recordResetStallEscalation raises the one escalation per stall episode: a
+// second session.reset_stalled event whose message carries ESCALATION (same
+// payload shape, so no event-schema change) and, when the controller wired one,
+// a mail to the rig pm.
+func recordResetStallEscalation(
+	info sessionpkg.Info,
+	template, name, resetCommittedAt string,
+	elapsedSeconds, streak int,
+	dt *drainTracker,
+	rec events.Recorder,
+	stderr io.Writer,
+) {
+	msg := fmt.Sprintf(
+		"session reconciler: ESCALATION reset stalled %d consecutive evaluations for %s: elapsed_s=%d reset_committed_at=%s bead_id=%s",
+		streak, name, elapsedSeconds, resetCommittedAt, info.ID,
+	)
+	fmt.Fprintln(stderr, msg) //nolint:errcheck
+	if rec != nil {
+		rec.Record(events.Event{
+			Type:      events.SessionResetStalled,
+			Actor:     "gc",
+			Subject:   name,
+			Message:   msg,
+			SessionID: info.ID,
+			Payload:   events.SessionResetStalledPayloadJSON(name, template, resetCommittedAt, elapsedSeconds),
+		})
+	}
+	if dt != nil && dt.escalateResetStall != nil {
+		dt.escalateResetStall(name, template, info.ID, streak)
+	}
+}
+
+// clearResetStampForUndesiredSeat durably clears reset_committed_at on a seat
+// that is not desired to run and ends its stall episode. Only touches a seat
+// carrying a stamp; a failed write leaves everything as it was.
+func clearResetStampForUndesiredSeat(store beads.Store, info sessionpkg.Info, dt *drainTracker, stderr io.Writer) {
+	if store == nil || strings.TrimSpace(info.ResetCommittedAt) == "" {
+		dt.clearResetStall(info.ID)
+		return
+	}
+	if err := sessionFrontDoor(store).SetMarker(info.ID, sessionpkg.ResetCommittedAtKey, ""); err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: clearing %s for %s: %v\n", sessionpkg.ResetCommittedAtKey, info.SessionNameMetadata, err) //nolint:errcheck
+		}
+		return
+	}
+	dt.clearResetStall(info.ID)
+}
+
 func recordResetStallIfDue(
 	info sessionpkg.Info,
 	template string,
@@ -220,19 +269,28 @@ func recordResetStallIfDue(
 		return
 	}
 	if alive || startupTimeout <= 0 {
+		dt.breakResetStallStreak(info.ID)
 		return
 	}
 	elapsed := now.Sub(committedAt)
 	if elapsed <= startupTimeout {
+		dt.breakResetStallStreak(info.ID)
 		return
 	}
-	if dt != nil && !dt.markResetStall(info.ID) {
-		return
-	}
+	// gcf-09i: count every consecutive stall evaluation; the third in one
+	// episode escalates once (event + mail), then stays silent until the
+	// pending flag clears.
+	streak, escalate := dt.noteResetStallEval(info.ID)
 	if stderr == nil {
 		stderr = io.Discard
 	}
 	elapsedSeconds := int(elapsed / time.Second)
+	if escalate {
+		recordResetStallEscalation(info, template, name, resetCommittedAt, elapsedSeconds, streak, dt, rec, stderr)
+	}
+	if dt != nil && !dt.markResetStall(info.ID) {
+		return
+	}
 	msg := fmt.Sprintf(
 		"session reconciler: reset stalled for %s: elapsed_s=%d reset_committed_at=%s bead_id=%s",
 		name, elapsedSeconds, resetCommittedAt, info.ID,
@@ -1651,6 +1709,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		name := strings.TrimSpace(info.SessionNameMetadata)
 		tp, desired := desiredState[name]
+		desiredToRun := desired // gcf-09i: false for a seat kept open only by preserve-named
 		if shadowTick != nil {
 			// 3a: durable facts from the already-observed coherent typed Info (the
 			// priming + canonical mirrors are projected Info fields). The predicted
@@ -1972,6 +2031,9 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				default:
 					tp = preservedTP
 					desired = true
+					// Preserved only because its configured spec still exists: the
+					// seat is not in the desired set, so it is not desired to run.
+					desiredToRun = false
 				}
 				if trace != nil {
 					outcome := TraceOutcomeResolutionFailed
@@ -2235,7 +2297,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			shadowTick.captureRuntime(id, "observeRuntimeProviderLiveness", name, triFromBool(running), triFromBool(alive))
 		}
 		peek := cachedSessionPeek(cityPath, store, sp, cfg, id, tp.Hints.ProcessNames)
-		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		if desiredToRun {
+			recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		} else if !alive {
+			// gcf-09i: a seat that is not desired to run never starts, so
+			// CommitStartedPatch never wipes its reset stamp and the stall
+			// could never clear. Drop the stamp (and the episode state) so a
+			// later wake starts fresh.
+			clearResetStampForUndesiredSeat(store, infoByID[id], dt, stderr)
+		}
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one

@@ -524,6 +524,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// Initialize bead-driven drain tracker and provider-health gate when bead store is available.
 	if cr.cityBeadStore() != nil && cr.tomlPath != "" {
 		cr.sessionDrains = newDrainTracker()
+		cr.sessionDrains.escalateResetStall = cr.mailResetStallEscalation
 		cr.providerHealthGate = newProviderHealthGate()
 	}
 	if ctx.Err() != nil {
@@ -2475,6 +2476,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// Ensure drain tracker and provider-health gate are initialized when bead store becomes available.
 	if cr.cityBeadStore() != nil && cr.tomlPath != "" && cr.sessionDrains == nil {
 		cr.sessionDrains = newDrainTracker()
+		cr.sessionDrains.escalateResetStall = cr.mailResetStallEscalation
 		cr.providerHealthGate = newProviderHealthGate()
 	}
 	cr.watchTargets = config.WatchTargets(result.Prov, nextCfg, cityRoot)
@@ -4447,4 +4449,24 @@ func (cr *CityRuntime) preserveSessionsOnShutdown() {
 
 func (cr *CityRuntime) forceStopRequested() bool {
 	return cr != nil && cr.forceStopShutdown != nil && cr.forceStopShutdown.Load()
+}
+
+// resetStallEscalationRecipient is the rig pm that receives the one mail per
+// reset-stall episode (gcf-09i pm ruling: gascity pm, not mayor or human).
+const resetStallEscalationRecipient = "gascity/gascity-crew.pm"
+
+// mailResetStallEscalation mails the rig pm once per stall episode. Best
+// effort: a failure is logged and never blocks the reconcile tick.
+func (cr *CityRuntime) mailResetStallEscalation(name, template, beadID string, stalls int) {
+	store := cr.cityBeadStore()
+	if store == nil {
+		return
+	}
+	mp := newCityMailProvider(cr.storageRoutes, store, cr.cfg, cr.cityPath, cr.rec)
+	subject := fmt.Sprintf("reset stalled: %s (%d consecutive evaluations)", name, stalls)
+	body := fmt.Sprintf("Session %s (template %s, bead %s) has had its committed reset pending past startup_timeout for %d consecutive reconcile evaluations while desired to run.\n"+
+		"One mail per episode; silent until the stall clears. Inspect: gc session list, gc bd show %s.", name, template, beadID, stalls, beadID)
+	if _, err := mp.Send("gc", resetStallEscalationRecipient, subject, body); err != nil {
+		fmt.Fprintf(cr.stderr, "session reconciler: reset-stall escalation mail for %s: %v\n", name, err) //nolint:errcheck
+	}
 }
