@@ -333,11 +333,12 @@ override the defaults instead of editing steps.
 </Accordion>
 
 <Note>
-Orders are the exception: order TOML has no variable mechanism and
-`gc order run` has no `--var` flag
-([#1813](https://github.com/gastownhall/gascity/issues/1813)), so a formula
-with required variables cannot be dispatched by an order. Give every
-variable a default if the formula must run on a schedule.
+Orders are the exception: a scheduled order passes no variables when its
+trigger fires. You can supply them by hand with
+`gc order run <name> --var key=value` (repeatable), and an order can declare
+the arguments it accepts in an `[order.params]` table, marking some
+`required`. A scheduled run has none of these, so give every variable a
+default if the formula must run on a schedule.
 </Note>
 
 See [variables](/reference/specs/formula-spec-v2#14-variables) in the v2 spec.
