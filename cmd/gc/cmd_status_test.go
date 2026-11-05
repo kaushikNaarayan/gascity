@@ -473,3 +473,20 @@ func TestRouteRigStatus_APIStaleBanner(t *testing.T) {
 		t.Errorf("human output should include stale banner, got:\n%s", stdout.String())
 	}
 }
+
+func TestRigStatusAgentLineAlwaysSeparatesNameFromStatus(t *testing.T) {
+	tests := []struct {
+		name, agent, status, want string
+	}{
+		{"short name keeps 12-column alignment", "worker", "running", "    worker      running\n"},
+		{"exactly 12 chars still gets a gap", "dev.worker-1", "stopped", "    dev.worker-1 stopped\n"},
+		{"long name gets a gap", "my-api/core.control-dispatcher", "stopped", "    my-api/core.control-dispatcher stopped\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rigStatusAgentLine(tt.agent, tt.status); got != tt.want {
+				t.Errorf("rigStatusAgentLine(%q, %q) = %q, want %q", tt.agent, tt.status, got, tt.want)
+			}
+		})
+	}
+}
