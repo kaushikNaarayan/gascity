@@ -46,23 +46,57 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/bootstrap"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
 // vendorSinks maps an agent provider to the relative directory under the
 // agent's scope-root or session WorkDir where skills are materialized.
 //
-// Only the providers with verified skill-reading behavior are included.
-// The other providers recognized by hooks.go (copilot, cursor, pi, omp)
+// Each path is the project-scoped skills directory that the provider's own
+// CLI actually scans (a directory of <name>/SKILL.md), verified against
+// vendor docs (2026-06):
+//
+//	claude   → .claude/skills   (code.claude.com/docs/en/skills)
+//	codex    → .agents/skills   (developers.openai.com/codex/skills — Codex
+//	                             scans .agents/skills from cwd up to the repo
+//	                             root; it does NOT read a project-scoped
+//	                             .codex/skills, only ~/.codex for user state)
+//	gemini   → .gemini/skills   (github.com/google-gemini/gemini-cli docs/cli/skills.md)
+//	opencode → .opencode/skills (opencode.ai/docs/skills)
+//	mimocode → .mimocode/skills (mimo.xiaomi.com/mimocode/skills)
+//	pi       → .agents/skills   (pi docs/skills.md "Locations", verified
+//	                             against pi 0.84.2 — see below)
+//
+// pi is the one provider that shares another's sink. It scans two
+// project-scoped locations, .pi/skills and .agents/skills, and .agents/skills
+// is the correct target for three reasons:
+//
+//   - The only behavioral difference between them does not apply here. Both
+//     discover <name>/SKILL.md directories recursively; .pi/skills
+//     additionally discovers root .md files as individual skills, which this
+//     package never writes — it materializes exclusively as <name> symlinks
+//     to skill directories.
+//   - pi documents .agents/skills as the cross-harness location, and relaxes
+//     the Agent Skills name-matches-directory rule specifically because it is
+//     "suboptimal for shared skill directories used across multiple agent
+//     harnesses".
+//   - Materializing to a separate .pi/skills alongside a codex agent's
+//     .agents/skills would make pi scan both and hit its name-collision path
+//     ("warn and keep the first skill found") on every shared skill.
+//
+// The other providers recognized by hooks.go (copilot, cursor, omp)
 // intentionally have no entry — VendorSink returns ok=false so the caller
 // can log a single skip line per session.
 var vendorSinks = map[string]string{
 	"claude":   ".claude/skills",
-	"codex":    ".codex/skills",
+	"codex":    ".agents/skills",
 	"gemini":   ".gemini/skills",
 	"opencode": ".opencode/skills",
 	"mimocode": ".mimocode/skills",
+	"pi":       ".agents/skills",
 }
 
 // VendorSink returns the sink subdirectory for a provider, relative to
@@ -327,6 +361,23 @@ type Request struct {
 	// symlinks. Pass nil to skip legacy migration. Use LegacyStubNames()
 	// for the canonical list.
 	LegacyNames []string
+	// LegacyOwnedRoots lists RETIRED gc-managed source roots whose
+	// stranded symlinks the cleanup walk should still recognize as
+	// gc-owned: targets under them are gc's own leftover property, never
+	// user content. The motivating case is the .gc/system/packs
+	// projection retired by #3344 with a config-only migration —
+	// pre-manifest sink links pointing into it classify as "user-owned"
+	// under OwnedRoots+manifest alone and are skipped forever
+	// (hq-38je). Links under these roots are re-pointed when their name
+	// is desired and deleted only once dangling when undesired; a
+	// still-resolving legacy link for an undesired name is left alone.
+	// Use LegacyOwnedRootsFor for the canonical list. Pass nil to keep
+	// the historical behavior.
+	LegacyOwnedRoots []string
+	// DryRun computes the pass without touching the filesystem: no sink
+	// directory, symlink, removal, or ownership manifest. The Result
+	// reports what a real pass would do.
+	DryRun bool
 }
 
 // SkippedConflict records a name in the desired set that could not be
@@ -346,7 +397,7 @@ type SkippedConflict struct {
 // invocation. Lists are sorted for deterministic test/log output.
 type Result struct {
 	// Materialized is the list of names whose symlinks now point at the
-	// desired source (created or already correct).
+	// desired source (created or already correct); after a DryRun, would.
 	Materialized []string
 	// Skipped lists desired names that were not materialized because
 	// user content occupies the target path.
@@ -359,6 +410,12 @@ type Result struct {
 	// (typically I/O errors on individual entries). The pass continued
 	// past each warning.
 	Warnings []string
+	// Created, Relinked, and Removed list the names whose symlink the
+	// pass created, re-pointed at a new target, or deleted (in a DryRun:
+	// would have).
+	Created  []string
+	Relinked []string
+	Removed  []string
 }
 
 // ownershipManifestFile is the name of the small bookkeeping file the
@@ -428,7 +485,8 @@ func manifestRecordsTarget(m ownershipManifest, name, canonTarget string) bool {
 //
 // Pass order:
 //
-//  1. Ensure SinkDir exists (mkdir -p).
+//  1. Ensure SinkDir exists (mkdir -p; a DryRun only notes that it is
+//     missing).
 //  2. Legacy-stub migration: for each name in req.LegacyNames, if a
 //     regular directory at <SinkDir>/<name> matches the v0.15.0 stub
 //     shape exactly, remove it.
@@ -451,9 +509,14 @@ func Run(req Request) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("resolving sink dir %q: %w", req.SinkDir, err)
 	}
-	if err := os.MkdirAll(absSink, 0o755); err != nil {
-		return Result{}, fmt.Errorf("creating sink dir %q: %w", absSink, err)
+	if !req.DryRun {
+		if err := os.MkdirAll(absSink, 0o755); err != nil {
+			return Result{}, fmt.Errorf("creating sink dir %q: %w", absSink, err)
+		}
 	}
+	// pendingRemoval holds legacy stub directories a DryRun would have
+	// removed, so the create step plans them as free paths.
+	pendingRemoval := make(map[string]bool)
 
 	desiredByName := make(map[string]SkillEntry, len(req.Desired))
 	for _, e := range req.Desired {
@@ -478,11 +541,25 @@ func Run(req Request) (Result, error) {
 	manifest := loadOwnershipManifest(absSink)
 	manifestDirty := false
 
+	legacyOwned := make([]string, 0, len(req.LegacyOwnedRoots))
+	for _, root := range req.LegacyOwnedRoots {
+		if root == "" {
+			continue
+		}
+		canon, err := canonicalizePath(root)
+		if err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("canonicalize legacy owned root %q: %v", root, err))
+			continue
+		}
+		legacyOwned = append(legacyOwned, canon)
+	}
+
 	// Step 2: legacy stub migration.
 	for _, name := range req.LegacyNames {
 		path := filepath.Join(absSink, name)
-		if removed, warn := tryRemoveLegacyStub(path, name); removed {
+		if removed, warn := tryRemoveLegacyStub(path, name, req.DryRun); removed {
 			result.LegacyMigrated = append(result.LegacyMigrated, name)
+			pendingRemoval[name] = req.DryRun
 		} else if warn != "" {
 			result.Warnings = append(result.Warnings, warn)
 		}
@@ -490,7 +567,7 @@ func Run(req Request) (Result, error) {
 
 	// Step 3: cleanup walk.
 	dirEntries, err := os.ReadDir(absSink)
-	if err != nil {
+	if err != nil && (!req.DryRun || !os.IsNotExist(err)) {
 		return result, fmt.Errorf("reading sink dir %q: %w", absSink, err)
 	}
 	for _, de := range dirEntries {
@@ -524,19 +601,41 @@ func Run(req Request) (Result, error) {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("canonicalize target %q: %v", target, terr))
 			continue
 		}
+		legacyTarget := false
 		if !targetUnderOwnedRoot(canonTarget, owned) && !manifestRecordsTarget(manifest, name, canonTarget) {
-			// External target — symlink the user placed themselves. Not
-			// under any currently-owned root, and not a target this
+			// Not under any currently-owned root, and not a target this
 			// materializer's own manifest remembers writing for this name
-			// in a previous pass.
-			continue
+			// in a previous pass. Retired gc-managed roots
+			// (LegacyOwnedRoots) still mark the link as gc's own stranded
+			// property — e.g. a pre-#3344 .gc/system/packs projection
+			// target orphaned by the config-only retirement migration.
+			if !targetUnderOwnedRoot(canonTarget, legacyOwned) {
+				// External target — symlink the user placed themselves.
+				continue
+			}
+			legacyTarget = true
 		}
 		desired, want := desiredByName[name]
 		if !want {
+			if legacyTarget {
+				// Stranded legacy-root links are removed only once they
+				// dangle; a still-resolving link for an undesired name may
+				// be serving content the user relies on.
+				if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+					continue
+				}
+			}
 			// Owned but not desired — delete (covers dangling and orphaned).
+			if req.DryRun {
+				result.Removed = append(result.Removed, name)
+				continue
+			}
 			if rmErr := os.Remove(path); rmErr != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("removing orphan symlink %q: %v", path, rmErr))
-			} else if _, had := manifest.Targets[name]; had {
+				continue
+			}
+			result.Removed = append(result.Removed, name)
+			if _, had := manifest.Targets[name]; had {
 				delete(manifest.Targets, name)
 				manifestDirty = true
 			}
@@ -567,12 +666,15 @@ func Run(req Request) (Result, error) {
 		// Drifted target — atomic replace. Use the lexical desiredAbs
 		// (not canonicalized) so the on-disk symlink target remains the
 		// caller-intended path; canonicalization is comparison-only.
-		if rerr := atomicSymlink(desiredAbs, path); rerr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("replacing symlink %q: %v", path, rerr))
-			continue
+		if !req.DryRun {
+			if rerr := atomicSymlink(desiredAbs, path); rerr != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("replacing symlink %q: %v", path, rerr))
+				continue
+			}
+			manifest.Targets[name] = canonDesired
+			manifestDirty = true
 		}
-		manifest.Targets[name] = canonDesired
-		manifestDirty = true
+		result.Relinked = append(result.Relinked, name)
 		result.Materialized = append(result.Materialized, name)
 		delete(desiredByName, name)
 	}
@@ -593,6 +695,10 @@ func Run(req Request) (Result, error) {
 			continue
 		}
 		info, lerr := os.Lstat(path)
+		if lerr == nil && pendingRemoval[name] {
+			// A DryRun's legacy-stub migration frees this path.
+			lerr = os.ErrNotExist
+		}
 		if lerr == nil {
 			// Something exists. If it's a symlink we already handled it
 			// in step 3 (otherwise the desiredByName entry would have
@@ -614,21 +720,24 @@ func Run(req Request) (Result, error) {
 			})
 			continue
 		}
-		if !os.IsNotExist(lerr) {
+		if !errors.Is(lerr, os.ErrNotExist) {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("lstat %q: %v", path, lerr))
 			continue
 		}
-		if cerr := atomicSymlink(desiredAbs, path); cerr != nil {
-			return result, fmt.Errorf("creating symlink %q -> %q: %w", path, desiredAbs, cerr)
+		if !req.DryRun {
+			if cerr := atomicSymlink(desiredAbs, path); cerr != nil {
+				return result, fmt.Errorf("creating symlink %q -> %q: %w", path, desiredAbs, cerr)
+			}
+			if canonDesired, cerr := canonicalizePath(desiredAbs); cerr == nil {
+				manifest.Targets[name] = canonDesired
+				manifestDirty = true
+			}
 		}
-		if canonDesired, cerr := canonicalizePath(desiredAbs); cerr == nil {
-			manifest.Targets[name] = canonDesired
-			manifestDirty = true
-		}
+		result.Created = append(result.Created, name)
 		result.Materialized = append(result.Materialized, name)
 	}
 
-	if manifestDirty {
+	if manifestDirty && !req.DryRun {
 		if serr := saveOwnershipManifest(absSink, manifest); serr != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("saving ownership manifest: %v", serr))
 		}
@@ -638,7 +747,56 @@ func Run(req Request) (Result, error) {
 	sort.Slice(result.Skipped, func(i, j int) bool { return result.Skipped[i].Name < result.Skipped[j].Name })
 	sort.Strings(result.LegacyMigrated)
 	sort.Strings(result.Warnings)
+	sort.Strings(result.Created)
+	sort.Strings(result.Relinked)
+	sort.Strings(result.Removed)
 	return result, nil
+}
+
+// TargetUnderManagedRoot reports whether target falls under one of the
+// given gc-managed roots, canonicalizing both sides the same way the
+// cleanup walk does so /var ↔ /private/var aliases compare equal. It
+// exists so the doctor dangling-sink check classifies link ownership
+// with exactly the materializer's logic instead of drifting into a
+// second convention. Canonicalization failures classify as false (not
+// owned) — the safe direction for a deletion decision.
+func TargetUnderManagedRoot(target string, roots []string) bool {
+	canonTarget, err := canonicalizePath(target)
+	if err != nil {
+		return false
+	}
+	canonRoots := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		canon, err := canonicalizePath(root)
+		if err != nil {
+			continue
+		}
+		canonRoots = append(canonRoots, canon)
+	}
+	return targetUnderOwnedRoot(canonTarget, canonRoots)
+}
+
+// LegacyOwnedRootsFor returns the canonical retired gc-managed source
+// roots for Request.LegacyOwnedRoots:
+//
+//   - <cityPath>/.gc/system/packs — the per-city projection retired by
+//     #3344, whose config-only migration stranded every pre-manifest
+//     sink symlink that pointed into it (hq-38je).
+//   - <GC_HOME>/cache/repos — the global content-addressed pack
+//     checkout cache; a pruned checkout strands pre-manifest links
+//     that #4130's manifest only covers going forward.
+//
+// The cache root is omitted when GC_HOME is unresolvable (hermetic
+// test binaries) rather than erroring the whole materialization pass.
+func LegacyOwnedRootsFor(cityPath string) []string {
+	roots := []string{filepath.Join(cityPath, citylayout.SystemPacksRoot)}
+	if cacheRoot, err := config.GlobalRepoCacheRoot(); err == nil {
+		roots = append(roots, cacheRoot)
+	}
+	return roots
 }
 
 // LegacyStubNames returns the canonical list of v0.15.0 stub names that
@@ -834,52 +992,19 @@ func targetUnderOwnedRoot(target string, ownedRoots []string) bool {
 	return false
 }
 
-// canonicalizePath returns a path with all leading symlinks resolved
-// (via filepath.EvalSymlinks). When the path itself does not exist
-// (e.g., a dangling symlink target or a not-yet-created sink entry),
-// the function walks up to find the deepest ancestor that does exist,
-// canonicalizes that, and re-appends the missing tail. This handles
-// platforms where common roots are symlinks (macOS /tmp →
-// /private/tmp; certain Linux distros where /var symlinks elsewhere)
-// without breaking comparisons against materializer-written targets
-// that may have been recorded with the unresolved prefix.
+// canonicalizePath returns path with all symlinks resolved, walking up to
+// the deepest existing ancestor when path itself does not exist (e.g., a
+// dangling symlink target or a not-yet-created sink entry) and re-appending
+// the missing tail. Delegates to pathutil.NormalizePathForCompare, which
+// also collapses platform path aliases (macOS /tmp → /private/tmp; certain
+// Linux distros where /var symlinks elsewhere) so comparisons against
+// materializer-written targets don't break on an unresolved prefix.
 //
-// Returns an error only when filepath.Abs fails on a relative input.
-// All EvalSymlinks errors are absorbed by the walk-up fallback.
-func canonicalizePath(path string) (string, error) {
-	if path == "" {
-		return "", nil
-	}
-	abs := path
-	if !filepath.IsAbs(abs) {
-		a, err := filepath.Abs(abs)
-		if err != nil {
-			return "", err
-		}
-		abs = a
-	}
-	abs = filepath.Clean(abs)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return resolved, nil
-	}
-	// Walk up until an ancestor exists; canonicalize it, then re-append
-	// the missing suffix. Falls back to the cleaned absolute path when
-	// nothing along the way exists (e.g., entirely-fictional path
-	// supplied by a test).
-	var suffix []string
-	cur := abs
-	for {
-		parent := filepath.Dir(cur)
-		suffix = append([]string{filepath.Base(cur)}, suffix...)
-		if parent == cur {
-			return abs, nil
-		}
-		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
-			parts := append([]string{resolved}, suffix...)
-			return filepath.Join(parts...), nil
-		}
-		cur = parent
-	}
+// Always returns a nil error; the signature is kept for call-site
+// compatibility (all callers already treat resolution failure as
+// non-fatal).
+func canonicalizePath(path string) (string, error) { //nolint:unparam // error slot preserves the call-site contract for all 7 callers
+	return pathutil.NormalizePathForCompare(path), nil
 }
 
 // atomicSymlink creates or replaces a symlink at path pointing to
@@ -917,7 +1042,7 @@ func tempSymlinkPath(dir, base string) (string, error) {
 // when the directory was removed, (false, "") when the directory does
 // not match (left alone — typical case once converged), and
 // (false, warning) when an unexpected I/O error blocks the decision.
-func tryRemoveLegacyStub(path, name string) (bool, string) {
+func tryRemoveLegacyStub(path, name string, dryRun bool) (bool, string) {
 	body, ok := legacyStubBodies[name]
 	if !ok {
 		return false, ""
@@ -950,6 +1075,9 @@ func tryRemoveLegacyStub(path, name string) (bool, string) {
 	if string(got) != body {
 		// User-edited stub — preserve.
 		return false, ""
+	}
+	if dryRun {
+		return true, ""
 	}
 	if err := os.RemoveAll(path); err != nil {
 		return false, fmt.Sprintf("removing legacy stub dir %q: %v", path, err)

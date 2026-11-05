@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/gchome"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func TestConditionEnvEnviron(t *testing.T) {
+	t.Setenv("GC_HOME", "/operator/gc-home")
+
 	env := ConditionEnv{
 		BeadID:               "bead-123",
 		Iteration:            3,
@@ -41,6 +44,7 @@ func TestConditionEnvEnviron(t *testing.T) {
 	// Required vars.
 	checks := map[string]string{
 		"PATH":                      conditionPATH(),
+		"GC_HOME":                   "/operator/gc-home",
 		"BEADS_DIR":                 "/home/test/city/.beads",
 		"GC_BEAD_ID":                "bead-123",
 		"GC_ITERATION":              "3",
@@ -76,6 +80,18 @@ func TestConditionEnvEnviron(t *testing.T) {
 	}
 	if _, ok := lookup["TMPDIR"]; !ok {
 		t.Error("missing TMPDIR env var")
+	}
+}
+
+func TestConditionGCHomeFallbackIsNotSharedTempDir(t *testing.T) {
+	t.Setenv("GC_HOME", "")
+
+	got := conditionGCHome()
+	if got == filepath.Join(os.TempDir(), ".gc") {
+		t.Fatalf("conditionGCHome() = %q, must not be the shared world-writable temp home (gastownhall/gascity#3506)", got)
+	}
+	if want := gchome.ResolveReadOnly().Path(); got != want {
+		t.Fatalf("conditionGCHome() = %q, want canonical gchome resolution %q", got, want)
 	}
 }
 
@@ -520,6 +536,84 @@ func TestResolveConditionPath(t *testing.T) {
 			t.Errorf("expected path traversal error, got: %v", err)
 		}
 	})
+
+	// Pins the canonical-path-at-ingest bug this migration fixes
+	// (ga-iawy13.4): a relative envelope (e.g. "." from an
+	// as-yet-unresolved city path) combined with a conditionPath that
+	// crosses a symlink component makes the current bare
+	// EvalSymlinks-without-Abs canonicalization produce an ABSOLUTE
+	// resolved target while canonEnvelope/canonBase stay RELATIVE.
+	// filepath.Rel(relative, absolute) errors, and containedIn treats any
+	// Rel error as "not contained" — so a completely legitimate, safely
+	// contained path is falsely rejected as escaping containment. Once
+	// canonEnvelope/canonBase are normalized via
+	// pathutil.NormalizePathForCompare (which absolutizes first), this
+	// must succeed.
+	t.Run("relative envelope combined with a symlinked conditionPath segment must not be falsely rejected", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink semantics differ on Windows")
+		}
+		dir := t.TempDir()
+		realDir := filepath.Join(dir, "real")
+		if err := os.MkdirAll(realDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(realDir, "check.sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realDir, filepath.Join(dir, "alias")); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+
+		t.Chdir(dir)
+
+		got, err := ResolveConditionPath(".", "", "alias/check.sh")
+		if err != nil {
+			t.Fatalf("unexpected error: %v — envelope/base must be canonicalized to absolute before containment comparison, not left relative", err)
+		}
+		testutil.AssertSamePath(t, got, script)
+	})
+
+	// Pins the darwin half of the same comparison contract: on macOS the
+	// system temp root lives under /var (or /tmp), which EvalSymlinks
+	// expands to /private/var (or /private/tmp) while
+	// pathutil.NormalizePathForCompare collapses it back the other way.
+	// canonEnvelope/canonBase therefore carry the collapsed spelling while
+	// the post-resolution `resolved` (bare EvalSymlinks) carries the
+	// /private spelling — a lexical containment check compares the two
+	// conventions and falsely rejects a plainly contained script. The
+	// containment check must normalize both sides.
+	//
+	// This needs the real os.TempDir() root, not an arbitrary directory:
+	// the /private alias only exists on the platform temp trees. No symlink
+	// is created by the test — the platform's own /var symlink is the
+	// trigger.
+	t.Run("darwin private temp alias must not falsely reject a contained relative condition path", func(t *testing.T) {
+		if runtime.GOOS != "darwin" {
+			t.Skip("darwin-only: the /private/{tmp,var} alias collapse is a no-op on other platforms")
+		}
+		root, err := os.MkdirTemp(os.TempDir(), "gc-cond-alias-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+		scripts := filepath.Join(root, "scripts")
+		if err := os.MkdirAll(scripts, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(scripts, "check.sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := ResolveConditionPath(root, "", "scripts/check.sh")
+		if err != nil {
+			t.Fatalf("unexpected error: %v — post-resolution containment must normalize both operands, not compare a /private-prefixed resolved path against an alias-collapsed envelope", err)
+		}
+		testutil.AssertSamePath(t, got, script)
+	})
 }
 
 func TestRunConditionPass(t *testing.T) {
@@ -703,8 +797,22 @@ func TestConditionPATHUsesResolvedToolDirs(t *testing.T) {
 	}
 
 	got := conditionPATH()
-	if !strings.HasPrefix(got, toolDir+":") && got != toolDir {
-		t.Fatalf("conditionPATH() = %q, want prefix %q", got, toolDir)
+	if !strings.Contains(":"+got+":", ":"+toolDir+":") {
+		t.Fatalf("conditionPATH() = %q, want it to include the resolved tool dir %q", got, toolDir)
+	}
+	for _, name := range []string{"bd", "gc"} {
+		found, ok := firstExecutableOnPATH(got, name)
+		if !ok {
+			t.Fatalf("resolve %s on %q: not found", name, got)
+		}
+		resolved, err := filepath.EvalSymlinks(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, _ := filepath.EvalSymlinks(filepath.Join(toolDir, name))
+		if resolved != want {
+			t.Errorf("gate %s resolves to %q, want %q", name, resolved, want)
+		}
 	}
 }
 
@@ -883,4 +991,70 @@ func TestRunConditionEnvVarsAvailable(t *testing.T) {
 	if !strings.Contains(result.Stdout, "PATH="+conditionPATH()) {
 		t.Errorf("expected resolved PATH in output, got: %s", result.Stdout)
 	}
+}
+
+// TestConditionPATHPinsEachToolWhenDirectoriesHoldCompetingCopies pins the
+// live failure. The controller resolved gc from a new install first on its
+// PATH and bd from ~/.local/bin, which also held an older gc. conditionPATH
+// listed the resolved tools' directories in bd, gc, dolt, jq order, so
+// ~/.local/bin came first and the gate's `gc` ran the older copy. Here several
+// directories hold competing copies, and every tool must run exactly the binary
+// the controller resolved.
+func TestConditionPATHPinsEachToolWhenDirectoriesHoldCompetingCopies(t *testing.T) {
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	t.Setenv("GC_HOME", t.TempDir())
+
+	writeTool := func(dir, name, says string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\necho "+says+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newDir, localDir, jqDir := t.TempDir(), t.TempDir(), t.TempDir()
+	writeTool(newDir, "gc", "gc-new")
+	writeTool(localDir, "bd", "bd-local")
+	writeTool(localDir, "gc", "gc-older")
+	writeTool(localDir, "dolt", "dolt-local")
+	writeTool(jqDir, "jq", "jq-usr")
+	writeTool(jqDir, "dolt", "dolt-older")
+	if err := os.Setenv("PATH", newDir+":"+localDir+":"+jqDir+":"+SafePATH); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"gc": "gc-new", "bd": "bd-local", "dolt": "dolt-local", "jq": "jq-usr"}
+
+	gatePATH := conditionPATH()
+	for name, says := range want {
+		found, ok := firstExecutableOnPATH(gatePATH, name)
+		if !ok {
+			t.Fatalf("gate `%s` with PATH=%s: not found", name, gatePATH)
+		}
+		script, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.TrimSpace(strings.TrimPrefix(string(script), "#!/bin/sh\necho ")); got != says {
+			t.Errorf("gate `%s` ran %q, want %q (the binary the controller resolved); PATH=%s", name, got, says, gatePATH)
+		}
+	}
+}
+
+// firstExecutableOnPATH resolves name the way a POSIX shell does for a gate
+// command: the first executable regular file named name in pathList's
+// directory order. Resolving it here, rather than asking a real shell, keeps
+// these tests free of subprocesses while proving the same thing: which binary
+// a gate's bare command runs.
+func firstExecutableOnPATH(pathList, name string) (string, bool) {
+	for _, dir := range filepath.SplitList(pathList) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		return candidate, true
+	}
+	return "", false
 }

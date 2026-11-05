@@ -858,7 +858,8 @@ func TestCompleteResumeCommandDefaultsDoesNotTreatBareMultiTokenFlagAsPresent(t 
 }
 
 func TestStripArgsSlice_PartialOverlap_CodexSuggest(t *testing.T) {
-	// Codex's "suggest" choice has a multi-flag FlagArgs:
+	// A legacy codex-shaped schema (the retired untrusted spelling, kept as
+	// mechanism test data) gives "suggest" a multi-flag FlagArgs:
 	//   ["--ask-for-approval", "untrusted", "--sandbox", "read-only"]
 	// After splitFlagArgs, this becomes two groups:
 	//   ["--ask-for-approval", "untrusted"] and ["--sandbox", "read-only"]
@@ -1117,9 +1118,11 @@ func TestBuiltinProviders_CodexHasNilArgsAndOptionDefaults(t *testing.T) {
 		t.Errorf("codex OptionDefaults[permission_mode] = %q, want unrestricted",
 			codex.OptionDefaults["permission_mode"])
 	}
-	if codex.OptionDefaults["model"] != "gpt-5.5" {
-		t.Errorf("codex OptionDefaults[model] = %q, want gpt-5.5",
-			codex.OptionDefaults["model"])
+	// Model and effort are left to the user's Codex config unless chosen.
+	for _, key := range []string{"model", "effort"} {
+		if v, ok := codex.OptionDefaults[key]; ok {
+			t.Errorf("codex OptionDefaults[%s] = %q, want unset", key, v)
+		}
 	}
 	if !schemaHasChoice(codex.OptionsSchema, "model", "gpt-5.5") {
 		t.Error("codex OptionsSchema missing model choice gpt-5.5")
@@ -1241,4 +1244,92 @@ func schemaHasChoice(schema []ProviderOption, key, value string) bool {
 		}
 	}
 	return false
+}
+
+// TestResolveClaudeCanonicalModelIDsThroughResolvers drives the real builtin
+// claude schema through both resolver entry points with the canonical provider
+// model IDs operators actually pin in agent.toml.
+//
+// This is the path that failed in ra-jbbv0, and the enum tests in
+// internal/worker/builtin do not reach it: they inspect the Choices table
+// directly, while the incident's two failure surfaces are both here.
+// ResolveExplicitOptions rejects an out-of-enum value outright ("invalid value
+// for model: claude-opus-5"), which left four named sessions unwakeable;
+// ResolveOptions instead finds no choice, skips the FlagArgs append behind its
+// choice != nil guard, and silently emits no --model at all, which left a whole
+// city running the provider default while `gc config show` still reported the
+// pin. Both are asserted here so a future edit to the enum cannot regress
+// either one unnoticed.
+func TestResolveClaudeCanonicalModelIDsThroughResolvers(t *testing.T) {
+	schema := BuiltinProviders()["claude"].OptionsSchema
+	if len(schema) == 0 {
+		t.Fatal("builtin claude provider has no OptionsSchema")
+	}
+
+	for _, model := range []string{
+		"claude-opus-5",
+		"claude-opus-5[1m]",
+		"claude-sonnet-5",
+		"claude-fable-5",
+	} {
+		t.Run(model, func(t *testing.T) {
+			want := []string{"--model", model}
+
+			args, _, err := ResolveOptions(schema, map[string]string{"model": model}, nil)
+			if err != nil {
+				t.Fatalf("ResolveOptions(model=%q) error = %v, want nil", model, err)
+			}
+			if !containsArgPair(args, want) {
+				t.Errorf("ResolveOptions(model=%q) args = %v, want to contain %v", model, args, want)
+			}
+
+			explicit, err := ResolveExplicitOptions(schema, map[string]string{"model": model})
+			if err != nil {
+				t.Fatalf("ResolveExplicitOptions(model=%q) error = %v, want nil", model, err)
+			}
+			if !containsArgPair(explicit, want) {
+				t.Errorf("ResolveExplicitOptions(model=%q) args = %v, want to contain %v", model, explicit, want)
+			}
+		})
+	}
+}
+
+// containsArgPair reports whether args contains pair as an adjacent subsequence.
+func containsArgPair(args []string, pair []string) bool {
+	for i := 0; i+len(pair) <= len(args); i++ {
+		match := true
+		for j, want := range pair {
+			if args[i+j] != want {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFormatACPOmittedArgs(t *testing.T) {
+	got := FormatACPOmittedArgs("rig/worker", "opencode-local", "opencode acp", []string{"-m", "acme/model x"})
+	for _, want := range []string{
+		"WARNING:",
+		`agent "rig/worker"`,
+		`provider "opencode-local"`,
+		`"opencode acp"`,
+		`-m 'acme/model x'`,
+		"acp_args",
+		`session = "tmux"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("FormatACPOmittedArgs() = %q, missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("FormatACPOmittedArgs() = %q, want a single line", got)
+	}
+	if blank := FormatACPOmittedArgs(" ", "", "opencode acp", []string{"-m"}); !strings.Contains(blank, `agent "(unknown)"`) || !strings.Contains(blank, `provider "(unknown)"`) {
+		t.Errorf("FormatACPOmittedArgs() with blank names = %q, want (unknown) placeholders", blank)
+	}
 }

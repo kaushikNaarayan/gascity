@@ -5,16 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -51,7 +56,7 @@ func TestResolveFormulaScope_RigFlagWins(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = "my-project"
 
-	scope, err := resolveFormulaScope(cfg, cityPath)
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
@@ -91,7 +96,7 @@ func TestResolveFormulaScope_CwdInsideRig(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = ""
 
-	scope, err := resolveFormulaScope(cfg, cityPath)
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
@@ -120,7 +125,7 @@ func TestResolveFormulaScope_CityScopeWhenNoRig(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = ""
 
-	scope, err := resolveFormulaScope(cfg, cityPath)
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
@@ -145,7 +150,7 @@ func TestResolveFormulaScope_UnknownRigErrors(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = "ghost"
 
-	_, err := resolveFormulaScope(cfg, cityPath)
+	_, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err == nil {
 		t.Fatal("expected error for unknown rig, got nil")
 	}
@@ -166,7 +171,7 @@ func TestResolveFormulaScope_UnboundRigErrors(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = "unbound"
 
-	_, err := resolveFormulaScope(cfg, cityPath)
+	_, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err == nil {
 		t.Fatal("expected error for unbound rig, got nil")
 	}
@@ -223,6 +228,21 @@ func TestRigFormulaVarsForScope(t *testing.T) {
 			t.Errorf("rigFormulaVarsForScope = %v, want empty (no rig context)", vars)
 		}
 	})
+
+	t.Run("GC_RIG env populates FormulaVars when cwd outside rig", func(t *testing.T) {
+		prev := rigFlag
+		t.Cleanup(func() { rigFlag = prev })
+		rigFlag = ""
+		t.Setenv("GC_RIG", "mo")
+
+		// cwd outside both cityPath and rigPath, simulating a pool/polecat
+		// worktree under .gc/worktrees/ where cwd resolution fails.
+		t.Chdir(t.TempDir())
+		vars := rigFormulaVarsForScope(cfg, cityPath)
+		if got := vars["test_command"]; got != "make test-fast" {
+			t.Errorf("rigFormulaVarsForScope()[test_command] = %q, want %q", got, "make test-fast")
+		}
+	})
 }
 
 // TestResolveFormulaScope_RigFallsBackToCityLayers covers the case where a
@@ -243,7 +263,7 @@ func TestResolveFormulaScope_RigFallsBackToCityLayers(t *testing.T) {
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = "bare-rig"
 
-	scope, err := resolveFormulaScope(cfg, cityPath)
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
@@ -253,6 +273,336 @@ func TestResolveFormulaScope_RigFallsBackToCityLayers(t *testing.T) {
 	want := []string{"/city/formulas"}
 	if !reflect.DeepEqual(scope.searchPaths, want) {
 		t.Errorf("searchPaths = %v, want %v (city fallback)", scope.searchPaths, want)
+	}
+}
+
+// TestResolveFormulaScope_GCRIGEnvRoutesWhenCwdOutsideRig covers the bug
+// where `gc formula cook`/`show` ignored GC_RIG env (set by the controller
+// on every rig agent) and fell back to city scope when cwd resolution
+// failed — which it always does for pool/polecat worktrees living under
+// .gc/worktrees/<pack>/<agent>/, since those are not inside the registered
+// rig.Path. This mirrors resolveBdScopeTarget's GC_RIG tier (cmd_bd.go),
+// which already closed the identical gap for `gc bd`. See gastownhall/gascity
+// ga-fstubn.
+func TestResolveFormulaScope_GCRIGEnvRoutesWhenCwdOutsideRig(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "my-project", Path: rigPath}},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"my-project": {"/city/formulas", "/rigs/my-project/formulas"},
+			},
+		},
+	}
+
+	// cwd is deliberately outside both cityPath and rigPath, simulating a
+	// pool/polecat worktree under .gc/worktrees/ — resolveRigForDir cannot
+	// resolve this to any rig.
+	t.Chdir(t.TempDir())
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+	t.Setenv("GC_RIG", "my-project")
+
+	var stderr bytes.Buffer
+	scope, err := resolveFormulaScope(cfg, cityPath, &stderr)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != rigPath {
+		t.Errorf("storeRoot = %q, want %q", scope.storeRoot, rigPath)
+	}
+	if scope.rig != "my-project" {
+		t.Errorf("rig = %q, want %q", scope.rig, "my-project")
+	}
+	want := []string{"/city/formulas", "/rigs/my-project/formulas"}
+	if !reflect.DeepEqual(scope.searchPaths, want) {
+		t.Errorf("searchPaths = %v, want %v", scope.searchPaths, want)
+	}
+	// A GC_RIG that names a bound rig is honored silently, matching
+	// resolveBdScopeTarget's behavior.
+	if warn := stderr.String(); warn != "" {
+		t.Errorf("expected no warning for a valid GC_RIG, got %q", warn)
+	}
+}
+
+// TestResolveFormulaScope_RigFlagOverridesGCRIGEnv verifies --rig still wins
+// over GC_RIG env, matching resolveBdScopeTarget's priority order.
+func TestResolveFormulaScope_RigFlagOverridesGCRIGEnv(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	otherPath := filepath.Join(cityPath, "other-rig")
+	for _, p := range []string{rigPath, otherPath} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "my-project", Path: rigPath},
+			{Name: "other-rig", Path: otherPath},
+		},
+	}
+
+	t.Chdir(t.TempDir())
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = "my-project"
+	t.Setenv("GC_RIG", "other-rig")
+
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != rigPath {
+		t.Errorf("storeRoot = %q, want %q (--rig must win over GC_RIG)", scope.storeRoot, rigPath)
+	}
+}
+
+// TestResolveFormulaScope_UnknownGCRIGEnvFallsThroughAndWarns matches
+// resolveBdScopeTarget's behavior: an unresolvable GC_RIG does not error
+// (unlike an identical --rig value), it falls through to cwd/city — but the
+// discard is not silent, so a stale or typo'd GC_RIG doesn't redirect
+// scope with no diagnostic.
+func TestResolveFormulaScope_UnknownGCRIGEnvFallsThroughAndWarns(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "real", Path: filepath.Join(cityPath, "real")}},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+		},
+	}
+
+	t.Chdir(t.TempDir())
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+	t.Setenv("GC_RIG", "nonexistent-rig")
+
+	var stderr bytes.Buffer
+	scope, err := resolveFormulaScope(cfg, cityPath, &stderr)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != cityPath {
+		t.Errorf("storeRoot = %q, want %q (city fallback)", scope.storeRoot, cityPath)
+	}
+	warn := stderr.String()
+	if !strings.Contains(warn, "GC_RIG") || !strings.Contains(warn, "nonexistent-rig") {
+		t.Errorf("expected a warning naming the discarded GC_RIG value, got %q", warn)
+	}
+}
+
+// TestResolveFormulaScope_ExplicitCityPinsCityScope verifies that an explicit
+// --city flag pins city scope ahead of GC_RIG env: a deliberate city scope
+// must never be silently downgraded to a rig store by the ambient GC_RIG env
+// var every controller-spawned agent carries. Mirrors the identical guard in
+// cmd_bd.go's resolveBdScopeTarget (gastownhall/gascity#3410).
+func TestResolveFormulaScope_ExplicitCityPinsCityScope(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{
+				Name: "my-project",
+				Path: rigPath,
+				FormulaVars: map[string]string{
+					"test_command": "make test-fast",
+				},
+			},
+		},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"my-project": {"/city/formulas", "/rigs/my-project/formulas"},
+			},
+		},
+	}
+
+	// cwd outside both cityPath and rigPath, simulating a pool/polecat
+	// worktree under .gc/worktrees/ — isolates the assertion to the
+	// GC_RIG-vs-city precedence rather than cwd auto-detection.
+	t.Chdir(t.TempDir())
+	prevRig := rigFlag
+	t.Cleanup(func() { rigFlag = prevRig })
+	rigFlag = ""
+	prevCity := cityFlag
+	t.Cleanup(func() { cityFlag = prevCity })
+	cityFlag = cityPath
+	t.Setenv("GC_RIG", "my-project")
+
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != cityPath {
+		t.Errorf("storeRoot = %q, want %q (--city must pin city scope over GC_RIG)", scope.storeRoot, cityPath)
+	}
+	if scope.rig != "" {
+		t.Errorf("rig = %q, want empty (city scope)", scope.rig)
+	}
+	want := []string{"/city/formulas"}
+	if !reflect.DeepEqual(scope.searchPaths, want) {
+		t.Errorf("searchPaths = %v, want %v", scope.searchPaths, want)
+	}
+
+	vars := rigFormulaVarsForScope(cfg, cityPath)
+	if len(vars) != 0 {
+		t.Errorf("rigFormulaVarsForScope = %v, want empty (city scope pinned by --city)", vars)
+	}
+}
+
+// TestResolveFormulaScope_ExplicitCityOverridesCwdResolvedRig verifies that
+// --city also pins city scope ahead of cwd-based rig auto-detection, not just
+// GC_RIG env. This is a deliberate behavior change (pre-existing cwd
+// detection would otherwise win) — matching the identical override in
+// cmd_bd.go's resolveBdScopeTarget, and must be called out in the commit
+// message per that precedent.
+func TestResolveFormulaScope_ExplicitCityOverridesCwdResolvedRig(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "my-project", Path: rigPath}},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"my-project": {"/city/formulas", "/rigs/my-project/formulas"},
+			},
+		},
+	}
+
+	t.Chdir(rigPath) // cwd resolves to the my-project rig
+	prevRig := rigFlag
+	t.Cleanup(func() { rigFlag = prevRig })
+	rigFlag = ""
+	prevCity := cityFlag
+	t.Cleanup(func() { cityFlag = prevCity })
+	cityFlag = cityPath
+
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != cityPath {
+		t.Errorf("storeRoot = %q, want %q (--city must pin city scope over cwd-resolved rig)", scope.storeRoot, cityPath)
+	}
+	if scope.rig != "" {
+		t.Errorf("rig = %q, want empty (city scope)", scope.rig)
+	}
+}
+
+// TestResolveFormulaScope_GCRIGEnvOverridesCwdResolvedRig closes a precedence
+// coverage gap: GC_RIG env must win over a DIFFERENT rig that cwd would
+// otherwise resolve to, not just over city-when-cwd-resolves-nothing (already
+// covered by TestResolveFormulaScope_GCRIGEnvRoutesWhenCwdOutsideRig). Pins
+// the documented "GC_RIG env > enclosing rig from cwd" ordering.
+func TestResolveFormulaScope_GCRIGEnvOverridesCwdResolvedRig(t *testing.T) {
+	cityPath := t.TempDir()
+	rigAPath := filepath.Join(cityPath, "rig-a")
+	rigBPath := filepath.Join(cityPath, "rig-b")
+	for _, p := range []string{rigAPath, rigBPath} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "rig-a", Path: rigAPath},
+			{Name: "rig-b", Path: rigBPath},
+		},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"rig-a": {"/city/formulas", "/rigs/rig-a/formulas"},
+				"rig-b": {"/city/formulas", "/rigs/rig-b/formulas"},
+			},
+		},
+	}
+
+	t.Chdir(rigAPath) // cwd resolves to rig-a
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+	t.Setenv("GC_RIG", "rig-b")
+
+	scope, err := resolveFormulaScope(cfg, cityPath, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != rigBPath {
+		t.Errorf("storeRoot = %q, want %q (GC_RIG must win over cwd-resolved rig-a)", scope.storeRoot, rigBPath)
+	}
+	if scope.rig != "rig-b" {
+		t.Errorf("rig = %q, want %q", scope.rig, "rig-b")
+	}
+}
+
+// TestResolveFormulaScope_UnboundGCRIGFallsThroughToCwdRigAndWarnsRigName
+// closes a second precedence coverage gap: when GC_RIG names a declared-but-
+// unbound rig and cwd resolves to a DIFFERENT bound rig, scope must fall
+// through to that cwd-resolved rig, and the discard warning must name the
+// actual "<rig>" rig rather than "city" — exercising the scopeDesc arm that
+// TestResolveFormulaScope_UnknownGCRIGEnvFallsThroughAndWarns (cwd outside
+// any rig) does not reach.
+func TestResolveFormulaScope_UnboundGCRIGFallsThroughToCwdRigAndWarnsRigName(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "my-project", Path: rigPath},
+			{Name: "unbound", Path: ""},
+		},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"my-project": {"/city/formulas", "/rigs/my-project/formulas"},
+			},
+		},
+	}
+
+	t.Chdir(rigPath) // cwd resolves to my-project
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+	t.Setenv("GC_RIG", "unbound")
+
+	var stderr bytes.Buffer
+	scope, err := resolveFormulaScope(cfg, cityPath, &stderr)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != rigPath {
+		t.Errorf("storeRoot = %q, want %q (fallthrough to cwd-resolved rig)", scope.storeRoot, rigPath)
+	}
+	if scope.rig != "my-project" {
+		t.Errorf("rig = %q, want %q", scope.rig, "my-project")
+	}
+	warn := stderr.String()
+	if !strings.Contains(warn, `"my-project" rig`) {
+		t.Errorf("expected warning naming %q, got %q", `"my-project" rig`, warn)
+	}
+	if strings.Contains(warn, "the city scope") {
+		t.Errorf("warning incorrectly names city scope instead of the cwd-resolved rig: %q", warn)
 	}
 }
 
@@ -718,6 +1068,401 @@ title = "Do work"
 	}
 }
 
+// TestFormulaCookRefusesMalformedMetaBeforeWriting pins where a malformed
+// --meta flag refuses the cook: before any root, step, synthetic input convoy
+// or blocking dependency exists, on every arm. The --attach arms used to skip
+// the flag entirely (issue #7309), and the standalone path parsed it only
+// after the molecule was already materialized. A key the bead store would
+// refuse is refused the same way: bd and native Dolt reject "my-key" only at
+// the stamp, after the cook has written its beads, and the file store under
+// this test accepts it, so only the up-front check refuses it here.
+func TestFormulaCookRefusesMalformedMetaBeforeWriting(t *testing.T) {
+	const refusedKeyMeta = "my-key=v"
+	refusedKey := fmt.Sprintf("invalid metadata %q: %v", refusedKeyMeta, beadmeta.ValidateKey("my-key"))
+	rows := []struct {
+		name    string
+		formula string
+		attach  bool
+		badMeta string
+		want    string
+	}{
+		{name: "standalone legacy-work no equals", formula: "legacy-work", badMeta: "novalue"},
+		{name: "standalone legacy-work empty key", formula: "legacy-work", badMeta: "=v"},
+		{name: "standalone graph-work no equals", formula: "graph-work", badMeta: "novalue"},
+		{name: "standalone graph-work empty key", formula: "graph-work", badMeta: "=v"},
+		{name: "attach legacy-work no equals", formula: "legacy-work", attach: true, badMeta: "novalue"},
+		{name: "attach legacy-work empty key", formula: "legacy-work", attach: true, badMeta: "=v"},
+		{name: "attach graph-work no equals", formula: "graph-work", attach: true, badMeta: "novalue"},
+		{name: "attach graph-work empty key", formula: "graph-work", attach: true, badMeta: "=v"},
+		{name: "standalone legacy-work key the store refuses", formula: "legacy-work", badMeta: refusedKeyMeta, want: refusedKey},
+		{name: "standalone graph-work key the store refuses", formula: "graph-work", badMeta: refusedKeyMeta, want: refusedKey},
+		{name: "attach legacy-work key the store refuses", formula: "legacy-work", attach: true, badMeta: refusedKeyMeta, want: refusedKey},
+		{name: "attach graph-work key the store refuses", formula: "graph-work", attach: true, badMeta: refusedKeyMeta, want: refusedKey},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			cityDir := oneShotCookCity(t)
+			seedCLIStorageRoutes(t, cityDir, nil)
+			work, err := openStoreAtForCity(cityDir, cityDir)
+			if err != nil {
+				t.Fatalf("open work store: %v", err)
+			}
+			args := []string{"--meta", row.badMeta}
+			var wantIDs []string
+			if row.attach {
+				target, err := work.Create(beads.Bead{Title: "attach target", Type: "task"})
+				if err != nil {
+					t.Fatalf("create attach bead: %v", err)
+				}
+				args = append([]string{"--attach", target.ID}, args...)
+				wantIDs = []string{target.ID}
+			}
+
+			out, err := cookFormulaErr(t, row.formula, args...)
+			if err == nil {
+				t.Fatalf("gc formula cook %s succeeded with malformed --meta %q: %s", row.formula, row.badMeta, out)
+			}
+			if !strings.Contains(out, "invalid metadata") {
+				t.Fatalf("output %q does not report the malformed --meta flag", out)
+			}
+			if row.want != "" && !strings.Contains(out, row.want) {
+				t.Fatalf("output %q does not contain %q", out, row.want)
+			}
+
+			// IncludeClosed and TierMode both, so a closed or wisp-tier bead a
+			// partial run minted (a failed graph.v2 cook closes its roots) still
+			// counts as a write.
+			items, err := work.List(beads.ListQuery{
+				AllowScan:     true,
+				IncludeClosed: true,
+				TierMode:      beads.TierBoth,
+			})
+			if err != nil {
+				t.Fatalf("list work store: %v", err)
+			}
+			if got := beadIDs(items); !slices.Equal(got, wantIDs) {
+				t.Fatalf("work store holds %v after the refused cook, want %v — a malformed --meta must refuse before any write", got, wantIDs)
+			}
+			if row.attach {
+				if got := blockingDepCount(t, work, wantIDs[0]); got != 0 {
+					t.Fatalf("attach bead %s carries %d blocking deps after the refused cook, want 0", wantIDs[0], got)
+				}
+			}
+		})
+	}
+}
+
+// TestFormulaCookAttachStampsMetaOnTheSubDAGRoot pins the v1 --attach arm's
+// --meta contract ("set root bead metadata after cook"): the pairs land on the
+// sub-DAG root this cook created, never on the attach bead. The attach bead is
+// a bare task, so it is its own workflow root — WorkflowRootID == target.ID —
+// which is exactly what a stamp aimed at the wrong root would hit (#7309).
+func TestFormulaCookAttachStampsMetaOnTheSubDAGRoot(t *testing.T) {
+	cityDir := oneShotCookCity(t)
+	seedCLIStorageRoutes(t, cityDir, nil)
+	work, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("open work store: %v", err)
+	}
+	target, err := work.Create(beads.Bead{Title: "attach target", Type: "task"})
+	if err != nil {
+		t.Fatalf("create attach bead: %v", err)
+	}
+
+	res := cookFormula(t, "legacy-work", "--attach", target.ID, "--meta", "work_dir=/w", "--meta", "base_sha=abc")
+
+	if res.WorkflowRootID != target.ID {
+		t.Fatalf("fixture premise: workflow_root_id = %q, want the self-rooted target %q — the negative check below would not be testing the wrong-root stamp", res.WorkflowRootID, target.ID)
+	}
+	root, err := work.Get(res.RootID)
+	if err != nil {
+		t.Fatalf("attached sub-DAG root %s: %v", res.RootID, err)
+	}
+	for k, v := range map[string]string{"work_dir": "/w", "base_sha": "abc"} {
+		if got := root.Metadata[k]; got != v {
+			t.Errorf("sub-DAG root %s: metadata %s = %q, want %q", res.RootID, k, got, v)
+		}
+	}
+	attachBead, err := work.Get(target.ID)
+	if err != nil {
+		t.Fatalf("attach bead %s: %v", target.ID, err)
+	}
+	for _, k := range []string{"work_dir", "base_sha"} {
+		if got, ok := attachBead.Metadata[k]; ok {
+			t.Errorf("attach bead %s carries %s=%q; the --meta stamp belongs on the sub-DAG root %s, not on the workflow root", target.ID, k, got, res.RootID)
+		}
+	}
+}
+
+// TestFormulaCookAttachGraphV2StampsMetaOnTheWorkflowRoot pins the graph.v2
+// --attach arm's --meta stamp on both results that arm can return: a freshly
+// instantiated workflow, and the live workflow a repeat cook adopts for the
+// same convoy target (#7309).
+func TestFormulaCookAttachGraphV2StampsMetaOnTheWorkflowRoot(t *testing.T) {
+	t.Run("fresh workflow", func(t *testing.T) {
+		cityDir := oneShotCookCity(t)
+		seedCLIStorageRoutes(t, cityDir, nil)
+		work, err := openStoreAtForCity(cityDir, cityDir)
+		if err != nil {
+			t.Fatalf("open work store: %v", err)
+		}
+		target, err := work.Create(beads.Bead{Title: "attach target", Type: "task"})
+		if err != nil {
+			t.Fatalf("create attach bead: %v", err)
+		}
+
+		res := cookFormula(t, "graph-work", "--attach", target.ID, "--meta", "k=v")
+
+		root, err := work.Get(res.RootID)
+		if err != nil {
+			t.Fatalf("workflow root %s: %v", res.RootID, err)
+		}
+		if got := root.Metadata["k"]; got != "v" {
+			t.Errorf("workflow root %s: k = %q, want %q", res.RootID, got, "v")
+		}
+		if got := root.Metadata[beadmeta.KindMetadataKey]; got != beadmeta.KindWorkflow {
+			t.Errorf("workflow root %s: %s = %q, want %q — the fixture must be a graph.v2 workflow root", res.RootID, beadmeta.KindMetadataKey, got, beadmeta.KindWorkflow)
+		}
+		attachBead, err := work.Get(target.ID)
+		if err != nil {
+			t.Fatalf("attach bead %s: %v", target.ID, err)
+		}
+		if got, ok := attachBead.Metadata["k"]; ok {
+			t.Errorf("attach bead %s carries k=%q; the stamp belongs on the workflow root %s", target.ID, got, res.RootID)
+		}
+	})
+	t.Run("adopted live workflow", func(t *testing.T) {
+		cityDir := oneShotCookCity(t)
+		seedCLIStorageRoutes(t, cityDir, nil)
+		work, err := openStoreAtForCity(cityDir, cityDir)
+		if err != nil {
+			t.Fatalf("open work store: %v", err)
+		}
+		// A convoy target gives the invocation a stable input-convoy id and
+		// therefore a stable graph root key, so the second cook adopts the live
+		// workflow through the `existing != nil` return instead of instantiating.
+		target, err := work.Create(beads.Bead{Title: "attach target", Type: "convoy"})
+		if err != nil {
+			t.Fatalf("create attach bead: %v", err)
+		}
+
+		first := cookFormula(t, "graph-work", "--attach", target.ID, "--meta", "k=v1", "--meta", "keep=1")
+		second := cookFormula(t, "graph-work", "--attach", target.ID, "--meta", "k=v2")
+
+		if first.RootID != second.RootID {
+			t.Fatalf("re-cook minted a second workflow root (%s then %s); the adopt return must be stamped, not skipped", first.RootID, second.RootID)
+		}
+		root, err := work.Get(second.RootID)
+		if err != nil {
+			t.Fatalf("workflow root %s: %v", second.RootID, err)
+		}
+		if got := root.Metadata["k"]; got != "v2" {
+			t.Errorf("adopted workflow root %s: k = %q, want %q (last cook wins)", second.RootID, got, "v2")
+		}
+		if got := root.Metadata["keep"]; got != "1" {
+			t.Errorf("adopted workflow root %s: keep = %q, want %q — the stamp must merge, not replace", second.RootID, got, "1")
+		}
+		if got := blockingDepCount(t, work, target.ID); got != 1 {
+			t.Errorf("attach bead %s carries %d blocking deps after two cooks, want 1", target.ID, got)
+		}
+	})
+}
+
+// TestFormulaCookAttachGraphV2StampsMetaUnderTheSourceWorkflowLock pins where
+// the graph.v2 --attach arm writes --meta: inside the per-source workflow lock,
+// on both results that arm returns. That lock is what orders overlapping cooks
+// of one source, so a stamp written after its release can land after a later
+// cook's and put the earlier cook's values back on the live root (#7309). The
+// probe is the lock file itself: a non-blocking flock through a fresh
+// descriptor is refused while the cook's descriptor holds the lock.
+func TestFormulaCookAttachGraphV2StampsMetaUnderTheSourceWorkflowLock(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		targetType string
+		cooks      int
+	}{
+		{name: "fresh workflow", targetType: "task", cooks: 1},
+		// A convoy target keeps the graph root key stable, so the second cook
+		// adopts the live workflow through the `existing != nil` return.
+		{name: "adopted live workflow", targetType: "convoy", cooks: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityDir := oneShotCookCity(t)
+			seedCLIStorageRoutes(t, cityDir, nil)
+			work, err := openStoreAtForCity(cityDir, cityDir)
+			if err != nil {
+				t.Fatalf("open work store: %v", err)
+			}
+			target, err := work.Create(beads.Bead{Title: "attach target", Type: tc.targetType})
+			if err != nil {
+				t.Fatalf("create attach bead: %v", err)
+			}
+			var lockHeld []bool
+			hookFormulaCookMetaStamp(t, "handoff", func(string) error {
+				lockHeld = append(lockHeld, sourceWorkflowLockHeld(t, cityDir))
+				return nil
+			})
+
+			var res formulaCookJSONResult
+			for i := range tc.cooks {
+				res = cookFormula(t, "graph-work", "--attach", target.ID, "--meta", fmt.Sprintf("handoff=cook-%d", i))
+			}
+
+			if len(lockHeld) != tc.cooks {
+				t.Fatalf("saw %d --meta stamps over %d cooks, want one per cook", len(lockHeld), tc.cooks)
+			}
+			for i, held := range lockHeld {
+				if !held {
+					t.Errorf("cook %d stamped --meta after releasing the source-workflow lock on %s; an overlapping cook of the same source can stamp in between, and the later cook's values are lost", i, target.ID)
+				}
+			}
+			root, err := work.Get(res.RootID)
+			if err != nil {
+				t.Fatalf("workflow root %s: %v", res.RootID, err)
+			}
+			if want := fmt.Sprintf("cook-%d", tc.cooks-1); root.Metadata["handoff"] != want {
+				t.Errorf("workflow root %s: handoff = %q, want %q", res.RootID, root.Metadata["handoff"], want)
+			}
+		})
+	}
+}
+
+// TestFormulaCookAttachFailedMetaStampReportsTheLiveGraft pins what a failed
+// --meta stamp leaves on each --attach arm. The stamp runs once the graft is
+// committed, so the cook fails with the graft in place: the root is open and
+// the attach bead blocks on it. The error says so, because a caller that reads
+// the failure as "nothing happened" and cooks again grafts a second sub-DAG on
+// the v1 arm, which has no idempotency key. On the graph.v2 arm the synthetic
+// input convoy the live workflow tracks also stays open: closing it is the
+// cleanup for an invocation that never started a workflow.
+func TestFormulaCookAttachFailedMetaStampReportsTheLiveGraft(t *testing.T) {
+	for _, tc := range []struct {
+		formula           string
+		kind              string
+		tracksInputConvoy bool
+	}{
+		{formula: "legacy-work", kind: "sub-DAG"},
+		{formula: "graph-work", kind: "workflow", tracksInputConvoy: true},
+	} {
+		t.Run(tc.formula, func(t *testing.T) {
+			cityDir := oneShotCookCity(t)
+			seedCLIStorageRoutes(t, cityDir, nil)
+			work, err := openStoreAtForCity(cityDir, cityDir)
+			if err != nil {
+				t.Fatalf("open work store: %v", err)
+			}
+			target, err := work.Create(beads.Bead{Title: "attach target", Type: "task"})
+			if err != nil {
+				t.Fatalf("create attach bead: %v", err)
+			}
+			stampErr := errors.New("injected --meta stamp failure")
+			var rootID string
+			hookFormulaCookMetaStamp(t, "handoff", func(id string) error {
+				rootID = id
+				return stampErr
+			})
+
+			out, err := cookFormulaErr(t, tc.formula, "--attach", target.ID, "--meta", "handoff=v")
+
+			if err == nil {
+				t.Fatalf("gc formula cook %s succeeded although its --meta stamp failed: %s", tc.formula, out)
+			}
+			if rootID == "" {
+				t.Fatalf("the cook failed before it tried the --meta stamp: %s", out)
+			}
+			for _, want := range []string{
+				tc.kind + " " + rootID + " is attached to " + target.ID + ", but --meta was not applied",
+				"gc bd update " + rootID + " --set-metadata",
+				stampErr.Error(),
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("output %q does not contain %q", out, want)
+				}
+			}
+			root, err := work.Get(rootID)
+			if err != nil {
+				t.Fatalf("attached root %s: %v", rootID, err)
+			}
+			if root.Status == "closed" {
+				t.Errorf("attached root %s was closed by the failed --meta stamp", rootID)
+			}
+			if got := blockingDepCount(t, work, target.ID); got != 1 {
+				t.Errorf("attach bead %s carries %d blocking deps after the failed stamp, want 1 on %s", target.ID, got, rootID)
+			}
+			if !tc.tracksInputConvoy {
+				return
+			}
+			convoyID := root.Metadata[beadmeta.InputConvoyIDMetadataKey]
+			if convoyID == "" || convoyID == target.ID {
+				t.Fatalf("fixture premise: workflow root %s names input convoy %q, want the synthetic convoy minted for task %s", rootID, convoyID, target.ID)
+			}
+			convoy, err := work.Get(convoyID)
+			if err != nil {
+				t.Fatalf("input convoy %s: %v", convoyID, err)
+			}
+			if convoy.Status == "closed" {
+				t.Errorf("the failed --meta stamp closed input convoy %s, which the live workflow %s tracks", convoyID, rootID)
+			}
+		})
+	}
+}
+
+// hookFormulaCookMetaStamp runs onStamp in front of every metadata batch that
+// carries key, through each store opened after this call. The cook tests pass
+// key only as a --meta pair, so onStamp sees exactly the --meta stamps; an
+// error from it fails that write.
+func hookFormulaCookMetaStamp(t *testing.T, key string, onStamp func(rootID string) error) {
+	t.Helper()
+	prev := observeOpenedStore
+	observeOpenedStore = func(_ string, store beads.Store) beads.Store {
+		return &formulaCookMetaStampStore{Store: store, key: key, onStamp: onStamp}
+	}
+	t.Cleanup(func() { observeOpenedStore = prev })
+}
+
+type formulaCookMetaStampStore struct {
+	beads.Store
+	key     string
+	onStamp func(rootID string) error
+}
+
+func (s *formulaCookMetaStampStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if _, ok := kvs[s.key]; ok {
+		if err := s.onStamp(id); err != nil {
+			return err
+		}
+	}
+	return s.Store.SetMetadataBatch(id, kvs)
+}
+
+// sourceWorkflowLockHeld reports whether the one source-workflow lock under
+// cityPath is held right now. A non-blocking flock through a fresh descriptor
+// of its lock file is refused while any other descriptor holds it, in this
+// process or another: the exclusion the lock gives overlapping cooks.
+func sourceWorkflowLockHeld(t *testing.T, cityPath string) bool {
+	t.Helper()
+	names := sourceWorkflowLockFiles(t, cityPath)
+	if len(names) != 1 {
+		t.Fatalf("source-workflow lock files under %s = %v, want exactly the one the cook takes", cityPath, names)
+	}
+	f, err := os.OpenFile(filepath.Join(citylayout.RuntimeDataDir(cityPath), "sling-source-locks", names[0]), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("opening source-workflow lock %s: %v", names[0], err)
+	}
+	defer f.Close() //nolint:errcheck // test cleanup
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return true
+	}
+	if err != nil {
+		t.Fatalf("probing source-workflow lock %s: %v", names[0], err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("releasing the probe's hold on source-workflow lock %s: %v", names[0], err)
+	}
+	return false
+}
+
 func writeFormulaTestFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -772,6 +1517,7 @@ title = "Do work for {{convoy_id}}"
 		t.Fatalf("write formula: %v", err)
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 	store, err := openStoreAtForCity(cityDir, cityDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -825,6 +1571,28 @@ title = "Do work for {{convoy_id}}"
 			t.Fatalf("source deps = %+v, want blocks dep to graph root %s", deps, root.ID)
 		}
 	}
+	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read execution events: %v", err)
+	}
+	for _, root := range roots {
+		seenAssociation := false
+		seenStep := false
+		for _, event := range recorded {
+			if event.RunID != root.ID {
+				continue
+			}
+			if event.Type == events.ExecutionWorkAssociated && event.Subject == source.ID {
+				seenAssociation = true
+			}
+			if event.Type == events.ExecutionStepDefined && event.Subject != root.ID {
+				seenStep = true
+			}
+		}
+		if !seenAssociation || !seenStep {
+			t.Fatalf("execution events for root %s missing attached work or graph step: %#v", root.ID, recorded)
+		}
+	}
 	sourceAfter, err := store.Get(source.ID)
 	if err != nil {
 		t.Fatalf("get source: %v", err)
@@ -876,7 +1644,7 @@ title = "Do work"
 	// review, quad341): the "cmd/gc+untagged" scope only counts *_test.go call
 	// sites beneath cmd/gc, so routing through internal/formulatest keeps the
 	// env/cwd baselines flat with no policy change.
-	formulatest.SetupHermeticCookEnv(t, cityDir)
+	formulatest.SetupHermeticCookEnv(t, cityDir, cityDir)
 
 	var stdout, stderr bytes.Buffer
 	cmd := newFormulaCookCmd(&stdout, &stderr)
@@ -903,6 +1671,13 @@ title = "Do work"
 	}
 	if got := root.Metadata[beadmeta.ScopeKindMetadataKey]; got != "formula-cook" {
 		t.Fatalf("root %s: gc.scope_kind = %q, want %q", res.RootID, got, "formula-cook")
+	}
+	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read execution events: %v", err)
+	}
+	if len(recorded) == 0 || recorded[0].Type != events.ExecutionStepDefined || recorded[0].RunID != res.RootID {
+		t.Fatalf("execution events = %#v, want initial step-definition snapshot for %s", recorded, res.RootID)
 	}
 }
 
@@ -949,8 +1724,10 @@ title = "Do work"
 	// Select the rig scope via cwd (enclosing-rig resolution in
 	// resolveFormulaScope), which reads the rig from city.toml's [[rigs]] — no
 	// site-registry registration needed, unlike the --rig flag path. The helper
-	// chdirs into the rig dir; resolveCity walks up to the city.toml.
-	formulatest.SetupHermeticCookEnv(t, rigDir)
+	// chdirs into the rig dir while pointing GC_CITY_PATH at cityDir directly,
+	// so the enclosing-rig cwd lookup still sees the rig dir while city
+	// resolution itself no longer depends on an ambient upward walk.
+	formulatest.SetupHermeticCookEnv(t, rigDir, cityDir)
 
 	var stdout, stderr bytes.Buffer
 	cmd := newFormulaCookCmd(&stdout, &stderr)
@@ -1019,6 +1796,7 @@ title = "Do work for {{convoy_id}}"
 		}
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 	store, err := openStoreAtForCity(cityDir, cityDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1086,6 +1864,7 @@ title = "Do work for {{convoy_id}}"
 		t.Fatalf("write formula: %v", err)
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 	store, err := openStoreAtForCity(cityDir, cityDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1123,5 +1902,206 @@ title = "Do work for {{convoy_id}}"
 	}
 	if !reflect.DeepEqual(conflictErr.WorkflowIDs, []string{legacyRoot.ID}) {
 		t.Fatalf("WorkflowIDs = %+v, want [%s]", conflictErr.WorkflowIDs, legacyRoot.ID)
+	}
+}
+
+func TestFormulaCookAttachGraphV2ClosesSyntheticConvoyOnPostPrepareFailure(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(withBuiltinProviderAliasesTOMLForTest(`
+[workspace]
+name = "my-city"
+provider = "claude"
+
+[daemon]
+formula_v2 = true
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaDir := filepath.Join(cityDir, "formulas")
+	if err := os.MkdirAll(formulaDir, 0o755); err != nil {
+		t.Fatalf("mkdir formulas: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.formula.toml"), []byte(`
+formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "step"
+title = "Do work for {{convoy_id}}"
+`), 0o644); err != nil {
+		t.Fatalf("write formula: %v", err)
+	}
+	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	source, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	// A live legacy source workflow makes the locked cook body return a
+	// ConflictError from ListLiveRoots — a deterministic failure that lands
+	// *after* PrepareInvocation has already minted a synthetic input convoy for
+	// the bare bead target. Without cleanup that convoy leaks as an open
+	// claim-attracting bead.
+	if _, err := store.Create(beads.Bead{
+		Title:  "legacy workflow",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":           "workflow",
+			"gc.source_bead_id": source.ID,
+		},
+	}); err != nil {
+		t.Fatalf("create legacy root: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := newFormulaCookCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"graph-work", "--attach", source.ID, "--json"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("formula cook succeeded, want post-prepare conflict failure\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+
+	// List(Type:"convoy") returns only non-terminal beads, so a closed synthetic
+	// convoy drops out; any that remains is a leaked open claim magnet.
+	open, err := store.List(beads.ListQuery{Type: "convoy"})
+	if err != nil {
+		t.Fatalf("list convoys: %v", err)
+	}
+	for _, c := range open {
+		if c.Metadata["gc.synthetic"] == "true" {
+			t.Fatalf("synthetic input convoy %s left open after post-prepare failure (status=%q); want it closed", c.ID, c.Status)
+		}
+	}
+}
+
+// TestFormulaCookAttachHelpDoesNotClaimParentChild pins the #2392 fix:
+// --attach only ever creates a "blocks" dependency back to the attached
+// bead (ensureFormulaCookAttachDep / molecule.Attach both call
+// store.DepAdd(attachBeadID, rootID, "blocks"), never setting ParentID) —
+// the sub-DAG root never becomes a child of the attached bead. The help
+// text previously claimed otherwise ("created as children of the given
+// bead"), which is actionably wrong: convoy auto-close watches
+// parent-child children, not blocks dependents, so a user following the
+// old description would wrongly expect an attached sub-DAG's completion
+// to trigger the attached convoy's auto-close.
+func TestFormulaCookAttachHelpDoesNotClaimParentChild(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cmd := newFormulaCookCmd(&stdout, &stderr)
+	long := strings.ToLower(cmd.Long)
+	if strings.Contains(long, "created as children") {
+		t.Fatalf("gc formula cook --help still claims --attach creates a parent-child relationship; Long=%q", cmd.Long)
+	}
+	if !strings.Contains(long, "blocking dependency") && !strings.Contains(long, "blocks") {
+		t.Fatalf("gc formula cook --help no longer describes the actual blocks-only relationship; Long=%q", cmd.Long)
+	}
+	if !strings.Contains(long, "not") || !strings.Contains(long, "parent") {
+		t.Fatalf("gc formula cook --help does not clarify that --attach is not a parent-child relationship; Long=%q", cmd.Long)
+	}
+}
+
+// TestFormulaListRigFlagListsOnlyThatRigsScope pins that `gc formula list
+// --rig` lists the rig's scope (city layers plus the rig's own), the search
+// paths `gc formula show --rig` compiles against, rather than ignoring --rig
+// and listing every rig's formulas. Callers outside the city pass --city
+// and --rig together, so both are set here.
+func TestFormulaListRigFlagListsOnlyThatRigsScope(t *testing.T) {
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+
+	cityDir := t.TempDir()
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `
+[workspace]
+name = "my-city"
+
+[[rigs]]
+name = "alpha"
+path = "alpha"
+formulas_dir = "alpha-formulas"
+
+[[rigs]]
+name = "beta"
+path = "beta"
+formulas_dir = "beta-formulas"
+`)
+	for dir, name := range map[string]string{
+		"formulas":       "city-work",
+		"alpha-formulas": "alpha-work",
+		"beta-formulas":  "beta-work",
+	} {
+		if err := os.MkdirAll(filepath.Join(cityDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(cityDir, dir, name+".toml"), fmt.Sprintf("formula = %q\n\n[[steps]]\nid = \"step\"\ntitle = \"Do work\"\n", name))
+	}
+	for _, rig := range []string{"alpha", "beta"} {
+		if err := os.MkdirAll(filepath.Join(cityDir, rig), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prevCity, prevRig := cityFlag, rigFlag
+	t.Cleanup(func() { cityFlag, rigFlag = prevCity, prevRig })
+	cityFlag = cityDir
+
+	list := func(rig string) ([]string, error) {
+		t.Helper()
+		rigFlag = rig
+		var stdout, stderr bytes.Buffer
+		cmd := newFormulaListCmd(&stdout, &stderr)
+		cmd.SetArgs([]string{"--json"})
+		if err := cmd.Execute(); err != nil {
+			return nil, err
+		}
+		var out formulaListJSON
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("parse list json %q: %v (stderr=%s)", stdout.String(), err, stderr.String())
+		}
+		names := make([]string, 0, len(out.Formulas))
+		for _, row := range out.Formulas {
+			names = append(names, row.Name)
+		}
+		return names, nil
+	}
+
+	got, err := list("alpha")
+	if err != nil {
+		t.Fatalf("formula list --rig alpha: %v", err)
+	}
+	if want := []string{"alpha-work", "city-work"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("--rig alpha formulas = %v, want %v", got, want)
+	}
+
+	got, err = list("")
+	if err != nil {
+		t.Fatalf("formula list: %v", err)
+	}
+	if want := []string{"alpha-work", "beta-work", "city-work"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("formulas without --rig = %v, want every layer %v", got, want)
+	}
+
+	t.Setenv("GC_RIG", "beta")
+	got, err = list("")
+	if err != nil {
+		t.Fatalf("formula list with GC_RIG=beta: %v", err)
+	}
+	if want := []string{"alpha-work", "beta-work", "city-work"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("GC_RIG must not narrow bare list: got %v, want %v", got, want)
+	}
+
+	if _, err := list("nope"); err == nil || !strings.Contains(err.Error(), `rig "nope" not found`) {
+		t.Errorf("--rig nope error = %v, want rig not found", err)
 	}
 }

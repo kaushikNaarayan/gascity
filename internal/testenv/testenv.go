@@ -61,9 +61,39 @@
 // store traced back to test clients reaching the local server on port 3307
 // (ga-4c2ss6). For the rare legitimate case, set ProdDoltPortOptOutVar
 // (GC_ALLOW_PROD_DOLT_PORT_IN_TESTS) to "1".
+//
+// Hermetic git template: in go-test mode init() also points GIT_TEMPLATE_DIR
+// at a template directory holding a config with maintenance.auto=false, an
+// empty hooks/ and an empty info/exclude, replacing any ambient
+// GIT_TEMPLATE_DIR (which beats init.templateDir) that is not already that
+// template. Every repo this binary or a child it spawns makes with git init or
+// git clone then starts with git's detached auto-maintenance off. Git 2.55
+// starts that daemon after commit, merge, am, fetch and pull, and it races
+// t.TempDir's RemoveAll ("directory not empty", ga-zoe1wr). The template lives
+// in $TEST_TMPDIR when Bazel sets it, else os.TempDir(), named for the owner's
+// uid and a digest of its contents. Git copies a template's hooks/ into every
+// repo it makes, so an existing template is verified against what init()
+// writes (entry by entry, content byte for byte, and on unix owner and mode)
+// before it is used, and one that differs makes init() panic naming the
+// directory to remove. A test binary that another one re-execs inherits
+// GIT_TEMPLATE_DIR and keeps it when it is an absolute path that passes the
+// same verification, so a child started with a TMPDIR of its own creates
+// nothing there. Testscript subcommand mode is left alone, as above. Code that
+// builds a child env from scratch must carry GIT_TEMPLATE_DIR into it, or the
+// repos that child makes lose the guard, and a child that is a test binary
+// installs a template of its own in its temp dir.
+//
+// Dolt event flush: in a go-test binary init() also sets
+// DOLT_DISABLE_EVENT_FLUSH. dolt forks a detached `dolt send-metrics` after each
+// command unless that variable is present, and metrics.disabled in the dolt
+// global config does not stop the fork, so every dolt a test runs, directly or
+// through gc or bd, would otherwise leave a metrics process behind. The variable
+// is a presence switch; dolt does not read its value. Testscript subcommand mode
+// skips it with the scrub, because testscript owns that child env exactly.
 package testenv
 
 import (
+	"encoding/json"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -77,6 +107,12 @@ import (
 // testscript subcommand re-invocation renames the binary (e.g. to `gc`) so
 // its os.Args[0] will not have the `.test` suffix.
 func isGoTestBinary() bool {
+	// Bazel test binaries drop the .test suffix but export TEST_SRCDIR and
+	// name the binary <target>_test; testscript re-invocations rename it
+	// (e.g. "gc"), so require both markers to keep the child env intact.
+	if os.Getenv("TEST_SRCDIR") != "" && strings.HasSuffix(filepath.Base(os.Args[0]), "_test") {
+		return true
+	}
 	name := filepath.Base(os.Args[0])
 	name = strings.TrimSuffix(name, ".exe")
 	return strings.HasSuffix(name, ".test")
@@ -87,6 +123,10 @@ func isGoTestBinary() bool {
 // the list are scrubbed as usual; the passthrough var itself is unset so the
 // list does not flow onward to further subprocesses.
 const PassthroughVar = "GC_TESTENV_PASSTHROUGH"
+
+// doltDisableEventFlushVar is the variable dolt checks, by presence only, before
+// it forks the detached `dolt send-metrics` it otherwise runs after each command.
+const doltDisableEventFlushVar = "DOLT_DISABLE_EVENT_FLUSH"
 
 // LeakVectorVars is the list of env vars that point at live-city paths,
 // session identities, bead stores, or Dolt runtimes. If any of these survive
@@ -104,6 +144,15 @@ const PassthroughVar = "GC_TESTENV_PASSTHROUGH"
 // expensive paths. Rollout-gate env overrides (internal/rollout registry
 // EnvOverride names) DO belong here: a developer's shell value must not leak in
 // and non-deterministically flip a gate's resolved mode during a test.
+//
+// Process-level opt-out vars belong here for the same reason. DO_NOT_TRACK and
+// GC_DISABLE_USAGE_METRICS gate internal/productmetrics, and agent fleets that
+// export GC_DISABLE_USAGE_METRICS=1 into every session leak it into bare
+// `go test` while `make test` (env -i) does not — so the state projection
+// reported environment-disabled instead of the state under test. Whether a
+// productmetrics test passed depended on which shell ran it, which both
+// invented merge-gate rejections of clean branches and could mask a genuine
+// misclassification regression.
 var LeakVectorVars = []string{
 	"BEADS_DIR",
 	"BEADS_DOLT_PASSWORD",
@@ -113,9 +162,11 @@ var LeakVectorVars = []string{
 	"BEADS_DOLT_SERVER_USER",
 	"BEADS_HOLDER_TOKEN",
 	"DOLT_ROOT_PATH",
+	"DO_NOT_TRACK",
 	"GC_AGENT",
 	"GC_ALIAS",
 	"GC_BEADS",
+	"GC_BEADS_ALLOW_SCHEMA_BEHIND_MIGRATE",
 	"GC_BEADS_CONDITIONAL_WRITES",
 	"GC_BEADS_GUARDED_RELEASE",
 	"GC_BEADS_SCOPE_ROOT",
@@ -126,12 +177,27 @@ var LeakVectorVars = []string{
 	"GC_CITY_RUNTIME_DIR",
 	"GC_CONTROL_DISPATCHER_TRACE_DEFAULT",
 	"GC_DIR",
+	"GC_DISABLE_USAGE_METRICS",
 	"GC_DOLT",
 	"GC_DOLT_HOST",
 	"GC_DOLT_PASSWORD",
 	"GC_DOLT_PORT",
 	"GC_DOLT_USER",
 	"GC_HOME",
+	// GC_LANE_FAILPOINT makes a test-hooks gc kill itself at a lane stage
+	// (cmd/gc/conversation_lane_failpoint.go). A leaked shell value would make
+	// a gc child a test starts, or a unit test that enables the stamp, kill
+	// itself, so the scrub owns it; tests that want it set it on the child.
+	"GC_LANE_FAILPOINT",
+	"GC_OPS_CONTENT",
+	"GC_OPS_CONTROL",
+	// GC_OPS_FAILPOINT makes a test-hooks gc kill itself, park a request or
+	// fail an op's closes at an op recording crash point
+	// (cmd/gc/ops_failpoint.go). A leaked shell value would make a gc child a
+	// test starts do so, so the scrub owns it; tests that want it set it on
+	// the child.
+	"GC_OPS_FAILPOINT",
+	"GC_OPS_LIFECYCLE",
 	"GC_SESSION_ID",
 	"GC_SESSION_NAME",
 	"GC_TMUX_SESSION",
@@ -183,27 +249,113 @@ func isLocalDoltHost(host string) bool {
 	return addr.IsLoopback() || addr.IsUnspecified()
 }
 
+// cityConfigFileName is the city-root marker file name. Kept as a stdlib-only
+// literal (mirroring citylayout.CityConfigFile) rather than an import of
+// internal/citylayout, for the same dependency-isolation reason as
+// isLocalDoltHost: this package is blank-imported by every test binary and
+// must not link domain packages.
+const cityConfigFileName = "city.toml"
+
+// doltRuntimeStateRelPath is a city root's managed-Dolt runtime state file,
+// relative to the city root. Mirrors the path
+// internal/beads/contract/connection.go's readManagedRuntimeState reads,
+// duplicated here for the same dependency-isolation reason as
+// cityConfigFileName.
+var doltRuntimeStateRelPath = filepath.Join(".gc", "runtime", "packs", "dolt", "dolt-state.json")
+
+// ambientCityDoltPort walks dir upward looking for a city.toml marker file
+// and, if one is found, returns the port recorded in that city's own
+// managed-Dolt runtime state. ok is false when no city.toml is discoverable
+// above dir, or the discovered city names no usable port — a process running
+// outside any city, or whose ambient city never started a managed Dolt
+// server, simply gives this arm nothing to compare against.
+//
+// This is a minimal, stdlib-only mirror of cmd/gc's findCity walk (package
+// main, so it cannot be imported here). It intentionally does not replicate
+// findCity's ceiling/legacy-runtime handling (home dir, temp dir,
+// GC_CEILING_DIRECTORIES, the supervisor's global runtime root): those
+// ceilings exist so production city *resolution* picks the intended city
+// over an unrelated ancestor. Here, any city.toml found above dir names
+// self-relative production data worth guarding against regardless of whose
+// city it is — walking all the way to the filesystem root is deliberately
+// more conservative, not less.
+func ambientCityDoltPort(dir string) (string, bool) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false
+	}
+	for {
+		if fi, statErr := os.Stat(filepath.Join(abs, cityConfigFileName)); statErr == nil && !fi.IsDir() {
+			return doltStatePort(abs)
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return "", false
+		}
+		abs = parent
+	}
+}
+
+// doltStatePort reads cityRoot's managed-Dolt runtime state and returns its
+// recorded port. ok is false if the state file is missing, unparsable, or
+// names no positive port — a best-effort signal, not a requirement that
+// every city have a running managed Dolt server.
+func doltStatePort(cityRoot string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(cityRoot, doltRuntimeStateRelPath))
+	if err != nil {
+		return "", false
+	}
+	var state struct {
+		Port int `json:"port"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || state.Port <= 0 {
+		return "", false
+	}
+	return strconv.Itoa(state.Port), true
+}
+
 // refuseProdDoltPort panics when a Dolt port var that will outlive init()
-// points at the local production Dolt server. survives reports whether the
-// named var survives the scrub: always in testscript subcommand mode,
-// passthrough-listed only in go-test mode. Port values are parsed with
-// strconv.Atoi the way consumers do, so numeric equivalents of ProdDoltPort
-// like "03307" and "+3307" fire too; unparsable values never reach a server
-// and are skipped. A paired host var that survives with a non-local value
-// disarms the guard for that pair — 3307 is Dolt's default port, so
-// external-server fixtures use it legitimately. A port var with no paired
-// host var is implicitly local and is never disarmed. ProdDoltPortOptOutVar
-// set to "1" disables the guard entirely.
+// points at a production Dolt server. survives reports whether the named var
+// survives the scrub: always in testscript subcommand mode,
+// passthrough-listed only in go-test mode. ProdDoltPortOptOutVar set to "1"
+// disables the guard entirely, for both detection arms below.
+//
+// Two independent arms feed refuseDoltPortValue: the hardcoded ProdDoltPort
+// constant (the well-known maintainer-host port), and — additively — the
+// port recorded in whatever city is ambiently discoverable from this
+// process's own working directory. The hardcoded constant alone cannot catch
+// a fleet whose managed Dolt port isn't 3307 (ga-cnyuq1); the ambient arm is
+// self-relative, so it protects each city's actual port without a second
+// hardcoded magic number. Known limitation: this guard runs only inside
+// internal/testenv's own init(), which never runs inside a forked,
+// separately-exec'd production `gc` binary subprocess — see ga-bixdpi.
 func refuseProdDoltPort(survives func(name string) bool) {
 	if os.Getenv(ProdDoltPortOptOutVar) == "1" {
 		return
 	}
+	refuseDoltPortValue(survives, ProdDoltPort)
+	if wd, err := os.Getwd(); err == nil {
+		if ambientPort, ok := ambientCityDoltPort(wd); ok {
+			refuseDoltPortValue(survives, ambientPort)
+		}
+	}
+}
+
+// refuseDoltPortValue panics when a Dolt port var that will outlive init()
+// carries targetPort with a local (or unproven) paired host. Port values are
+// parsed with strconv.Atoi the way consumers do, so numeric equivalents of
+// targetPort like "03307" and "+3307" fire too; unparsable values never
+// reach a server and are skipped. A paired host var that survives with a
+// non-local value disarms the guard for that pair — 3307 is Dolt's default
+// port, so external-server fixtures use it legitimately. A port var with no
+// paired host var is implicitly local and is never disarmed.
+func refuseDoltPortValue(survives func(name string) bool, targetPort string) {
 	for portVar, hostVar := range doltPortVars {
 		if !survives(portVar) {
 			continue
 		}
 		port, err := strconv.Atoi(strings.TrimSpace(os.Getenv(portVar)))
-		if err != nil || strconv.Itoa(port) != ProdDoltPort {
+		if err != nil || strconv.Itoa(port) != targetPort {
 			continue
 		}
 		host := ""
@@ -213,7 +365,7 @@ func refuseProdDoltPort(survives func(name string) bool) {
 		if !isLocalDoltHost(host) {
 			continue
 		}
-		panic("testenv: " + portVar + "=" + ProdDoltPort + " with a local Dolt host points at the production Dolt server; refusing to run tests against it (set " + ProdDoltPortOptOutVar + "=1 to deliberately allow it)")
+		panic("testenv: " + portVar + "=" + targetPort + " with a local Dolt host points at a production Dolt server; refusing to run tests against it (set " + ProdDoltPortOptOutVar + "=1 to deliberately allow it)")
 	}
 }
 
@@ -228,6 +380,7 @@ func init() {
 		refuseProdDoltPort(func(string) bool { return true })
 		return
 	}
+	prependBazelTools()
 	keep := map[string]bool{}
 	if list := os.Getenv(PassthroughVar); list != "" {
 		for _, name := range strings.Split(list, ",") {
@@ -243,4 +396,8 @@ func init() {
 			_ = os.Unsetenv(name)
 		}
 	}
+	seedGitTemplate()
+	// Not a leak vector, so the scrub above leaves it alone and a passthrough
+	// list cannot name it; set unconditionally because only its presence counts.
+	_ = os.Setenv(doltDisableEventFlushVar, "1")
 }

@@ -2,19 +2,25 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
+	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/usage"
 )
 
@@ -50,6 +56,32 @@ func TestComputeFactGetCandidate(t *testing.T) {
 	}
 }
 
+func TestLiveModelSweepCandidate(t *testing.T) {
+	const awakeStart = "2026-01-02T00:30:00Z"
+	for _, tc := range []struct {
+		name  string
+		state string
+		awake string
+		want  bool
+	}{
+		{name: "active", state: "active", awake: awakeStart, want: true},
+		{name: "awake alias", state: "awake", awake: awakeStart, want: true},
+		{name: "missing interval anchor", state: "active", want: false},
+		{name: "terminal", state: "asleep", awake: awakeStart, want: false},
+		{name: "transitional", state: "draining", awake: awakeStart, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := session.Info{MetadataState: tc.state, AwakeStartedAt: tc.awake}
+			if got := liveModelSweepCandidate(info); got != tc.want {
+				t.Fatalf("liveModelSweepCandidate() = %v, want %v", got, tc.want)
+			}
+			if isLiveModelSweepState(tc.state) && isComputeTerminalState(tc.state) {
+				t.Fatalf("state %q is both live and compute-terminal", tc.state)
+			}
+		})
+	}
+}
+
 type captureSink struct{ facts []usage.Fact }
 
 func (c *captureSink) Record(_ context.Context, f usage.Fact) error {
@@ -71,12 +103,11 @@ func TestEmitComputeFactForBead(t *testing.T) {
 	b, err := store.Create(beads.Bead{
 		Title: "session",
 		Metadata: map[string]string{
-			"state":               "asleep",
-			"session_name":        "s-x",
-			"awake_started_at":    start.Format(time.RFC3339),
-			"slept_at":            slept.Format(time.RFC3339),
-			"molecule_id":         "mol-7",
-			"gc.active_work_bead": "mol.finalize", // the step the session was on; cleared at this terminal pass
+			"state":            "asleep",
+			"session_name":     "s-x",
+			"awake_started_at": start.Format(time.RFC3339),
+			"slept_at":         slept.Format(time.RFC3339),
+			"molecule_id":      "mol-7",
 		},
 	})
 	if err != nil {
@@ -117,11 +148,6 @@ func TestEmitComputeFactForBead(t *testing.T) {
 	refreshed, err := store.Get(b.ID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	// The terminal pass also CLEARS the active-work-bead pointer, so an idle
-	// invocation after this work attributes at run level (StepID="") not the old step.
-	if got := refreshed.Metadata["gc.active_work_bead"]; got != "" {
-		t.Fatalf("gc.active_work_bead = %q, want cleared (\"\") at the terminal pass", got)
 	}
 	if emitComputeFactForBead(context.Background(), sink, store, refreshed, "fake", "demo", now, nil, true) {
 		t.Fatal("second emit on same interval must no-op (marker set)")
@@ -281,20 +307,23 @@ func TestEmitComputeFactForBeadHungSinkReturnsPromptly(t *testing.T) {
 	}
 }
 
+const codexSweepSessionKey = "019e3e8e-3591-7532-a1ef-8b9e882bea2f"
+
 // writeCodexRolloutForSweep fabricates a codex rollout transcript
 // (rollout-<localtime>-<sessionID>.jsonl) under root/YYYY/MM/DD reachable by the
 // window-free keyed discovery: a session_meta line whose cwd is workDir, a
 // turn_context supplying the model, and one event_msg token_count per element of
-// tokenCounts ({total, lastInput, lastOutput}). Returns the rollout path.
-func writeCodexRolloutForSweep(t *testing.T, root, workDir, sessionID string, tokenCounts [][3]int) {
+// tokenCounts ({total, lastInput, lastOutput}). The keyed sweep scenarios share
+// codexSweepSessionKey; callers vary only the transcript contents and location.
+func writeCodexRolloutForSweep(t *testing.T, root, workDir string, tokenCounts [][3]int) {
 	t.Helper()
 	dayDir := filepath.Join(root, "2026", "06", "15")
 	if err := os.MkdirAll(dayDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dayDir, "rollout-2026-06-15T10-00-00-"+sessionID+".jsonl")
+	path := filepath.Join(dayDir, "rollout-2026-06-15T10-00-00-"+codexSweepSessionKey+".jsonl")
 	lines := []string{
-		fmt.Sprintf(`{"timestamp":"2026-06-15T10:00:00.000Z","type":"session_meta","payload":{"id":%q,"cwd":%q}}`, sessionID, workDir),
+		fmt.Sprintf(`{"timestamp":"2026-06-15T10:00:00.000Z","type":"session_meta","payload":{"id":%q,"cwd":%q}}`, codexSweepSessionKey, workDir),
 		`{"timestamp":"2026-06-15T10:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}`,
 	}
 	for i, tc := range tokenCounts {
@@ -321,6 +350,423 @@ func kindCount(facts []usage.Fact, kind usage.Kind) int {
 	return n
 }
 
+// rawSinkModelFactCount counts the model facts APPENDED to the sink file,
+// without usage.ReadFacts's IdempotencyKey dedup. Idempotency assertions must
+// use this: ReadFacts collapses a replayed fact at read time, so it would
+// silently pass even if a tick re-recorded work the cursor should have skipped.
+func rawSinkModelFactCount(t *testing.T, path string) int {
+	t.Helper()
+	return rawSinkFactCount(t, path, usage.KindModel)
+}
+
+// liveSweepStart anchors a live fixture just behind the wall clock. A live
+// session has no slept_at, so its transcript-discovery window runs from
+// awake_started_at all the way to now: a hardcoded fixture date drifts out of
+// discovery's bounded day lookback as real time advances, and the fixture stops
+// being discoverable — the test would start failing for everyone on a fixed
+// future day. Deriving the anchor from time.Now keeps the window an hour wide
+// forever.
+func liveSweepStart() time.Time {
+	return time.Now().UTC().Add(-time.Hour)
+}
+
+// liveCodexSessionMeta is an AWAKE codex session's metadata: a non-terminal state
+// and NO slept_at, so it is a live-lane candidate whose discovery window runs to
+// the wall clock. An empty sessionKey is omitted entirely, selecting the keyless
+// (work_dir, wake-window) discovery path.
+func liveCodexSessionMeta(start time.Time, workDir, sessionKey string) map[string]string {
+	meta := map[string]string{
+		"state":            "active",
+		"session_name":     "codex-live-1",
+		"awake_started_at": start.Format(time.RFC3339),
+		"work_dir":         workDir,
+		"provider":         "codex",
+		"builtin_ancestor": "codex",
+		"molecule_id":      "run-L",
+	}
+	if sessionKey != "" {
+		meta["session_key"] = sessionKey
+	}
+	return meta
+}
+
+// liveSweepHarness is the shared wiring for the live model-usage sweep cases: a
+// session bead in a memory store, a real usage sink, and codexRoot as the only
+// transcript search path. The cases differ only in session metadata and in what
+// is on disk, so everything else is built once here.
+type liveSweepHarness struct {
+	cr       *CityRuntime
+	store    *beads.MemStore
+	meta     map[string]string
+	beadID   string
+	sinkPath string
+	info     session.Info
+}
+
+func newLiveSweepHarness(t *testing.T, codexRoot string, meta map[string]string) liveSweepHarness {
+	t.Helper()
+	cityPath := t.TempDir()
+	sinkPath := filepath.Join(cityPath, ".gc", "usage.jsonl")
+	store := beads.NewMemStore()
+	cfg := &config.City{Daemon: config.DaemonConfig{ObservePaths: []string{codexRoot}}}
+	cs := &controllerState{cityBeadStore: store, usageSink: usage.NewLocalSink(sinkPath), cityName: "demo", cityPath: cityPath}
+	h := liveSweepHarness{
+		cr:       &CityRuntime{cs: cs, cfg: cfg, sp: runtime.NewFake(), cityName: "demo", cityPath: cityPath, stderr: io.Discard},
+		store:    store,
+		meta:     meta,
+		sinkPath: sinkPath,
+	}
+	h.info = h.addSession(t, meta)
+	h.beadID = h.info.ID
+	return h
+}
+
+// addSession creates another session bead in the harness store and returns the
+// snapshot row the reconcile tick would hand emitDueComputeFacts for it.
+func (h liveSweepHarness) addSession(t *testing.T, meta map[string]string) session.Info {
+	t.Helper()
+	b, err := h.store.Create(beads.Bead{
+		Type:     session.BeadType,
+		Status:   "open",
+		Title:    meta["session_name"],
+		Labels:   []string{session.LabelSession},
+		Metadata: meta,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session.Info{ID: b.ID, MetadataState: meta["state"], AwakeStartedAt: meta["awake_started_at"]}
+}
+
+// tick runs one STEADY-STATE reconcile-tick usage pass over the harness session.
+// The boot pass is driven directly by the one case that covers it, which needs a
+// two-session snapshot anyway.
+func (h liveSweepHarness) tick() {
+	h.cr.emitDueComputeFacts(context.Background(), []session.Info{h.info}, false)
+}
+
+// memo returns the live-sweep memo the tick holds for this session's current
+// awake epoch and conversation.
+func (h liveSweepHarness) memo() liveSweepMemo {
+	return h.cr.liveSweepMemoFor(h.beadID, h.meta["awake_started_at"], h.meta["session_key"])
+}
+
+// expireSweepThrottle clears the session's liveModelSweepMinInterval floor,
+// standing in for that interval elapsing between ticks. It preserves the rest of
+// the memo (resolved path, settled-miss sentinel) so a case advances only the
+// clock.
+func (h liveSweepHarness) expireSweepThrottle() {
+	memo := h.memo()
+	memo.nextSweepAt = time.Time{}
+	h.cr.storeLiveSweepMemo(h.beadID, memo)
+}
+
+func (h liveSweepHarness) cursor(t *testing.T) string {
+	t.Helper()
+	b, err := h.store.Get(h.beadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b.Metadata[session.MetadataKeyInvocationUsageCursor]
+}
+
+// TestEmitDueComputeFactsSweepsLiveSessionModelUsage is the undercount
+// regression for "model calls today": model facts used to be minted only by the
+// terminal end-of-interval sweep, so a session that stayed awake for hours
+// contributed nothing to the day's totals until it finally closed. The reconcile
+// tick must sweep an AWAKE session's transcript incrementally — billing each
+// invocation as it lands, without minting a compute fact or closing the still-open
+// interval — and the persisted invocation cursor must make a tick with no new
+// transcript activity a no-op.
+func TestEmitDueComputeFactsSweepsLiveSessionModelUsage(t *testing.T) {
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	start := liveSweepStart()
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},  // total=150, last input=100, output=50
+		{450, 200, 100}, // total=450, last input=200, output=100
+	})
+	h := newLiveSweepHarness(t, codexRoot, liveCodexSessionMeta(start, workDir, codexSweepSessionKey))
+
+	// Tick 1: nothing terminal has happened, yet both invocations already on the
+	// transcript must bill now instead of waiting for retirement.
+	h.tick()
+	facts1, warnings, err := usage.ReadFacts(h.sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts (tick 1): %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected sink warnings: %v", warnings)
+	}
+	if got := kindCount(facts1, usage.KindModel); got != 2 {
+		t.Fatalf("tick 1 model facts = %d, want 2 (a live session's invocations must bill before it closes); facts: %+v", got, facts1)
+	}
+	if got := kindCount(facts1, usage.KindCompute); got != 0 {
+		t.Fatalf("tick 1 compute facts = %d, want 0: the awake interval has not ended", got)
+	}
+	for _, f := range facts1 {
+		if f.RunID != "run-L" {
+			t.Fatalf("fact RunID = %q, want run-L: %+v", f.RunID, f)
+		}
+		if f.Provider != "codex" {
+			t.Fatalf("model fact Provider = %q, want codex", f.Provider)
+		}
+	}
+
+	// The interval stays OPEN: stamping either accounting marker on a live sweep
+	// would suppress the real end-of-interval compute fact and terminal sweep.
+	afterTick1, err := h.store.Get(h.beadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := afterTick1.Metadata[session.MetadataKeyInvocationUsageCursor]; got != "total:450" {
+		t.Fatalf("invocation_usage_cursor = %q, want total:450 (advanced past the swept batch)", got)
+	}
+	if got := afterTick1.Metadata[usageComputeEmittedAtKey]; got != "" {
+		t.Fatalf("live sweep closed the awake interval (usage_compute_emitted_at = %q), want unset", got)
+	}
+	if got := afterTick1.Metadata[usageModelSweptAtKey]; got != "" {
+		t.Fatalf("live sweep stamped the terminal sweep marker (%q), want unset while the interval accumulates", got)
+	}
+
+	// Discovery is memoized for this awake epoch so a per-tick sweep does not
+	// repeat the bounded rollout scan.
+	if memo := h.memo(); memo.path == "" {
+		t.Fatalf("tick 1 did not memoize the resolved transcript path: memo=%+v", memo)
+	}
+
+	// Tick 2: no transcript activity. The sweep-interval floor is cleared first so
+	// this asserts the CURSOR, not the throttle (TestEmitDueComputeFactsThrottles-
+	// LiveModelSweep owns the floor): a live session stays a candidate on every
+	// tick, so only the persisted cursor prevents a double-count.
+	h.expireSweepThrottle()
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 2 {
+		t.Fatalf("tick 2 appended model facts to a total of %d, want 2: the cursor must make a no-activity tick a no-op", got)
+	}
+
+	// Tick 3: one new invocation lands. Only that delta bills, and the session is
+	// still awake, so still no compute fact.
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+		{750, 300, 150},
+	})
+	h.expireSweepThrottle()
+	h.tick()
+	facts3, _, err := usage.ReadFacts(h.sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts (tick 3): %v", err)
+	}
+	if got := kindCount(facts3, usage.KindModel); got != 3 {
+		t.Fatalf("tick 3 model facts = %d, want 3 (one appended invocation): %+v", got, facts3)
+	}
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 3 {
+		t.Fatalf("tick 3 appended model facts to a total of %d, want 3 (only the delta)", got)
+	}
+	if got := kindCount(facts3, usage.KindCompute); got != 0 {
+		t.Fatalf("tick 3 compute facts = %d, want 0 while the session is awake", got)
+	}
+	if got := h.cursor(t); got != "total:750" {
+		t.Fatalf("invocation_usage_cursor = %q, want total:750", got)
+	}
+}
+
+// TestEmitDueComputeFactsThrottlesLiveModelSweep pins the live lane's cost
+// bound. Unlike the terminal lane — gated by a persisted per-interval marker, so
+// it touches a session once — a live session is a candidate on EVERY tick, so
+// without a floor the reconcile tick would run bounded transcript discovery and a
+// transcript read for every awake session at whatever cadence the tick spins
+// (pokes drive it sub-second). A session must be swept at most once per
+// liveModelSweepMinInterval no matter how often the tick fires.
+func TestEmitDueComputeFactsThrottlesLiveModelSweep(t *testing.T) {
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	start := liveSweepStart()
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+	})
+	h := newLiveSweepHarness(t, codexRoot, liveCodexSessionMeta(start, workDir, codexSweepSessionKey))
+
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 2 {
+		t.Fatalf("tick 1 model facts = %d, want 2", got)
+	}
+	if memo := h.memo(); !memo.nextSweepAt.After(time.Now().UTC()) {
+		t.Fatalf("tick 1 left the sweep-interval floor unarmed: nextSweepAt=%v", memo.nextSweepAt)
+	}
+
+	// A third invocation lands and the tick fires again immediately. The session is
+	// inside its floor, so it must not be re-swept — no discovery, no transcript
+	// read, no fact — even though there is genuinely new usage waiting.
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+		{750, 300, 150},
+	})
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 2 {
+		t.Fatalf("tick 2 model facts = %d, want 2: a tick inside liveModelSweepMinInterval must not re-sweep the session", got)
+	}
+	if got := h.cursor(t); got != "total:450" {
+		t.Fatalf("invocation_usage_cursor = %q, want total:450 (unmoved by the throttled tick)", got)
+	}
+
+	// Once the floor elapses the same session is swept again and the delta bills:
+	// the throttle delays a sweep, it never drops one.
+	h.expireSweepThrottle()
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 3 {
+		t.Fatalf("tick 3 model facts = %d, want 3 (the delta bills once the floor elapses)", got)
+	}
+}
+
+// TestEmitDueComputeFactsSkipsLiveModelSweepOnBootPass pins the boot carve-out.
+// The boot reconcile covers the WHOLE fleet at once on the synchronous readiness
+// path, which is exactly where fleet-proportional per-session file discovery and
+// reads must not land. The live lane therefore waits for the first steady-state
+// tick — while the terminal lane, whose per-interval marker makes it self-limiting,
+// keeps running on boot as before.
+func TestEmitDueComputeFactsSkipsLiveModelSweepOnBootPass(t *testing.T) {
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	start := liveSweepStart()
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+	})
+	h := newLiveSweepHarness(t, codexRoot, liveCodexSessionMeta(start, workDir, codexSweepSessionKey))
+
+	// A retired session in the same snapshot: its interval ended, so the terminal
+	// lane owes it a compute fact on the boot pass. Its own workdir has no rollout,
+	// so it contributes no model facts either way.
+	slept := start.Add(90 * time.Second)
+	terminal := h.addSession(t, map[string]string{
+		"state":            "asleep",
+		"session_name":     "codex-retired-1",
+		"awake_started_at": start.Format(time.RFC3339),
+		"slept_at":         slept.Format(time.RFC3339),
+		"session_key":      "019e7777-cccc-7000-8000-00000000000b",
+		"work_dir":         t.TempDir(),
+		"provider":         "codex",
+		"builtin_ancestor": "codex",
+		"molecule_id":      "run-T",
+	})
+	snapshot := []session.Info{h.info, terminal}
+
+	h.cr.emitDueComputeFacts(context.Background(), snapshot, true)
+	bootFacts, _, err := usage.ReadFacts(h.sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts (boot pass): %v", err)
+	}
+	if got := kindCount(bootFacts, usage.KindModel); got != 0 {
+		t.Fatalf("boot pass model facts = %d, want 0: the live lane must not run on the fleet-wide boot reconcile; facts: %+v", got, bootFacts)
+	}
+	if got := kindCount(bootFacts, usage.KindCompute); got != 1 {
+		t.Fatalf("boot pass compute facts = %d, want 1: the terminal lane's cost profile is unchanged and must keep running on boot", got)
+	}
+	if got := h.cursor(t); got != "" {
+		t.Fatalf("boot pass advanced the live session's invocation cursor to %q, want unset (it must not be swept at all)", got)
+	}
+	if memo := h.memo(); memo.path != "" || !memo.nextSweepAt.IsZero() {
+		t.Fatalf("boot pass touched the live session's sweep memo: %+v", memo)
+	}
+
+	// The very next steady-state tick picks the live session up: boot DEFERS the
+	// lane, it does not disable it.
+	h.cr.emitDueComputeFacts(context.Background(), snapshot, false)
+	steadyFacts, _, err := usage.ReadFacts(h.sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts (steady tick): %v", err)
+	}
+	if got := kindCount(steadyFacts, usage.KindModel); got != 2 {
+		t.Fatalf("steady tick model facts = %d, want 2 (the deferred live sweep runs on the first non-boot tick): %+v", got, steadyFacts)
+	}
+}
+
+// TestEmitDueComputeFactsBacksOffUnresolvedLiveSweepDiscovery pins the miss
+// memoization. A live session is a candidate on every tick, so an awake session
+// whose transcript cannot be discovered yet would otherwise re-run the bounded
+// rollout scan forever, once per tick, for its entire life. A TRANSIENT miss must
+// be memoized as a backoff: re-attempted on the sweep floor rather than on every
+// tick, and never dropped.
+func TestEmitDueComputeFactsBacksOffUnresolvedLiveSweepDiscovery(t *testing.T) {
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	start := liveSweepStart()
+	h := newLiveSweepHarness(t, codexRoot, liveCodexSessionMeta(start, workDir, codexSweepSessionKey))
+
+	// Tick 1: the keyed rollout is not on disk yet. That miss is transient — the
+	// file may simply not be flushed — so it must not settle.
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 0 {
+		t.Fatalf("tick 1 model facts = %d, want 0 (no transcript on disk yet)", got)
+	}
+	memo := h.memo()
+	if memo.settledMiss {
+		t.Fatal("a keyed rollout that is merely not flushed yet must not be memoized as a settled miss")
+	}
+	if memo.nextSweepAt.IsZero() {
+		t.Fatal("an unresolved discovery must still arm the sweep floor, or discovery re-runs on every tick forever")
+	}
+
+	// The transcript lands immediately after. Tick 2 is inside the backoff, so
+	// discovery is NOT re-attempted.
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+	})
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 0 {
+		t.Fatalf("tick 2 model facts = %d, want 0: a memoized miss must not re-run discovery inside its backoff", got)
+	}
+
+	// Once the floor elapses discovery is retried and the pending usage is
+	// recovered.
+	h.expireSweepThrottle()
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 2 {
+		t.Fatalf("tick 3 model facts = %d, want 2 (discovery retried once the backoff elapsed)", got)
+	}
+}
+
+// TestEmitDueComputeFactsStopsRetryingSettledLiveSweepMiss pins the other half of
+// the miss memoization: a DEFINITIVE miss is not retried at all. A keyless codex
+// session whose bounded (work_dir, wake-window) scan comes up empty on a CLEAN
+// scan has nothing to find — the outcome is ambiguity, an out-of-window filename,
+// or a TZ shift, none of which a retry resolves — so the live lane records the
+// verdict once and stops scanning for that awake epoch.
+func TestEmitDueComputeFactsStopsRetryingSettledLiveSweepMiss(t *testing.T) {
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	start := liveSweepStart()
+	// No session_key: discovery takes the keyless workdir+window fallback.
+	h := newLiveSweepHarness(t, codexRoot, liveCodexSessionMeta(start, workDir, ""))
+
+	h.tick()
+	memo := h.memo()
+	if !memo.settledMiss {
+		t.Fatalf("a clean keyless scan that found nothing is definitive and must settle: memo=%+v", memo)
+	}
+
+	// Even with the floor cleared AND a matching rollout now on disk, the settled
+	// miss is never re-attempted. Nothing is lost: the interval's usage is still
+	// recovered by the terminal sweep when the session finally closes, and a re-wake
+	// starts a fresh epoch that discovers again.
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, "019e7777-cccc-7000-8000-00000000000c", [][3]int{
+		{150, 100, 50},
+	})
+	h.expireSweepThrottle()
+	h.tick()
+	if got := rawSinkModelFactCount(t, h.sinkPath); got != 0 {
+		t.Fatalf("model facts = %d, want 0: a settled discovery miss must never re-run discovery", got)
+	}
+	if got := h.cursor(t); got != "" {
+		t.Fatalf("invocation_usage_cursor = %q, want unset (nothing was swept)", got)
+	}
+}
+
 // TestEmitDueComputeFactsAlsoSweepsModelUsage is the CORE regression for the
 // token-starvation bug: the controller reconcile tick emits per-interval compute
 // facts but never any model facts for pool-routed, hook-self-driven codex agents,
@@ -336,8 +782,8 @@ func TestEmitDueComputeFactsAlsoSweepsModelUsage(t *testing.T) {
 
 	// Codex names rollouts by the session_key uuid suffix; the keyed no-window
 	// discovery matches on exactly that.
-	sessionKey := "019e3e8e-3591-7532-a1ef-8b9e882bea2f"
-	writeCodexRolloutForSweep(t, codexRoot, workDir, sessionKey, [][3]int{
+	sessionKey := codexSweepSessionKey
+	writeCodexRolloutForSweep(t, codexRoot, workDir, [][3]int{
 		{150, 100, 50},  // total=150, last input=100, output=50
 		{450, 200, 100}, // total=450, last input=200, output=100
 	})
@@ -351,16 +797,15 @@ func TestEmitDueComputeFactsAlsoSweepsModelUsage(t *testing.T) {
 		Title:  "codex session",
 		Labels: []string{session.LabelSession},
 		Metadata: map[string]string{
-			"state":               "asleep",
-			"session_name":        "codex-1",
-			"awake_started_at":    start.Format(time.RFC3339),
-			"slept_at":            slept.Format(time.RFC3339),
-			"session_key":         sessionKey,
-			"work_dir":            workDir,
-			"provider":            "mc-codex-wrap", // wrapped manifold name
-			"builtin_ancestor":    "codex",         // canonical ladder resolves this to codex
-			"molecule_id":         "run-Z",
-			"gc.active_work_bead": "run-Z.step-1",
+			"state":            "asleep",
+			"session_name":     "codex-1",
+			"awake_started_at": start.Format(time.RFC3339),
+			"slept_at":         slept.Format(time.RFC3339),
+			"session_key":      sessionKey,
+			"work_dir":         workDir,
+			"provider":         "mc-codex-wrap", // wrapped manifold name
+			"builtin_ancestor": "codex",         // canonical ladder resolves this to codex
+			"molecule_id":      "run-Z",
 		},
 	})
 	if err != nil {
@@ -377,7 +822,7 @@ func TestEmitDueComputeFactsAlsoSweepsModelUsage(t *testing.T) {
 	cr := &CityRuntime{cs: cs, cfg: cfg, sp: runtime.NewFake(), cityName: "demo", cityPath: cityPath, stderr: io.Discard}
 
 	info := session.Info{ID: b.ID, MetadataState: "asleep", AwakeStartedAt: start.Format(time.RFC3339)}
-	cr.emitDueComputeFacts(context.Background(), []session.Info{info})
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
 
 	facts, warnings, err := usage.ReadFacts(sinkPath)
 	if err != nil {
@@ -407,8 +852,8 @@ func TestEmitDueComputeFactsAlsoSweepsModelUsage(t *testing.T) {
 			continue
 		}
 		seen[fmt.Sprintf("%d/%d", f.InputTokens, f.OutputTokens)] = true
-		if f.StepID != "run-Z.step-1" {
-			t.Fatalf("model fact StepID = %q, want run-Z.step-1 (the interval's active work bead)", f.StepID)
+		if f.StepID != "" {
+			t.Fatalf("model fact StepID = %q, want empty (run-level attribution)", f.StepID)
 		}
 		if f.Provider != "codex" {
 			t.Fatalf("model fact Provider = %q, want codex (wrapped name resolved via builtin_ancestor)", f.Provider)
@@ -430,7 +875,7 @@ func TestEmitDueComputeFactsAlsoSweepsModelUsage(t *testing.T) {
 	// A second tick must add no new facts: the cursor blocks the model re-record
 	// and the emit marker blocks the compute re-emit; ReadFacts also dedups any
 	// replay by IdempotencyKey.
-	cr.emitDueComputeFacts(context.Background(), []session.Info{info})
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
 	facts2, _, err := usage.ReadFacts(sinkPath)
 	if err != nil {
 		t.Fatalf("ReadFacts (second tick): %v", err)
@@ -453,7 +898,7 @@ func TestEmitDueComputeFactsRetriesUnsettledModelSweep(t *testing.T) {
 	workDir := t.TempDir()
 	codexRoot := t.TempDir()
 	sinkPath := filepath.Join(cityPath, ".gc", "usage.jsonl")
-	sessionKey := "019e3e8e-3591-7532-a1ef-8b9e882bea2f"
+	sessionKey := codexSweepSessionKey
 
 	store := beads.NewMemStore()
 	start := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
@@ -464,16 +909,15 @@ func TestEmitDueComputeFactsRetriesUnsettledModelSweep(t *testing.T) {
 		Title:  "codex session",
 		Labels: []string{session.LabelSession},
 		Metadata: map[string]string{
-			"state":               "asleep",
-			"session_name":        "codex-1",
-			"awake_started_at":    start.Format(time.RFC3339),
-			"slept_at":            slept.Format(time.RFC3339),
-			"session_key":         sessionKey,
-			"work_dir":            workDir,
-			"provider":            "codex",
-			"builtin_ancestor":    "codex",
-			"molecule_id":         "run-Z",
-			"gc.active_work_bead": "run-Z.step-1",
+			"state":            "asleep",
+			"session_name":     "codex-1",
+			"awake_started_at": start.Format(time.RFC3339),
+			"slept_at":         slept.Format(time.RFC3339),
+			"session_key":      sessionKey,
+			"work_dir":         workDir,
+			"provider":         "codex",
+			"builtin_ancestor": "codex",
+			"molecule_id":      "run-Z",
 		},
 	})
 	if err != nil {
@@ -488,7 +932,7 @@ func TestEmitDueComputeFactsRetriesUnsettledModelSweep(t *testing.T) {
 	// Tick 1: the rollout is not on disk yet → the sweep misses (transient). The
 	// compute fact still records, but neither the compute marker nor the sweep
 	// marker is stamped, so the interval stays open for retry.
-	cr.emitDueComputeFacts(context.Background(), []session.Info{info})
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
 	facts1, _, err := usage.ReadFacts(sinkPath)
 	if err != nil {
 		t.Fatalf("ReadFacts (tick 1): %v", err)
@@ -511,14 +955,14 @@ func TestEmitDueComputeFactsRetriesUnsettledModelSweep(t *testing.T) {
 	}
 
 	// The transcript is flushed to disk between ticks.
-	writeCodexRolloutForSweep(t, codexRoot, workDir, sessionKey, [][3]int{
+	writeCodexRolloutForSweep(t, codexRoot, workDir, [][3]int{
 		{150, 100, 50},
 		{450, 200, 100},
 	})
 
 	// Tick 2: the interval is still a candidate → the sweep retries, discovers the
 	// rollout, and recovers the model facts. No duplicate compute fact.
-	cr.emitDueComputeFacts(context.Background(), []session.Info{info})
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
 	facts2, _, err := usage.ReadFacts(sinkPath)
 	if err != nil {
 		t.Fatalf("ReadFacts (tick 2): %v", err)
@@ -543,13 +987,137 @@ func TestEmitDueComputeFactsRetriesUnsettledModelSweep(t *testing.T) {
 
 	// Tick 3: both markers set → no re-Get work, no new facts.
 	info.UsageComputeEmittedAt = awake // reflects the committed interval on the snapshot
-	cr.emitDueComputeFacts(context.Background(), []session.Info{info})
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
 	facts3, _, err := usage.ReadFacts(sinkPath)
 	if err != nil {
 		t.Fatalf("ReadFacts (tick 3): %v", err)
 	}
 	if kindCount(facts3, usage.KindCompute) != 1 || kindCount(facts3, usage.KindModel) != 2 {
 		t.Fatalf("tick 3 changed counts: compute=%d model=%d, want 1/2", kindCount(facts3, usage.KindCompute), kindCount(facts3, usage.KindModel))
+	}
+}
+
+// writeCodexRolloutForSweepAt fabricates a codex rollout at the local-date path
+// the codex CLI would use for `at` (session_meta cwd=workDir, a turn_context
+// model, one token_count per {total, lastInput, lastOutput}). Unlike
+// writeCodexRolloutForSweep — which hardcodes 2026-06-15, fine only for a fixture
+// whose slept_at also pins the discovery window to that date — it derives BOTH the
+// day dir and the filename timestamp from `at` in time.Local, matching how codex
+// names rollouts and how discovery parses them. Any test whose discovery window
+// runs to the wall clock (a live session has no slept_at) must use this: a
+// hardcoded day falls out of the bounded lookback as real time advances, so the
+// fixture would silently stop being discoverable.
+func writeCodexRolloutForSweepAt(t *testing.T, root string, at time.Time, workDir, sessionID string, tokenCounts [][3]int) {
+	t.Helper()
+	local := at.In(time.Local)
+	dayDir := filepath.Join(root, local.Format("2006"), local.Format("01"), local.Format("02"))
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dayDir, "rollout-"+local.Format("2006-01-02T15-04-05")+"-"+sessionID+".jsonl")
+	const ms = "2006-01-02T15:04:05.000Z07:00"
+	lines := []string{
+		fmt.Sprintf(`{"timestamp":%q,"type":"session_meta","payload":{"id":%q,"cwd":%q}}`,
+			at.UTC().Format(ms), sessionID, workDir),
+		fmt.Sprintf(`{"timestamp":%q,"type":"turn_context","payload":{"model":"gpt-5-codex"}}`,
+			at.Add(time.Second).UTC().Format(ms)),
+	}
+	for i, tc := range tokenCounts {
+		lines = append(lines, fmt.Sprintf(
+			`{"timestamp":%q,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":%d},"last_token_usage":{"input_tokens":%d,"cached_input_tokens":0,"output_tokens":%d}}}}`,
+			at.Add(time.Duration(i+2)*time.Second).UTC().Format(ms), tc[0], tc[1], tc[2]))
+	}
+	body := ""
+	for _, l := range lines {
+		body += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEmitDueComputeFactsSweepsKeylessCodexViaWorkdir is the maintainer-city
+// production regression for Design B: graph.v2 wisp codex sessions NEVER captured
+// a session_key (the split city's metadata table had zero session_key rows ever),
+// so the model sweep minted nothing and factory token counts stayed 0 even though
+// compute facts flowed fine. The end-of-interval sweep must recover them by
+// discovering the rollout through (work_dir, interval-window) with no session_key,
+// mint the trailing model facts, and settle the interval.
+func TestEmitDueComputeFactsSweepsKeylessCodexViaWorkdir(t *testing.T) {
+	cityPath := t.TempDir()
+	workDir := t.TempDir()
+	codexRoot := t.TempDir()
+	sinkPath := filepath.Join(cityPath, ".gc", "usage.jsonl")
+
+	start := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	slept := start.Add(90 * time.Second)
+	// A keyless codex rollout in this wisp's unique worktree — no session_key keys
+	// it; only the cwd + interval window resolve it.
+	writeCodexRolloutForSweepAt(t, codexRoot, start, workDir, "019e7777-cccc-7000-8000-000000000009", [][3]int{
+		{150, 100, 50},
+		{450, 200, 100},
+	})
+
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Status: "open",
+		Title:  "codex wisp session",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"state":                 "asleep",
+			"session_name":          "codex-wisp-1",
+			"awake_started_at":      start.Format(time.RFC3339),
+			"slept_at":              slept.Format(time.RFC3339),
+			"work_dir":              workDir,
+			"provider":              "mc-codex-wrap", // wrapped manifold name
+			"builtin_ancestor":      "codex",         // canonical ladder resolves to codex
+			"molecule_id":           "run-Z",
+			"test_active_work_bead": "run-Z.step-1",
+			// NB: NO session_key — the whole point.
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{Daemon: config.DaemonConfig{ObservePaths: []string{codexRoot}}}
+	cs := &controllerState{cityBeadStore: store, usageSink: usage.NewLocalSink(sinkPath), cityName: "demo", cityPath: cityPath}
+	cr := &CityRuntime{cs: cs, cfg: cfg, sp: runtime.NewFake(), cityName: "demo", cityPath: cityPath, stderr: io.Discard}
+	info := session.Info{ID: b.ID, MetadataState: "asleep", AwakeStartedAt: start.Format(time.RFC3339)}
+
+	cr.emitDueComputeFacts(context.Background(), []session.Info{info}, false)
+
+	facts, warnings, err := usage.ReadFacts(sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected sink warnings: %v", warnings)
+	}
+	if got := kindCount(facts, usage.KindCompute); got != 1 {
+		t.Fatalf("compute facts = %d, want 1", got)
+	}
+	if got := kindCount(facts, usage.KindModel); got != 2 {
+		t.Fatalf("model facts = %d, want 2 (keyless codex must be swept via work_dir); facts: %+v", got, facts)
+	}
+	for _, f := range facts {
+		if f.RunID != "run-Z" {
+			t.Fatalf("fact RunID = %q, want run-Z (shared across kinds): %+v", f.RunID, f)
+		}
+		if f.Kind == usage.KindModel && f.Provider != "codex" {
+			t.Fatalf("model fact Provider = %q, want codex (wrapped name resolved via builtin_ancestor)", f.Provider)
+		}
+	}
+
+	// The settled keyless sweep stamps the model-swept marker so the interval is not
+	// re-swept every subsequent tick.
+	refreshed, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := refreshed.Metadata[usageModelSweptAtKey]; got != start.Format(time.RFC3339) {
+		t.Fatalf("usage_model_swept_at = %q, want %q (a settled keyless sweep must mark the interval)", got, start.Format(time.RFC3339))
 	}
 }
 
@@ -566,5 +1134,813 @@ func TestIsComputeTerminalState(t *testing.T) {
 		if isComputeTerminalState(s) {
 			t.Errorf("%q should not be terminal", s)
 		}
+	}
+}
+
+// rawSinkFactCount counts the facts of kind APPENDED to the sink file, without
+// usage.ReadFacts's IdempotencyKey dedup, so an "exactly once" assertion sees a
+// replayed record.
+func rawSinkFactCount(t *testing.T, path string, kind usage.Kind) int {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("reading usage sink %s: %v", path, err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var f usage.Fact
+		if err := json.Unmarshal([]byte(line), &f); err != nil {
+			t.Fatalf("malformed usage fact %q: %v", line, err)
+		}
+		if f.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// newClosedUsageRuntime wires a CityRuntime whose usage lane reads store,
+// records to a real sink, and searches codexRoot for transcripts. It returns the
+// runtime and the sink path.
+func newClosedUsageRuntime(t *testing.T, store beads.Store, codexRoot string) (*CityRuntime, string) {
+	t.Helper()
+	cityPath := t.TempDir()
+	sinkPath := filepath.Join(cityPath, ".gc", "usage.jsonl")
+	cfg := &config.City{Daemon: config.DaemonConfig{ObservePaths: []string{codexRoot}}}
+	cs := &controllerState{cityBeadStore: store, usageSink: usage.NewLocalSink(sinkPath), cityName: "demo", cityPath: cityPath}
+	return &CityRuntime{cs: cs, cfg: cfg, sp: runtime.NewFake(), cityName: "demo", cityPath: cityPath, stderr: io.Discard}, sinkPath
+}
+
+// awakeCodexSession creates a keyed codex session awake since t0 in env's
+// store and returns its bead id.
+func awakeCodexSession(t *testing.T, env *reconcilerTestEnv, t0 time.Time, workDir string) string {
+	t.Helper()
+	b := env.createSessionBead("worker", "worker")
+	meta := liveCodexSessionMeta(t0, workDir, codexSweepSessionKey)
+	delete(meta, "session_name")
+	env.setSessionMetadata(&b, meta)
+	return b.ID
+}
+
+// drainAckClose closes session id through the drain-ack finalize at env's
+// clock, the close that never passes through an open terminal state.
+func drainAckClose(t *testing.T, env *reconcilerTestEnv, id string) {
+	t.Helper()
+	if err := env.store.SetMetadataBatch(id, session.DrainAckStopPendingPatch(env.clk.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	res := finalizeDrainAckStoppedSession(env.cfg, env.store, testSeatWork(env.city, env.cfg, env.store, nil), env.sessionInfo(id),
+		"worker", true, newFakeDrainOps(), env.dt, env.clk, events.Discard, io.Discard)
+	if !res.closed {
+		t.Fatalf("drain-ack finalize did not close the session: %+v", res)
+	}
+}
+
+// drainAckClosedCodexSession creates a keyed codex session awake since t0 and
+// closes it through the drain-ack finalize at env's clock. It returns the
+// session bead id.
+func drainAckClosedCodexSession(t *testing.T, env *reconcilerTestEnv, t0 time.Time, workDir string) string {
+	t.Helper()
+	id := awakeCodexSession(t, env, t0, workDir)
+	drainAckClose(t, env, id)
+	return id
+}
+
+// TestEmitDueComputeFactsSettlesDrainAckClosedInterval is the regression for a
+// session closed straight from active by the drain-ack finalize: it never sat in
+// an open terminal state, so the open-bead scan never saw its interval end and
+// its compute fact was lost. The next steady-state pass must account it once,
+// ending at the close.
+func TestEmitDueComputeFactsSettlesDrainAckClosedInterval(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	t1 := time.Now().UTC().Truncate(time.Second)
+	env.clk.Time = t1
+	t0 := t1.Add(-10 * time.Minute)
+	workDir, codexRoot := t.TempDir(), t.TempDir()
+	writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+	id := drainAckClosedCodexSession(t, env, t0, workDir)
+
+	cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+	cr.emitDueComputeFacts(context.Background(), nil, false)
+
+	if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 1 {
+		t.Fatalf("compute facts recorded = %d, want exactly 1 for the closed interval", got)
+	}
+	facts, _, err := usage.ReadFacts(sinkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range facts {
+		if f.Kind == usage.KindCompute && (f.SessionID != id || f.WallSeconds != 600) {
+			t.Fatalf("compute fact = %+v, want session %s with WallSeconds 600 (T1 - T0)", f, id)
+		}
+	}
+	got, err := env.store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Metadata[usageComputeEmittedAtKey]; v != t0.Format(time.RFC3339) {
+		t.Fatalf("usage_compute_emitted_at = %q, want %q", v, t0.Format(time.RFC3339))
+	}
+	for _, key := range []string{session.MetadataKeyUsageClosePending, session.MetadataKeyUsageClosedAt} {
+		if v := got.Metadata[key]; v != "" {
+			t.Fatalf("%s = %q after settling, want cleared", key, v)
+		}
+	}
+}
+
+// TestEmitDueComputeFactsSweepsClosedIntervalTrailingTurns pins the closed
+// row's model-usage settle: turns the transcript gained after the last live
+// sweep (the drain-ack turn among them) each bill once, and the invocation
+// cursor on the now-closed bead advances past them.
+func TestEmitDueComputeFactsSweepsClosedIntervalTrailingTurns(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	t1 := time.Now().UTC().Truncate(time.Second)
+	env.clk.Time = t1
+	t0 := t1.Add(-10 * time.Minute)
+	workDir, codexRoot := t.TempDir(), t.TempDir()
+	writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}, {450, 200, 100}})
+	id := awakeCodexSession(t, env, t0, workDir)
+	cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+	cur := t1
+	cr.usageNow = func() time.Time { return cur }
+	cr.emitDueComputeFacts(context.Background(), []session.Info{env.sessionInfo(id)}, false)
+	if got := rawSinkModelFactCount(t, sinkPath); got != 2 {
+		t.Fatalf("live sweep model facts = %d, want 2", got)
+	}
+
+	writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{
+		{150, 100, 50}, {450, 200, 100}, {750, 300, 150}, {1050, 300, 150},
+	})
+	drainAckClose(t, env, id)
+	// Past the closed List's floor, which the live pass started.
+	cur = t1.Add(liveModelSweepMinInterval)
+	cr.emitDueComputeFacts(context.Background(), nil, false)
+
+	if got := rawSinkModelFactCount(t, sinkPath); got != 4 {
+		t.Fatalf("model facts after settling = %d, want 4 (each trailing turn once)", got)
+	}
+	got, err := env.store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Metadata[session.MetadataKeyInvocationUsageCursor]; v != "total:1050" {
+		t.Fatalf("invocation_usage_cursor on the closed bead = %q, want total:1050", v)
+	}
+	if v := got.Metadata[usageModelSweptAtKey]; v != t0.Format(time.RFC3339) {
+		t.Fatalf("usage_model_swept_at = %q, want %q", v, t0.Format(time.RFC3339))
+	}
+}
+
+// TestEmitDueComputeFactsSettlesReopenedNamedSessionInterval covers a
+// configured named session closed straight from active (dead-runtime) and
+// reopened by the sync phase before the usage lane runs: the row is open again,
+// not yet awake, and still carries the close marker. The same tick's pass must
+// account the old interval, ending at the close, and clear the markers.
+func TestEmitDueComputeFactsSettlesReopenedNamedSessionInterval(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	t1 := time.Now().UTC().Truncate(time.Second)
+	t0 := t1.Add(-10 * time.Minute)
+	workDir, codexRoot := t.TempDir(), t.TempDir()
+	writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+	id := awakeCodexSession(t, env, t0, workDir)
+	if err := env.store.SetMetadataBatch(id, session.ClosePatch(t1, "dead-runtime")); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Close(id); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := env.store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Reopen(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.SetMetadataBatch(id, reopenNamedSessionBatch(closed, "creating", t1.Add(time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+	cr.emitDueComputeFacts(context.Background(), []session.Info{env.sessionInfo(id)}, false)
+
+	if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 1 {
+		t.Fatalf("compute facts recorded = %d, want 1 for the interval the close ended", got)
+	}
+	facts, _, err := usage.ReadFacts(sinkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range facts {
+		if f.Kind == usage.KindCompute && f.WallSeconds != 600 {
+			t.Fatalf("compute WallSeconds = %v, want 600 (ending at usage_closed_at)", f.WallSeconds)
+		}
+	}
+	got, err := env.store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{session.MetadataKeyUsageClosePending, session.MetadataKeyUsageClosedAt} {
+		if v := got.Metadata[key]; v != "" {
+			t.Fatalf("%s = %q after settling, want cleared before the session re-wakes", key, v)
+		}
+	}
+	if v := got.Metadata[usageComputeEmittedAtKey]; v != t0.Format(time.RFC3339) {
+		t.Fatalf("usage_compute_emitted_at = %q, want %q", v, t0.Format(time.RFC3339))
+	}
+}
+
+// TestEmitDueComputeFactsClearsCloseMarkerWithNothingToAccount covers marked
+// rows the usage lane must not bill: no awake interval, an interval already
+// committed, an open row awake on a newer interval than the close ended with no
+// start kept by a reopen (a close rolled back to asleep keeps its marker, and
+// its later wake replaces the start), and an open row still live on the closed
+// interval's start. Each records no fact and has its markers cleared. A row the
+// lane settled is then listed no more and records nothing on a later pass.
+func TestEmitDueComputeFactsClearsCloseMarkerWithNothingToAccount(t *testing.T) {
+	t1 := time.Now().UTC().Truncate(time.Second)
+	t0 := t1.Add(-10 * time.Minute)
+	start := t0.Format(time.RFC3339)
+	for _, c := range []struct {
+		name   string
+		closed bool
+		edit   func(meta map[string]string)
+	}{
+		{name: "no awake interval", closed: true, edit: func(m map[string]string) { delete(m, "awake_started_at") }},
+		{name: "interval already committed", closed: true, edit: func(m map[string]string) { m[usageComputeEmittedAtKey] = start }},
+		{name: "open row awake on a newer interval, no start kept", edit: func(m map[string]string) {
+			m["awake_started_at"] = t1.Add(time.Minute).Format(time.RFC3339)
+		}},
+		{name: "open row live on the closed interval", edit: func(map[string]string) {}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			workDir, codexRoot := t.TempDir(), t.TempDir()
+			store := beads.NewMemStore()
+			meta := liveCodexSessionMeta(t0, workDir, codexSweepSessionKey)
+			maps.Copy(meta, session.UsageClosePatch(t1))
+			c.edit(meta)
+			b, err := store.Create(beads.Bead{Type: session.BeadType, Title: "s", Labels: []string{session.LabelSession}, Metadata: meta})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var open []session.Info
+			if c.closed {
+				if err := store.Close(b.ID); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				info, err := sessionFrontDoor(store).Get(b.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				open = append(open, info)
+			}
+			cr, sinkPath := newClosedUsageRuntime(t, store, codexRoot)
+			cr.emitDueComputeFacts(context.Background(), open, false)
+
+			if n := rawSinkFactCount(t, sinkPath, usage.KindCompute) + rawSinkModelFactCount(t, sinkPath); n != 0 {
+				t.Fatalf("recorded %d facts, want none: the row has nothing to account", n)
+			}
+			got, err := store.Get(b.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{session.MetadataKeyUsageClosePending, session.MetadataKeyUsageClosedAt} {
+				if v := got.Metadata[key]; v != "" {
+					t.Fatalf("%s = %q, want cleared", key, v)
+				}
+			}
+		})
+	}
+
+	t.Run("a settled row is listed no more", func(t *testing.T) {
+		env := newReconcilerTestEnv(t)
+		env.clk.Time = t1
+		workDir, codexRoot := t.TempDir(), t.TempDir()
+		writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+		drainAckClosedCodexSession(t, env, t0, workDir)
+		cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		listed, err := env.store.List(closedUsageListQuery())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(listed) != 0 {
+			t.Fatalf("settled row still listed as pending: %+v", listed)
+		}
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 1 {
+			t.Fatalf("compute facts after a second pass = %d, want 1", got)
+		}
+		if got := rawSinkModelFactCount(t, sinkPath); got != 1 {
+			t.Fatalf("model facts after a second pass = %d, want 1", got)
+		}
+	})
+}
+
+// TestEmitDueComputeFactsGivesUpUnsettledClosedIntervalSweep pins the closed
+// row's retry bound: a keyed codex miss leaves the sweep unsettled, so each
+// attempt records the compute fact without committing it, at most once per
+// liveModelSweepMinInterval, until the first attempt at or after
+// usage_closed_at + 15m commits the compute marker and clears the markers. A
+// sink failure never clears them.
+func TestEmitDueComputeFactsGivesUpUnsettledClosedIntervalSweep(t *testing.T) {
+	t1 := time.Now().UTC().Truncate(time.Second)
+	t0 := t1.Add(-10 * time.Minute)
+	start := t0.Format(time.RFC3339)
+	closedRow := func(t *testing.T) (*reconcilerTestEnv, string, *CityRuntime, string, *time.Time) {
+		env := newReconcilerTestEnv(t)
+		env.clk.Time = t1
+		workDir, codexRoot := t.TempDir(), t.TempDir()
+		id := drainAckClosedCodexSession(t, env, t0, workDir)
+		cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+		cur := t1
+		cr.usageNow = func() time.Time { return cur }
+		return env, id, cr, sinkPath, &cur
+	}
+	markers := func(t *testing.T, store beads.Store, id string) (pending, emitted, swept string) {
+		t.Helper()
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Metadata[session.MetadataKeyUsageClosePending], got.Metadata[usageComputeEmittedAtKey], got.Metadata[usageModelSweptAtKey]
+	}
+
+	t.Run("unsettled attempts are floored, then give up at the deadline", func(t *testing.T) {
+		env, id, cr, sinkPath, cur := closedRow(t)
+		for _, step := range []struct {
+			at       time.Duration
+			attempts int
+			settled  bool
+		}{
+			{at: time.Second, attempts: 1},
+			{at: 11 * time.Second, attempts: 1},
+			{at: 32 * time.Second, attempts: 2},
+			{at: 15*time.Minute - time.Second, attempts: 3},
+			{at: 15*time.Minute + 10*time.Second, attempts: 3},
+			{at: 15*time.Minute + 30*time.Second, attempts: 4, settled: true},
+			{at: 20 * time.Minute, attempts: 4, settled: true},
+		} {
+			*cur = t1.Add(step.at)
+			cr.emitDueComputeFacts(context.Background(), nil, false)
+			if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != step.attempts {
+				t.Fatalf("at close+%s: compute records = %d, want %d", step.at, got, step.attempts)
+			}
+			pending, emitted, swept := markers(t, env.store, id)
+			if !step.settled && (pending != "true" || emitted != "") {
+				t.Fatalf("at close+%s: pending=%q emitted=%q, want the interval kept uncommitted", step.at, pending, emitted)
+			}
+			if step.settled && (pending != "" || emitted != start || swept != "") {
+				t.Fatalf("at close+%s: pending=%q emitted=%q swept=%q, want the compute marker committed, the markers cleared and no sweep marker", step.at, pending, emitted, swept)
+			}
+		}
+	})
+
+	t.Run("a sink failure keeps the markers past the deadline", func(t *testing.T) {
+		env, id, cr, _, cur := closedRow(t)
+		sink := &erroringSink{}
+		cr.cs.usageSink = sink
+		*cur = t1.Add(20 * time.Minute)
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if sink.calls == 0 {
+			t.Fatal("the closed interval was never recorded")
+		}
+		if pending, emitted, _ := markers(t, env.store, id); pending != "true" || emitted != "" {
+			t.Fatalf("pending=%q emitted=%q after a sink failure, want the interval kept", pending, emitted)
+		}
+	})
+}
+
+// isClosedUsageList reports whether q is the usage lane's List of the rows
+// whose usage close is pending (closedUsageListQuery).
+func isClosedUsageList(q beads.ListQuery) bool {
+	return q.Metadata[session.MetadataKeyUsageClosePending] == "true"
+}
+
+// closedListCountingStore counts the closed-session Lists the usage lane
+// issues.
+type closedListCountingStore struct {
+	beads.Store
+	closedLists int
+}
+
+func (s *closedListCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if isClosedUsageList(q) {
+		s.closedLists++
+	}
+	return s.Store.List(q)
+}
+
+// TestEmitDueComputeFactsDefersClosedIntervalsPastBoot pins the boot pass's
+// cost: rows closed while the controller was down are not listed on the
+// synchronous boot pass, and the first steady-state pass settles them with
+// the interval ending at usage_closed_at, not at the pass time.
+func TestEmitDueComputeFactsDefersClosedIntervalsPastBoot(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	t1 := time.Now().UTC().Truncate(time.Second)
+	env.clk.Time = t1
+	t0 := t1.Add(-10 * time.Minute)
+	workDir, codexRoot := t.TempDir(), t.TempDir()
+	writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+	id := drainAckClosedCodexSession(t, env, t0, workDir)
+
+	store := &closedListCountingStore{Store: env.store}
+	cr, sinkPath := newClosedUsageRuntime(t, store, codexRoot)
+	cr.usageNow = func() time.Time { return t1.Add(time.Hour) }
+
+	cr.emitDueComputeFacts(context.Background(), nil, true)
+	if store.closedLists != 0 {
+		t.Fatalf("boot pass issued %d closed-session Lists, want none", store.closedLists)
+	}
+	if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 0 {
+		t.Fatalf("boot pass recorded %d compute facts, want none", got)
+	}
+
+	cr.emitDueComputeFacts(context.Background(), nil, false)
+	facts, _, err := usage.ReadFacts(sinkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kindCount(facts, usage.KindCompute) != 1 {
+		t.Fatalf("steady pass compute facts = %d, want 1", kindCount(facts, usage.KindCompute))
+	}
+	for _, f := range facts {
+		if f.Kind == usage.KindCompute && (f.SessionID != id || f.WallSeconds != 600) {
+			t.Fatalf("compute fact = %+v, want session %s with WallSeconds 600 (usage_closed_at - T0)", f, id)
+		}
+	}
+}
+
+// closedListRecordingStore records each closed-session List the usage lane
+// issues and the rows it returned.
+type closedListRecordingStore struct {
+	beads.Store
+	queries []beads.ListQuery
+	rows    []int
+}
+
+func (s *closedListRecordingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	got, err := s.Store.List(q)
+	if isClosedUsageList(q) {
+		s.queries = append(s.queries, q)
+		s.rows = append(s.rows, len(got))
+	}
+	return got, err
+}
+
+// TestEmitDueComputeFactsBoundsClosedIntervalScan pins the closed lane's cost
+// on a large backlog: the closed List runs at most once per
+// liveModelSweepMinInterval and returns at most 64 rows, oldest first, and a
+// row whose live memo already holds the interval's transcript is swept from
+// that path without discovery.
+func TestEmitDueComputeFactsBoundsClosedIntervalScan(t *testing.T) {
+	t1 := time.Now().UTC().Truncate(time.Second)
+
+	t.Run("the closed List is floored and capped, oldest first", func(t *testing.T) {
+		mem := beads.NewMemStore()
+		var ids []string
+		for i := 0; i < 70; i++ {
+			b, err := mem.Create(beads.Bead{
+				Type: session.BeadType, Title: "s", Labels: []string{session.LabelSession},
+				Metadata: map[string]string(session.UsageClosePatch(t1)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mem.Close(b.ID); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, b.ID)
+		}
+		store := &closedListRecordingStore{Store: mem}
+		cr, _ := newClosedUsageRuntime(t, store, t.TempDir())
+		cur := t1
+		cr.usageNow = func() time.Time { return cur }
+		stillMarked := func() []string {
+			t.Helper()
+			var marked []string
+			for _, id := range ids {
+				b, err := mem.Get(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if b.Metadata[session.MetadataKeyUsageClosePending] == "true" {
+					marked = append(marked, id)
+				}
+			}
+			return marked
+		}
+
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if len(store.queries) != 1 || store.queries[0].Limit != 64 || store.queries[0].Sort != beads.SortCreatedAsc || store.rows[0] != 64 {
+			t.Fatalf("first pass closed Lists = %+v returning %v, want one List of limit 64, created ascending, returning 64 rows", store.queries, store.rows)
+		}
+		if got, want := stillMarked(), ids[64:]; !slices.Equal(got, want) {
+			t.Fatalf("rows still marked after the first pass = %v, want the 6 newest %v", got, want)
+		}
+
+		cur = t1.Add(10 * time.Second)
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if len(store.queries) != 1 {
+			t.Fatalf("closed Lists within liveModelSweepMinInterval = %d, want 1", len(store.queries))
+		}
+
+		cur = t1.Add(liveModelSweepMinInterval + time.Second)
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if len(store.queries) != 2 {
+			t.Fatalf("closed Lists after liveModelSweepMinInterval = %d, want 2", len(store.queries))
+		}
+		if got := stillMarked(); len(got) != 0 {
+			t.Fatalf("rows still marked after the second List = %v, want none", got)
+		}
+	})
+
+	t.Run("a memo path skips discovery", func(t *testing.T) {
+		env := newReconcilerTestEnv(t)
+		env.clk.Time = t1
+		t0 := t1.Add(-10 * time.Minute)
+		// The memo's rollout sits under the observe path, which the extractor
+		// requires, but outside the day tree keyed discovery walks.
+		workDir, codexRoot := t.TempDir(), t.TempDir()
+		memoRoot := filepath.Join(codexRoot, "memo")
+		writeCodexRolloutForSweepAt(t, memoRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+		var rollout string
+		if err := filepath.WalkDir(memoRoot, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				rollout = path
+			}
+			return err
+		}); err != nil || rollout == "" {
+			t.Fatalf("locating the rollout under %s: %q, %v", memoRoot, rollout, err)
+		}
+		id := drainAckClosedCodexSession(t, env, t0, workDir)
+		cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+		start := t0.Format(time.RFC3339)
+		cr.storeLiveSweepMemo(id, liveSweepMemo{awakeStart: start, sessionKey: codexSweepSessionKey, path: rollout})
+
+		cr.emitDueComputeFacts(context.Background(), nil, false)
+		if got := rawSinkModelFactCount(t, sinkPath); got != 1 {
+			t.Fatalf("model facts = %d, want 1 swept from the memo's path, which discovery does not find", got)
+		}
+		got, err := env.store.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Metadata[usageModelSweptAtKey] != start || got.Metadata[session.MetadataKeyUsageClosePending] != "" {
+			t.Fatalf("swept=%q pending=%q, want the interval settled", got.Metadata[usageModelSweptAtKey], got.Metadata[session.MetadataKeyUsageClosePending])
+		}
+	})
+}
+
+// TestEmitDueComputeFactsClosedListPushesItsLimit pins the closed List's cost
+// on the default sessions store: priced as NativeDoltStore sends it
+// (beads.NativeListPlan), the List the lane issues is one keyed backing
+// request that carries closedUsageListLimit, oldest first. A typed or
+// status-filtered List carries no limit there, so every marked row would be
+// read on every pass and cut to the page in Go.
+func TestEmitDueComputeFactsClosedListPushesItsLimit(t *testing.T) {
+	mem := beads.NewMemStore()
+	b, err := mem.Create(beads.Bead{
+		Type: session.BeadType, Title: "s", Labels: []string{session.LabelSession},
+		Metadata: map[string]string(session.UsageClosePatch(time.Now().UTC())),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Close(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	store := &closedListRecordingStore{Store: mem}
+	cr, _ := newClosedUsageRuntime(t, store, t.TempDir())
+	cr.emitDueComputeFacts(context.Background(), nil, false)
+
+	if len(store.queries) != 1 || store.rows[0] != 1 {
+		t.Fatalf("closed Lists = %+v returning %v, want one List finding the marked row", store.queries, store.rows)
+	}
+	plan := beads.NativeListPlan(store.queries[0])
+	if len(plan) != 1 {
+		t.Fatalf("native plan = %d requests, want 1", len(plan))
+	}
+	req := plan[0]
+	if req.Limit == nil || *req.Limit != closedUsageListLimit {
+		limit := "unset"
+		if req.Limit != nil {
+			limit = fmt.Sprint(*req.Limit)
+		}
+		t.Fatalf("native request limit = %s, want %d pushed to the backing", limit, closedUsageListLimit)
+	}
+	if !beads.NativeListRequestKeyed(req) || req.SortBy != "created" || !req.Reverse {
+		t.Fatalf("native request = %+v, want a keyed request sorted created ascending", req)
+	}
+}
+
+// TestEmitDueComputeFactsSettlesClosedIntervalAfterTheRowStartsAgain is the
+// regression for a closed interval whose row a reopen starts again before the
+// usage lane runs, as v2 can (its start commits in the session reconciler, the
+// lane in controller maintenance): the start stamps a newer awake_started_at
+// and the fresh wake a newer session_key. The lane must account the interval
+// the reopen kept on the close marker, ending at the close, sweep the closed
+// conversation's rollout rather than the newer one, and leave the row's newer
+// interval unaccounted. It meets the row in the open snapshot, or in the
+// closed List when the snapshot predates the reopen.
+func TestEmitDueComputeFactsSettlesClosedIntervalAfterTheRowStartsAgain(t *testing.T) {
+	const newerKey = "019e3e8e-3591-7532-a1ef-8b9e882bea30"
+	for _, fromList := range []bool{false, true} {
+		name := "from the open snapshot"
+		if fromList {
+			name = "from the closed List"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newReconcilerTestEnv(t)
+			t1 := time.Now().UTC().Truncate(time.Second)
+			env.clk.Time = t1
+			t0, t2 := t1.Add(-10*time.Minute), t1.Add(2*time.Minute)
+			workDir, codexRoot := t.TempDir(), t.TempDir()
+			writeCodexRolloutForSweepAt(t, codexRoot, t0, workDir, codexSweepSessionKey, [][3]int{{150, 100, 50}})
+			writeCodexRolloutForSweepAt(t, codexRoot, t2, workDir, newerKey, [][3]int{{300, 200, 100}, {600, 200, 100}})
+			id := drainAckClosedCodexSession(t, env, t0, workDir)
+			closed, err := env.store.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := env.store.Reopen(id); err != nil {
+				t.Fatal(err)
+			}
+			if err := env.store.SetMetadataBatch(id, reopenNamedSessionBatch(closed, "stopped", t1.Add(time.Minute))); err != nil {
+				t.Fatal(err)
+			}
+			start := session.PreWakePatch(session.PreWakePatchInput{Generation: 2, InstanceToken: "tok-2", ContinuationEpoch: 2, Now: t2, FreshWake: true})
+			maps.Copy(start, session.CommitStartedPatch(session.CommitStartedPatchInput{
+				CoreHash: "h", ConfirmState: true, ClearPendingCreateClaim: true, StartsAwakeInterval: true, Now: t2,
+			}))
+			start["session_key"] = newerKey
+			if err := env.store.SetMetadataBatch(id, start); err != nil {
+				t.Fatal(err)
+			}
+
+			cr, sinkPath := newClosedUsageRuntime(t, env.store, codexRoot)
+			cr.usageNow = func() time.Time { return t2.Add(time.Minute) }
+			var open []session.Info
+			if !fromList {
+				open = append(open, env.sessionInfo(id))
+			}
+			cr.emitDueComputeFacts(context.Background(), open, false)
+
+			if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 1 {
+				t.Fatalf("compute facts recorded = %d, want 1 for the interval the close ended", got)
+			}
+			facts, _, err := usage.ReadFacts(sinkPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range facts {
+				if f.Kind == usage.KindCompute && (f.WallSeconds != 600 || f.UpstreamReqID != id+":"+t0.Format(time.RFC3339)) {
+					t.Fatalf("compute fact = %+v, want the interval started %s, WallSeconds 600 (ending at the close)", f, t0.Format(time.RFC3339))
+				}
+			}
+			if got := rawSinkModelFactCount(t, sinkPath); got != 1 {
+				t.Fatalf("model facts = %d, want the closed conversation's one turn and none of the newer one's", got)
+			}
+			got, err := env.store.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{
+				session.MetadataKeyUsageClosePending, session.MetadataKeyUsageClosedAt,
+				session.MetadataKeyUsageClosedAwakeStartedAt, session.MetadataKeyUsageClosedSessionKey,
+			} {
+				if v := got.Metadata[key]; v != "" {
+					t.Fatalf("%s = %q after settling, want cleared", key, v)
+				}
+			}
+			if emitted, swept := got.Metadata[usageComputeEmittedAtKey], got.Metadata[usageModelSweptAtKey]; emitted != "" || swept != "" {
+				t.Fatalf("usage_compute_emitted_at=%q usage_model_swept_at=%q, want both unset: the row's newer interval is unaccounted", emitted, swept)
+			}
+		})
+	}
+}
+
+// historyListCountingStore counts the Lists other than the usage lane's
+// marked-row List: the session-history reads a transcript lookup can make.
+type historyListCountingStore struct {
+	beads.Store
+	historyLists int
+}
+
+func (s *historyListCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if !isClosedUsageList(q) {
+		s.historyLists++
+	}
+	return s.Store.List(q)
+}
+
+// writeClaudeTranscriptForSweep writes the claude transcript of sessionKey in
+// workDir under root, one assistant turn per message id.
+func writeClaudeTranscriptForSweep(t *testing.T, root, workDir, sessionKey string, messageIDs ...string) {
+	t.Helper()
+	dir := filepath.Join(root, sessionlog.ProjectSlug(workDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var body []byte
+	for i, msg := range messageIDs {
+		entry, err := json.Marshal(map[string]any{
+			"type": "assistant",
+			"uuid": fmt.Sprintf("u%d", i),
+			"message": map[string]any{
+				"id": msg, "role": "assistant", "model": "claude-opus-4-7",
+				"usage": map[string]any{"input_tokens": 100, "output_tokens": 50},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = append(append(body, entry...), '\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionKey+".jsonl"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEmitDueComputeFactsSettlesClosedClaudeIntervalByKey pins the closed
+// lane's claude transcript lookup: it resolves by the interval's session_key
+// alone and never lists the session history the manager's lookup falls back
+// to on a keyed miss, a read that grows with every session the work dir ever
+// held and would repeat on each retry of each marked row. A keyed transcript
+// is swept; a keyed miss stays pending for a retry; a keyless row settles at
+// once with its compute fact, since nothing names its transcript.
+func TestEmitDueComputeFactsSettlesClosedClaudeIntervalByKey(t *testing.T) {
+	t1 := time.Now().UTC().Truncate(time.Second)
+	t0 := t1.Add(-10 * time.Minute)
+	for _, c := range []struct {
+		name       string
+		key        string
+		transcript bool
+		models     int
+		settled    bool
+	}{
+		{name: "keyed, transcript on disk", key: "claude-key-1", transcript: true, models: 2, settled: true},
+		{name: "keyed, transcript missing", key: "claude-key-1"},
+		{name: "keyless", settled: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			workDir, root := t.TempDir(), t.TempDir()
+			mem := beads.NewMemStore()
+			for range 3 {
+				old, err := mem.Create(beads.Bead{
+					Type: session.BeadType, Title: "old", Labels: []string{session.LabelSession},
+					Metadata: map[string]string{"provider": "claude", "work_dir": workDir},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := mem.Close(old.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meta := map[string]string{
+				"state": "active", "session_name": "claude-1", "awake_started_at": t0.Format(time.RFC3339),
+				"work_dir": workDir, "provider": "claude", "builtin_ancestor": "claude", "session_key": c.key,
+			}
+			maps.Copy(meta, session.ClosePatch(t1, "dead-runtime"))
+			b, err := mem.Create(beads.Bead{Type: session.BeadType, Title: "s", Labels: []string{session.LabelSession}, Metadata: meta})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mem.Close(b.ID); err != nil {
+				t.Fatal(err)
+			}
+			if c.transcript {
+				writeClaudeTranscriptForSweep(t, root, workDir, c.key, "msg-1", "msg-2")
+			}
+			store := &historyListCountingStore{Store: mem}
+			cr, sinkPath := newClosedUsageRuntime(t, store, root)
+			cr.usageNow = func() time.Time { return t1.Add(time.Minute) }
+			cr.emitDueComputeFacts(context.Background(), nil, false)
+
+			if store.historyLists != 0 {
+				t.Fatalf("settling issued %d session-history Lists, want none", store.historyLists)
+			}
+			if got := rawSinkFactCount(t, sinkPath, usage.KindCompute); got != 1 {
+				t.Fatalf("compute facts = %d, want 1", got)
+			}
+			if got := rawSinkModelFactCount(t, sinkPath); got != c.models {
+				t.Fatalf("model facts = %d, want %d", got, c.models)
+			}
+			got, err := mem.Get(b.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pending := got.Metadata[session.MetadataKeyUsageClosePending]; (pending == "") != c.settled {
+				t.Fatalf("usage_close_pending = %q, want settled=%t", pending, c.settled)
+			}
+		})
 	}
 }

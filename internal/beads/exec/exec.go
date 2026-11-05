@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -26,11 +27,35 @@ type Store struct {
 	script  string
 	timeout time.Duration
 	env     map[string]string
+
+	// localMu and localStrings back SetLocalString/GetLocalString. Clone-local
+	// data is kept in process only, never routed through the script: unlike
+	// every other operation, it must not depend on script latency, since the
+	// whole point is cheap high-churn writes. It does not survive process
+	// restart, which is an accepted limitation for this delegating store.
+	localMu      sync.Mutex
+	localStrings map[string]map[string]string
+
+	// payloadBlind is DeclarePayloadBlind's grant.
+	payloadBlind bool
 }
 
 // SetEnv sets environment variables passed to the script process.
 func (s *Store) SetEnv(env map[string]string) {
 	s.env = env
+}
+
+// IDPrefix returns the bead ID prefix for this exec-backed scope, taken from
+// the projected GC_BEADS_PREFIX env. NewCachingStore uses this to key the
+// per-scope cache (owner metadata); without it an exec-backed rig store caches
+// as "(no-prefix)" and the reconciler's rig-scoped scale-check cannot associate
+// routed rig beads with the rig pool, so a direct `gc sling <rig>/<agent>` never
+// scales a worker.
+func (s *Store) IDPrefix() string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.env["GC_BEADS_PREFIX"])
 }
 
 // NewStore returns a Store that delegates to the given script.
@@ -189,7 +214,17 @@ func (w *beadWire) toBead() beads.Bead {
 		Ephemeral:   w.Ephemeral,
 		NoHistory:   w.NoHistory,
 		DeferUntil:  cloneTimePtr(w.DeferUntil),
+		CloseReason: closeReasonFor(status, w.CloseReason),
 	}
+}
+
+// closeReasonFor keeps a script's close_reason only on a closed bead: a bead
+// that is not closed has no close reason.
+func closeReasonFor(status, reason string) string {
+	if status != "closed" {
+		return ""
+	}
+	return reason
 }
 
 func cloneTimePtr(v *time.Time) *time.Time {
@@ -257,6 +292,11 @@ func (s *Store) Get(id string) (beads.Bead, error) {
 
 // Update modifies fields of an existing bead: script update <id> (stdin: JSON)
 func (s *Store) Update(id string, opts beads.UpdateOpts) error {
+	// The exec protocol's update document has no removal field; a script
+	// would see only the sets and report success with the keys still set.
+	if len(opts.UnsetMetadata) > 0 {
+		return fmt.Errorf("exec beads update %q: %w", id, beads.ErrUnsetMetadataUnsupported)
+	}
 	data, err := marshalUpdate(opts)
 	if err != nil {
 		return fmt.Errorf("exec beads update: marshaling: %w", err)
@@ -295,6 +335,13 @@ func (s *Store) Close(id string) error {
 
 // Reopen sets a bead's status to "open": script reopen <id>
 func (s *Store) Reopen(id string) error {
+	// metadata.close_reason is a closer's input; a reopened bead must not hand
+	// it to its next close, so it is cleared before the reopen, as BdStore does.
+	if b, err := s.Get(id); err == nil && b.Status != "open" && strings.TrimSpace(b.Metadata["close_reason"]) != "" {
+		if err := s.SetMetadata(id, "close_reason", ""); err != nil {
+			return fmt.Errorf("reopening bead %q: clearing close_reason: %w", id, err)
+		}
+	}
 	_, err := s.run(nil, "reopen", id)
 	if err != nil {
 		if isNotFoundError(err) {
@@ -468,6 +515,36 @@ func (s *Store) SetMetadataBatch(id string, kvs map[string]string) error {
 	return nil
 }
 
+// SetLocalString sets a clone-local string value for a bead. See
+// [beads.Store.SetLocalString]. Kept in an in-process map rather than
+// delegated to the script, so it never pays script-invocation latency and
+// never validates that id refers to an existing bead — see the interface
+// doc comment for why.
+func (s *Store) SetLocalString(id, key, value string) error {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	if value == "" {
+		delete(s.localStrings[id], key)
+		return nil
+	}
+	if s.localStrings == nil {
+		s.localStrings = make(map[string]map[string]string)
+	}
+	if s.localStrings[id] == nil {
+		s.localStrings[id] = make(map[string]string)
+	}
+	s.localStrings[id][key] = value
+	return nil
+}
+
+// GetLocalString returns the clone-local string value for a bead. See
+// [beads.Store.GetLocalString].
+func (s *Store) GetLocalString(id, key string) (string, error) {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	return s.localStrings[id][key], nil
+}
+
 // Tx executes fn sequentially against the exec store.
 func (s *Store) Tx(_ string, fn func(beads.Tx) error) error {
 	if fn == nil {
@@ -478,8 +555,13 @@ func (s *Store) Tx(_ string, fn func(beads.Tx) error) error {
 
 // Delete permanently removes a bead by calling the "delete" subcommand.
 func (s *Store) Delete(id string) error {
-	_, err := s.run(nil, "delete", "--force", id)
-	return err
+	if _, err := s.run(nil, "delete", "--force", id); err != nil {
+		return err
+	}
+	s.localMu.Lock()
+	delete(s.localStrings, id)
+	s.localMu.Unlock()
+	return nil
 }
 
 // Ping verifies the store script is accessible by running a list operation.
@@ -525,5 +607,28 @@ func (s *Store) DepList(id, direction string) ([]beads.Dep, error) {
 	return deps, nil
 }
 
-// Compile-time interface check.
-var _ beads.Store = (*Store)(nil)
+// DeclarePayloadBlind records that this store's provider keeps no dependency
+// payload anywhere it could be read from: the exec protocol has no payload
+// field (a create request carries none and dep-add takes three arguments), and
+// the provider is not backed by bd, where a graph plan can have written one.
+// Whether the provider is bd-backed is the caller's knowledge, not the
+// protocol's, so the store declares nothing until the caller that built it
+// grants it (cmd/gc's exec store opener).
+func (s *Store) DeclarePayloadBlind() {
+	s.payloadBlind = true
+}
+
+// DepMetadataAbsentByProtocol reports the declaration DeclarePayloadBlind
+// granted.
+func (s *Store) DepMetadataAbsentByProtocol() (string, bool) {
+	if s == nil || !s.payloadBlind {
+		return "", false
+	}
+	return "exec", true
+}
+
+// Compile-time interface checks.
+var (
+	_ beads.Store                       = (*Store)(nil)
+	_ beads.DepMetadataAbsentByProtocol = (*Store)(nil)
+)

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +24,23 @@ import (
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/worker"
 )
+
+// statusTestCityDir returns an empty, test-owned city directory for tests that
+// run real session observations. An observation does real filesystem I/O on
+// the city path (store and controller probes, path normalization, and the
+// per-city events recorder it opens), and gc status bounds each observation by
+// statusObservationTimeout. A made-up host path such as "/home/user/city" makes
+// that I/O depend on the machine: on macOS /home is an autofs mount, every
+// lookup under it costs tens of milliseconds, and the observations overrun the
+// deadline and report a running agent as stopped. resetCLIFactoryRecorders
+// registers its cleanup after t.TempDir's, so the recorder the observations
+// memoize for this directory is closed before the directory is removed.
+func statusTestCityDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	resetCLIFactoryRecorders(t)
+	return dir
+}
 
 func TestCityStatusEmptyCity(t *testing.T) {
 	sp := runtime.NewFake()
@@ -68,14 +88,15 @@ func TestCityStatusWithAgents(t *testing.T) {
 		},
 	}
 
+	cityPath := statusTestCityDir(t)
 	var stdout, stderr bytes.Buffer
-	code := doCityStatus(sp, dops, cfg, "/home/user/city", &stdout, &stderr)
+	code := doCityStatus(sp, dops, cfg, cityPath, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	out := stdout.String()
 
-	if !strings.Contains(out, "/home/user/city") {
+	if !strings.Contains(out, cityPath) {
 		t.Errorf("stdout missing city path, got:\n%s", out)
 	}
 	if !strings.Contains(out, "Agents:") {
@@ -111,7 +132,7 @@ func TestCityStatusReportsObservationErrors(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doCityStatus(sp, dops, cfg, "/home/user/city", &stdout, &stderr)
+	code := doCityStatus(sp, dops, cfg, statusTestCityDir(t), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -416,12 +437,12 @@ func TestCityStatusJSONWithAgents(t *testing.T) {
 			{Name: "polecat", Dir: "myrig", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
 		},
 		Rigs: []config.Rig{
-			{Name: "myrig", Path: "/home/user/myrig"},
+			{Name: "myrig", Path: t.TempDir()},
 		},
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doCityStatusJSON(sp, cfg, "/home/user/city", &stdout, &stderr)
+	code := doCityStatusJSON(sp, cfg, statusTestCityDir(t), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -722,6 +743,11 @@ func TestControllerStatusLine(t *testing.T) {
 			ctrl: ControllerJSON{Mode: "supervisor", PID: 4321, Running: true},
 			want: "supervisor-managed (PID 4321)",
 		},
+		{
+			name: "legacy hosting unknown",
+			ctrl: ControllerJSON{PID: 2468, Running: true},
+			want: "controller running (PID 2468, hosting mode unknown)",
+		},
 	}
 
 	for _, tt := range tests {
@@ -735,7 +761,14 @@ func TestControllerStatusLine(t *testing.T) {
 
 func startFakeControllerSocket(t *testing.T, cityPath, response string) <-chan struct{} {
 	t.Helper()
-	sockPath := controllerSocketPath(cityPath)
+	return startFakeUnixSocket(t, controllerSocketPath(cityPath), func(string) string { return response })
+}
+
+// startFakeUnixSocket listens on sockPath and answers each connection's
+// command line with respond(line); an empty reply closes without replying.
+// The returned channel is signaled (non-blocking) on each accept.
+func startFakeUnixSocket(t *testing.T, sockPath string, respond func(line string) string) <-chan struct{} {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -762,9 +795,9 @@ func startFakeControllerSocket(t *testing.T, cityPath, response string) <-chan s
 			go func(conn net.Conn) {
 				defer conn.Close() //nolint:errcheck // test cleanup
 				_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-				_, _ = conn.Read(make([]byte, 64))
+				line, _ := bufio.NewReader(conn).ReadString('\n')
 				_ = conn.SetReadDeadline(time.Time{})
-				_, _ = conn.Write([]byte(response))
+				_, _ = conn.Write([]byte(respond(strings.TrimSuffix(line, "\n"))))
 			}(conn)
 		}
 	}()
@@ -817,7 +850,7 @@ func TestControllerStatusForCityFallsBackToStandaloneWhenRegisteredSupervisorDow
 		t.Fatalf("register city: %v", err)
 	}
 
-	startFakeControllerSocket(t, cityPath, "2468\n")
+	startFakeControllerSocket(t, cityPath, `{"pid":2468,"hosting_mode":"standalone"}`+"\n")
 
 	oldAlive := supervisorAliveHook
 	oldRunning := supervisorCityRunningHook
@@ -834,6 +867,25 @@ func TestControllerStatusForCityFallsBackToStandaloneWhenRegisteredSupervisorDow
 	got := controllerStatusForCity(cityPath)
 	if got.Mode != "standalone" || !got.Running || got.PID != 2468 {
 		t.Fatalf("controllerStatusForCity = %+v, want running standalone PID 2468", got)
+	}
+}
+
+func TestControllerStatusForCityLeavesLegacyHostingUnknown(t *testing.T) {
+	t.Setenv("GC_HOME", filepath.Join(t.TempDir(), "gc-home"))
+	cityPath := filepath.Join(shortSocketTempDir(t, "gc-status-"), "bright-lights")
+	startFakeControllerSocket(t, cityPath, "2468\n")
+
+	oldAlive := supervisorAliveHook
+	supervisorAliveHook = func() int { return 0 }
+	t.Cleanup(func() { supervisorAliveHook = oldAlive })
+
+	identity := probeControllerIdentity(cityPath)
+	if identity.PID != 2468 || identity.HostingMode != controllerHostingUnknown {
+		t.Fatalf("probeControllerIdentity = %+v, want detectable legacy PID 2468 with unknown hosting", identity)
+	}
+	got := controllerStatusForCity(cityPath)
+	if got.Mode != "" || !got.Running || got.PID != 2468 {
+		t.Fatalf("controllerStatusForCity = %+v, want running PID 2468 with unknown legacy hosting", got)
 	}
 }
 
@@ -876,42 +928,54 @@ func TestControllerStatusForCityReusesSupervisorPIDWhenCityStateUnknown(t *testi
 	}
 }
 
-func TestControllerStatusForCityReturnsSupervisorModeWhenProbeSucceedsAfterUnknownRetry(t *testing.T) {
-	t.Setenv("GC_HOME", filepath.Join(t.TempDir(), "gc-home"))
-
-	root := shortSocketTempDir(t, "gc-status-")
-	cityPath := filepath.Join(root, "bright-lights")
-	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
-		t.Fatal(err)
+func TestControllerStatusForCityRequiresMatchingPIDForLegacySupervisorInference(t *testing.T) {
+	tests := []struct {
+		name          string
+		controllerPID int
+		wantMode      string
+	}{
+		{name: "same process", controllerPID: 4321, wantMode: "supervisor"},
+		{name: "different process", controllerPID: 2468, wantMode: ""},
 	}
-	if err := supervisor.NewRegistry(supervisor.RegistryPath()).Register(cityPath, "bright-lights"); err != nil {
-		t.Fatalf("register city: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GC_HOME", filepath.Join(t.TempDir(), "gc-home"))
 
-	startFakeControllerSocket(t, cityPath, "2468\n")
+			root := shortSocketTempDir(t, "gc-status-")
+			cityPath := filepath.Join(root, "bright-lights")
+			if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := supervisor.NewRegistry(supervisor.RegistryPath()).Register(cityPath, "bright-lights"); err != nil {
+				t.Fatalf("register city: %v", err)
+			}
 
-	oldAlive := supervisorAliveHook
-	oldRunning := supervisorCityRunningHook
-	calls := 0
-	supervisorAliveHook = func() int {
-		calls++
-		if calls == 1 {
-			return 4321
-		}
-		return 0
-	}
-	supervisorCityRunningHook = func(string) (bool, string, bool) { return false, "", false }
-	t.Cleanup(func() {
-		supervisorAliveHook = oldAlive
-		supervisorCityRunningHook = oldRunning
-	})
+			startFakeControllerSocket(t, cityPath, fmt.Sprintf("%d\n", tt.controllerPID))
 
-	got := controllerStatusForCity(cityPath)
-	if got.Mode != "supervisor" || !got.Running || got.PID != 2468 {
-		t.Fatalf("controllerStatusForCity = %+v, want running supervisor-mode PID 2468", got)
-	}
-	if calls != 2 {
-		t.Fatalf("supervisorAliveHook calls = %d, want 2", calls)
+			oldAlive := supervisorAliveHook
+			oldRunning := supervisorCityRunningHook
+			calls := 0
+			supervisorAliveHook = func() int {
+				calls++
+				if calls == 1 {
+					return 4321
+				}
+				return 0
+			}
+			supervisorCityRunningHook = func(string) (bool, string, bool) { return false, "", false }
+			t.Cleanup(func() {
+				supervisorAliveHook = oldAlive
+				supervisorCityRunningHook = oldRunning
+			})
+
+			got := controllerStatusForCity(cityPath)
+			if got.Mode != tt.wantMode || !got.Running || got.PID != tt.controllerPID {
+				t.Fatalf("controllerStatusForCity = %+v, want running PID %d with mode %q", got, tt.controllerPID, tt.wantMode)
+			}
+			if calls != 2 {
+				t.Fatalf("supervisorAliveHook calls = %d, want 2", calls)
+			}
+		})
 	}
 }
 
@@ -1077,10 +1141,11 @@ func TestRouteCityStatus_SixRowMatrix(t *testing.T) {
 				c = api.NewCityScopedClient(srv.URL, "test-city")
 			}
 
-			sp := runtime.NewFake()
 			dops := newFakeDrainOps()
 			var stdout, stderr bytes.Buffer
-			code := routeCityStatus(cityPath, cfg, sp, dops, c, tc.nilReason, false, &stdout, &stderr)
+			code := routeCityStatus(cityPath, cfg, dops, c, tc.nilReason, false, &stdout, &stderr, func() int {
+				return cmdCityStatusLocalFallback(cfg, cityPath, false, &stdout, &stderr)
+			})
 
 			if code != tc.wantExit {
 				t.Fatalf("exit = %d, want %d; stderr=%q stdout=%q", code, tc.wantExit, stderr.String(), stdout.String())
@@ -1104,6 +1169,109 @@ func TestRouteCityStatus_SixRowMatrix(t *testing.T) {
 	}
 }
 
+// TestCmdCityStatus_SupervisorManagedNoAPIPortUsesSupervisorAPI is the
+// ra-r9hm6v end-to-end regression test, exercising the real `gc status`
+// entry point (cmdCityStatus) rather than routeCityStatus directly. A
+// supervisor-managed city with no [api] section in city.toml — the shape
+// writeCityStatusTestCity produces, and the shape of a default `gc init`'d
+// city — used to make cmdCityStatus's real cityStatusAPIClient resolve nil
+// (apiClient's "alive socket, no standalone port" case), forcing every `gc
+// status` call onto the expensive local snapshot builder even though a
+// supervisor was reachable. It must now resolve the fake supervisor's API
+// client and take route=api end to end.
+//
+// It also keeps the supervisor route ahead of every bead/Dolt read. During a
+// store-contention burst, opening the local store can block even while the
+// supervisor's cached status endpoint is healthy; doing that work before
+// choosing the API route made gc status emit no output until the external
+// command timeout killed it.
+func TestCmdCityStatus_SupervisorManagedNoAPIPortUsesSupervisorAPI(t *testing.T) {
+	t.Setenv("GC_DEBUG", "1")
+	cityPath := writeCityStatusTestCity(t)
+	if err := os.Mkdir(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatalf("create store marker: %v", err)
+	}
+
+	srv := httptest.NewServer(okCityStatusHandler(t))
+	defer srv.Close()
+
+	origIdentity, origSup := apiRouteControllerIdentityHook, apiRouteSupervisorClientHook
+	origOpen := openCityStoreAtForStatus
+	t.Cleanup(func() {
+		apiRouteControllerIdentityHook = origIdentity
+		apiRouteSupervisorClientHook = origSup
+		openCityStoreAtForStatus = origOpen
+	})
+	// Simulates a live per-city controller socket hosted by a supervisor that
+	// predates identify (it answers only ping, so its hosting mode is unknown),
+	// paired with a supervisor-managed API client — the exact combination
+	// apiClient alone cannot route because city.toml has no [api] port.
+	apiRouteControllerIdentityHook = func(string) controllerIdentityReply { return controllerIdentityReply{PID: 4242} }
+	apiRouteSupervisorClientHook = func(cp string) *api.Client {
+		if cp != cityPath {
+			return nil
+		}
+		return api.NewCityScopedClient(srv.URL, "test-city")
+	}
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
+		t.Fatal("gc status opened the local bead store before using the healthy supervisor API")
+		return beads.StoreOpenResult{}, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdCityStatus([]string{cityPath}, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdCityStatus exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "route=api") {
+		t.Fatalf("stderr missing route=api (still falling back to the expensive local path): %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "route=fallback") {
+		t.Fatalf("stderr shows route=fallback, want route=api only: %s", stderr.String())
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal stdout: %v; stdout=%s", err, stdout.String())
+	}
+	if _, ok := envelope["_cache_age_s"]; !ok {
+		t.Fatalf("stdout missing _cache_age_s (API-path envelope field), got: %s", stdout.String())
+	}
+}
+
+// TestCmdCityStatus_NoAPIClientOpensLocalStore covers the complement of
+// TestCmdCityStatus_SupervisorManagedNoAPIPortUsesSupervisorAPI: with no
+// supervisor API client available, the entry point must fall back to the
+// local store.
+func TestCmdCityStatus_NoAPIClientOpensLocalStore(t *testing.T) {
+	t.Setenv("GC_DEBUG", "1")
+	cityPath := writeCityStatusTestCity(t)
+	if err := os.Mkdir(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatalf("create store marker: %v", err)
+	}
+
+	origClient := cityStatusAPIClient
+	origOpen := openCityStoreAtForStatus
+	t.Cleanup(func() {
+		cityStatusAPIClient = origClient
+		openCityStoreAtForStatus = origOpen
+	})
+	cityStatusAPIClient = func(string) (*api.Client, string) { return nil, "controller-down" }
+	opens := 0
+	openCityStoreAtForStatus = func(path string) (beads.StoreOpenResult, error) {
+		opens++
+		return origOpen(path)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmdCityStatus([]string{cityPath}, true, &stdout, &stderr)
+	if opens < 1 {
+		t.Fatalf("gc status did not open the local bead store on the fallback route; stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "route=fallback") {
+		t.Fatalf("stderr missing route=fallback: %s", stderr.String())
+	}
+}
+
 // TestRouteCityStatus_APIJSONIncludesCacheAge verifies the API-path JSON
 // output carries the _cache_age_s envelope field while the fallback path
 // omits it. Enforces D5 from the gc-read-path design doc.
@@ -1118,10 +1286,11 @@ func TestRouteCityStatus_APIJSONIncludesCacheAge(t *testing.T) {
 	defer srv.Close()
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
-	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	if code := routeCityStatus(cityPath, cfg, sp, dops, c, "", true, &stdout, &stderr); code != 0 {
+	if code := routeCityStatus(cityPath, cfg, dops, c, "", true, &stdout, &stderr, func() int {
+		return cmdCityStatusLocalFallback(cfg, cityPath, true, &stdout, &stderr)
+	}); code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	var envelope map[string]any
@@ -1144,10 +1313,11 @@ func TestRouteCityStatus_FallbackJSONOmitsCacheAge(t *testing.T) {
 		t.Fatalf("loadCityConfig: %v", err)
 	}
 
-	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	if code := routeCityStatus(cityPath, cfg, sp, dops, nil, "controller-down", true, &stdout, &stderr); code != 0 {
+	if code := routeCityStatus(cityPath, cfg, dops, nil, "controller-down", true, &stdout, &stderr, func() int {
+		return cmdCityStatusLocalFallback(cfg, cityPath, true, &stdout, &stderr)
+	}); code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	var envelope map[string]any
@@ -1159,9 +1329,10 @@ func TestRouteCityStatus_FallbackJSONOmitsCacheAge(t *testing.T) {
 	}
 }
 
-// TestRouteCityStatus_APIStaleBanner verifies the human-output staleness
-// banner appears when the supervisor reports a cache age > 30 s.
-func TestRouteCityStatus_APIStaleBanner(t *testing.T) {
+// TestRouteCityStatus_CacheAgeFooterOnStderr verifies the API route prints
+// the cache-age footer on stderr, not stdout, when the supervisor reports a
+// cache age more than twice its re-scan interval.
+func TestRouteCityStatus_CacheAgeFooterOnStderr(t *testing.T) {
 	cityPath := writeCityStatusTestCity(t)
 	cfg, err := loadCityConfig(cityPath, new(bytes.Buffer))
 	if err != nil {
@@ -1169,7 +1340,7 @@ func TestRouteCityStatus_APIStaleBanner(t *testing.T) {
 	}
 	staleHandler := func(_ *testing.T) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("X-GC-Cache-Age-S", "123")
+			setBehindCacheHeaders(w)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"name": "test-city", "path": "/tmp/test-city",
@@ -1185,15 +1356,14 @@ func TestRouteCityStatus_APIStaleBanner(t *testing.T) {
 	defer srv.Close()
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
-	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	if code := routeCityStatus(cityPath, cfg, sp, dops, c, "", false, &stdout, &stderr); code != 0 {
+	if code := routeCityStatus(cityPath, cfg, dops, c, "", false, &stdout, &stderr, func() int {
+		return cmdCityStatusLocalFallback(cfg, cityPath, false, &stdout, &stderr)
+	}); code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "cache age:") {
-		t.Errorf("human output should include stale banner, got:\n%s", stdout.String())
-	}
+	assertCacheAgeFooterOnStderr(t, stdout.String(), stderr.String())
 }
 
 func TestControllerStatusGuidance(t *testing.T) {
@@ -1255,6 +1425,14 @@ func TestControllerStatusGuidance(t *testing.T) {
 			ctrl: ControllerJSON{Mode: "supervisor", PID: 4321, Running: true},
 			want: []string{
 				"Authority: supervisor process PID 4321",
+			},
+		},
+		{
+			name: "legacy hosting unknown",
+			ctrl: ControllerJSON{PID: 2468, Running: true},
+			want: []string{
+				"Authority: controller PID 2468; hosting mode unknown",
+				"Next: upgrade or restart the running controller to restore authoritative hosting information",
 			},
 		},
 		{
@@ -1343,7 +1521,7 @@ func TestRenderCityStatusFromAPIPartialRendersUnknownNotStopped(t *testing.T) {
 	cr := api.CachedRead[api.StatusView]{Body: view}
 
 	var stdout bytes.Buffer
-	if code := renderCityStatusFromAPI(view.CityPath, cr, newFakeDrainOps(), false, &stdout); code != 0 {
+	if code := renderCityStatusFromAPI(view.CityPath, nil, cr, newFakeDrainOps(), false, &stdout, io.Discard); code != 0 {
 		t.Fatalf("code = %d, want 0", code)
 	}
 	out := stdout.String()
@@ -1356,7 +1534,7 @@ func TestRenderCityStatusFromAPIPartialRendersUnknownNotStopped(t *testing.T) {
 
 	// The JSON projection off the same view must also carry the partial flags.
 	var jsonOut bytes.Buffer
-	if code := renderCityStatusFromAPI(view.CityPath, cr, newFakeDrainOps(), true, &jsonOut); code != 0 {
+	if code := renderCityStatusFromAPI(view.CityPath, nil, cr, newFakeDrainOps(), true, &jsonOut, io.Discard); code != 0 {
 		t.Fatalf("json code = %d, want 0", code)
 	}
 	var status StatusJSON

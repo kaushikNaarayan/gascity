@@ -3,9 +3,13 @@ package supervisor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/loopbackport"
 )
 
 func TestLoadConfigMissing(t *testing.T) {
@@ -102,6 +106,9 @@ func TestShouldSeedIsolatedSupervisorConfigTrueForNonTestBinaryWithGCIsolated(t 
 
 func setProgramName(t *testing.T, name string) {
 	t.Helper()
+	// Bazel test binaries are detected via TEST_SRCDIR rather than the
+	// program name; clear it so non-test-binary simulations hold there too.
+	t.Setenv("TEST_SRCDIR", "")
 	oldArgs := os.Args
 	os.Args = append([]string{name}, oldArgs[1:]...)
 	t.Cleanup(func() {
@@ -157,6 +164,62 @@ policy_ref = "platform-sso"
 	}
 	if cfg.Publication.TenantAuth.PolicyRef != "platform-sso" {
 		t.Errorf("Publication.TenantAuth.PolicyRef = %q, want platform-sso", cfg.Publication.TenantAuth.PolicyRef)
+	}
+}
+
+func TestLoadConfigEventExportCities(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		wantNil  bool
+		want     []string
+	}{
+		{
+			name: "omitted preserves all-city default",
+			contents: `
+[events.export]
+endpoint = "https://example.invalid/ingest"
+`,
+			wantNil: true,
+		},
+		{
+			name: "explicit empty is retained",
+			contents: `
+[events.export]
+endpoint = "https://example.invalid/ingest"
+cities = []
+`,
+			want: []string{},
+		},
+		{
+			name: "configured names retain exact spelling and order",
+			contents: `
+[events.export]
+endpoint = "https://example.invalid/ingest"
+cities = ["north", " south "]
+`,
+			want: []string{"north", " south "},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "supervisor.toml")
+			if err := os.WriteFile(path, []byte(tt.contents), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.Events.Export.Cities == nil) != tt.wantNil {
+				t.Fatalf("Cities nil = %t, want %t", cfg.Events.Export.Cities == nil, tt.wantNil)
+			}
+			if got := cfg.Events.Export.Cities; !slices.Equal(got, tt.want) {
+				t.Fatalf("Cities = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -350,4 +413,35 @@ func TestRegistryRegisterPanicsOnHostPath(t *testing.T) {
 		}
 	}()
 	_ = reg.Register(t.TempDir(), "test-city")
+}
+
+// The seeded port is outside the kernel's ephemeral range, so no bind(":0")
+// or outgoing connect in the network namespace is handed it, and on Linux,
+// where ports are leased, two isolated homes seeded at once get different
+// ports. A listen-then-close reservation on ":0" let concurrent isolated
+// supervisors seed the same port and the loser exit on "address already in
+// use" (ga-96smfk.87).
+func TestLoadConfigSeedsAPortOutsideTheEphemeralRange(t *testing.T) {
+	lo, hi := loopbackport.EphemeralPortRange()
+	if lo <= 10000 && hi == 65535 {
+		t.Skipf("the kernel's ephemeral range [%d, %d] covers every port from 10000 up, where loopbackport.Reserve draws", lo, hi)
+	}
+	seen := map[int]bool{}
+	for i := 0; i < 20; i++ {
+		t.Setenv("GC_HOME", t.TempDir())
+		cfg, err := LoadConfig(ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := cfg.Supervisor.Port
+		if port >= lo && port <= hi {
+			t.Fatalf("seeded port %d is in the kernel's ephemeral range [%d, %d]", port, lo, hi)
+		}
+		// Ports are leased only on Linux (loopbackport), so elsewhere two homes
+		// seeded in one process can be handed the same port.
+		if runtime.GOOS == "linux" && seen[port] {
+			t.Fatalf("seeded port %d twice", port)
+		}
+		seen[port] = true
+	}
 }

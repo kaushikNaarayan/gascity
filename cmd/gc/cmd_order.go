@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/execenv"
+	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/orderdiscovery"
@@ -111,6 +112,7 @@ func newOrderRunCmd(stdout, stderr io.Writer) *cobra.Command {
 	var rig string
 	var jsonOutput bool
 	var varFlags []string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "run <name>",
 		Short: "Execute an order manually",
@@ -124,14 +126,16 @@ outside their normal schedule.
 Use --rig to disambiguate same-name orders in different rigs.
 Use --var key=value (repeatable) to pass args to the order: formula orders
 receive them as formula vars, exec orders as environment variables. A param
-declared required in [order.params] must be supplied or the run fails.`,
+declared required in [order.params] must be supplied or the run fails.
+An order whose requires_backend does not name its scope's backend is
+refused; --force runs it anyway.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			vars, ok := parseOrderRunVarFlags(varFlags, stderr)
 			if !ok {
 				return errExit
 			}
-			if cmdOrderRun(args[0], rig, jsonOutput, vars, stdout, stderr) != 0 {
+			if cmdOrderRun(args[0], rig, jsonOutput, force, vars, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -141,6 +145,7 @@ declared required in [order.params] must be supplied or the run fails.`,
 	cmd.Flags().StringVar(&rig, "rig", "", "rig name to disambiguate same-name orders")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output (formula orders only; rejected for exec orders)")
 	cmd.Flags().StringArrayVar(&varFlags, "var", nil, "order arg as key=value (repeatable): formula var / exec env")
+	cmd.Flags().BoolVar(&force, "force", false, "run an order even when its requires_backend rules out its scope's backend")
 	_ = cmd.RegisterFlagCompletionFunc("rig", completeRigFlagNames)
 	return cmd
 }
@@ -187,20 +192,35 @@ exit code 0 if any order is due, 1 if none are due.`,
 func newOrderHistoryCmd(stdout, stderr io.Writer) *cobra.Command {
 	var rig string
 	var jsonOutput bool
+	var limit int
+	var since string
 	cmd := &cobra.Command{
 		Use:   "history [name]",
 		Short: "Show order execution history",
 		Long: `Show execution history for orders.
 
 Queries bead history for past order runs. Optionally filter by order
-name. Use --rig to filter by rig.`,
+name. Use --rig to filter by rig.
+
+The read is bounded by default: only the most recent runs are fetched.
+Widen it with --limit (0 fetches every retained run) or bound it by time
+with --since. On a city with a long order-run history an unbounded read
+costs tens of seconds, so prefer keeping a bound when triaging.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := ""
 			if len(args) > 0 {
 				name = args[0]
 			}
-			if cmdOrderHistoryJSON(name, rig, jsonOutput, stdout, stderr) != 0 {
+			bounds, err := parseOrderHistoryBounds(limit, since)
+			if err != nil {
+				// Report it here rather than returning the error: the root
+				// command silences cobra's own error printing, so returning
+				// would exit 1 with no message at all.
+				fmt.Fprintf(stderr, "gc order history: %v\n", err) //nolint:errcheck // best-effort stderr
+				return errExit
+			}
+			if cmdOrderHistoryJSON(name, rig, bounds, jsonOutput, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -209,8 +229,59 @@ name. Use --rig to filter by rig.`,
 	}
 	cmd.Flags().StringVar(&rig, "rig", "", "rig name to filter order history")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output JSONL summary")
+	cmd.Flags().IntVar(&limit, "limit", defaultOrderHistoryLimit, "maximum runs to show (0 = every retained run)")
+	cmd.Flags().StringVar(&since, "since", "", "only show runs from within this duration ago (e.g. 1h, 24h)")
 	_ = cmd.RegisterFlagCompletionFunc("rig", completeRigFlagNames)
 	return cmd
+}
+
+// defaultOrderHistoryLimit bounds `gc order history` when the operator gives no
+// --limit. The command previously fetched every retained order-run bead, which
+// measured 22s on a city with 11k+ rows and left the command unusable for
+// interactive triage — the very moment an operator reaches for it (ga-klv).
+// Recent runs are what triage needs; --limit 0 restores the full read.
+const defaultOrderHistoryLimit = 50
+
+// orderHistoryBounds bounds an order-history read.
+type orderHistoryBounds struct {
+	// Limit caps how many runs are returned, newest first. Zero or less
+	// fetches every retained run.
+	Limit int
+	// Since drops runs older than this much time ago. Zero applies no time
+	// bound.
+	Since time.Duration
+}
+
+// parseOrderHistoryBounds validates the CLI bound flags. A malformed --since is
+// rejected at the edge so a typo fails loudly instead of silently widening the
+// read to everything.
+func parseOrderHistoryBounds(limit int, since string) (orderHistoryBounds, error) {
+	if limit < 0 {
+		return orderHistoryBounds{}, fmt.Errorf("--limit %d: want a non-negative count (0 fetches every retained run)", limit)
+	}
+	bounds := orderHistoryBounds{Limit: limit}
+	trimmed := strings.TrimSpace(since)
+	if trimmed == "" {
+		return bounds, nil
+	}
+	parsed, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return orderHistoryBounds{}, fmt.Errorf("parsing --since %q: %w (want a duration such as 1h or 24h)", since, err)
+	}
+	if parsed <= 0 {
+		return orderHistoryBounds{}, fmt.Errorf("parsing --since %q: want a positive duration such as 1h or 24h", since)
+	}
+	bounds.Since = parsed
+	return bounds, nil
+}
+
+// cutoff reports the oldest run time the bounds admit, and whether a time bound
+// applies at all.
+func (b orderHistoryBounds) cutoff(now time.Time) (time.Time, bool) {
+	if b.Since <= 0 {
+		return time.Time{}, false
+	}
+	return now.Add(-b.Since), true
 }
 
 func newOrderSweepTrackingCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -218,6 +289,7 @@ func newOrderSweepTrackingCmd(stdout, stderr io.Writer) *cobra.Command {
 	includeWisps := false
 	dryRun := false
 	quiet := false
+	confirm := false
 	cmd := &cobra.Command{
 		Use:   "sweep-tracking [order ...]",
 		Short: "Close stale and prune closed order-tracking beads",
@@ -234,10 +306,15 @@ use bounded cleanup to avoid spending an unbounded tick on stale work.
 Use --include-wisps for operator recovery of abandoned order-run wisp
 subtrees whose open descendants are also older than --stale-after. Pass one
 or more scoped order names when --include-wisps is set; wisp recovery is
-order-scoped to avoid scanning unrelated beads.`,
+order-scoped to avoid scanning unrelated beads.
+
+When the number of eligible closed-bead deletions exceeds
+GC_BULK_DELETE_CONFIRM_THRESHOLD (default 20), --confirm is required to
+proceed. This guard prevents accidental mass-deletes without an explicit
+operator acknowledgement.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdOrderSweepTrackingWithOptions(staleAfter, includeWisps, dryRun, quiet, args, stdout, stderr) != 0 {
+			if cmdOrderSweepTrackingWithOptions(staleAfter, includeWisps, dryRun, quiet, confirm, args, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -248,20 +325,17 @@ order-scoped to avoid scanning unrelated beads.`,
 	cmd.Flags().BoolVar(&includeWisps, "include-wisps", false, "also close stale order-run wisp subtrees with open descendants")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report stale order-tracking and order wisp beads without closing them")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress success output")
+	// The help text hardcodes the default threshold rather than calling
+	// bulkDeleteConfirmThreshold(): that reads the environment at command
+	// construction time, which would make docs/reference/cli.md regenerate
+	// differently depending on the generator's environment.
+	cmd.Flags().BoolVar(&confirm, "confirm", false, fmt.Sprintf("confirm bulk deletion when eligible count > GC_BULK_DELETE_CONFIRM_THRESHOLD (default %d)", defaultBulkDeleteConfirmThreshold))
 	return cmd
 }
 
-// loadOrders is the common preamble for active order commands: resolve city,
-// load config, scan formula layers, apply overrides, and filter disabled orders.
-func loadOrders(stderr io.Writer, cmdName string) ([]orders.Order, int) {
-	return loadActiveOrders(stderr, cmdName)
-}
-
-func loadActiveOrders(stderr io.Writer, cmdName string) ([]orders.Order, int) {
-	_, _, aa, code := loadActiveOrdersWithCity(stderr, cmdName)
-	return aa, code
-}
-
+// loadOrdersWithCity is the common preamble for active order commands: resolve
+// city, load config, scan formula layers, apply overrides, and filter disabled
+// orders.
 func loadOrdersWithCity(stderr io.Writer, cmdName string) (string, *config.City, []orders.Order, int) {
 	return loadActiveOrdersWithCity(stderr, cmdName)
 }
@@ -340,27 +414,69 @@ func cmdOrderListWithOptions(stdout, stderr io.Writer, jsonOutput bool) int {
 		}
 		return doOrderListJSON(cityPath, cfg, aa, stdout)
 	}
-	aa, code := loadOrders(stderr, "gc order list")
+	cityPath, cfg, aa, code := loadOrdersWithCity(stderr, "gc order list")
 	if code != 0 {
 		return code
 	}
-	return doOrderList(aa, stdout)
+	return doOrderListForCity(cityPath, cfg, aa, stdout)
 }
 
 // doOrderList prints a table of orders. Accepts pre-scanned orders for testability.
 func doOrderList(aa []orders.Order, stdout io.Writer) int {
+	return doOrderListForCity("", nil, aa, stdout)
+}
+
+// doOrderListForCity prints a table of orders. When cityPath is set, an order
+// whose requires_backend rules out its scope's backend is marked
+// "inapplicable (backend <name>)" in a trailing STATUS column; the column is
+// shown only when some order is inapplicable.
+func doOrderListForCity(cityPath string, cfg *config.City, aa []orders.Order, stdout io.Writer) int {
 	if len(aa) == 0 {
 		fmt.Fprintln(stdout, "No orders found.") //nolint:errcheck // best-effort stdout
 		return 0
 	}
 
-	hasRig := anyOrderHasRig(aa)
-	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %-15s %s\n", "NAME", "TYPE", "TRIGGER", "INTERVAL/SCHED", "RIG", "TARGET") //nolint:errcheck
-	} else {
-		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %s\n", "NAME", "TYPE", "TRIGGER", "INTERVAL/SCHED", "TARGET") //nolint:errcheck
+	status := make([]string, len(aa))
+	hasStatus := false
+	if cityPath != "" {
+		for i, a := range aa {
+			if backend, inapplicable := orderInapplicableBackend(cityPath, cfg, a); inapplicable {
+				status[i] = orderInapplicableLabel(backend)
+				hasStatus = true
+			}
+		}
 	}
-	for _, a := range aa {
+	// The STATUS column is appended only when some order is inapplicable, so
+	// the table every other city prints is unchanged.
+	targetFmt, statusFmt := "%s", ""
+	if hasStatus {
+		targetFmt, statusFmt = "%-15s", " %s"
+	}
+	statusCell := func(i int) []any {
+		if !hasStatus {
+			return nil
+		}
+		if status[i] == "" {
+			return []any{"-"}
+		}
+		return []any{status[i]}
+	}
+
+	hasRig := anyOrderHasRig(aa)
+	rowFmt := "%-20s %-8s %-12s %-15s " + targetFmt + statusFmt + "\n"
+	if hasRig {
+		rowFmt = "%-20s %-8s %-12s %-15s %-15s " + targetFmt + statusFmt + "\n"
+	}
+	header := []any{"NAME", "TYPE", "TRIGGER", "INTERVAL/SCHED"}
+	if hasRig {
+		header = append(header, "RIG")
+	}
+	header = append(header, "TARGET")
+	if hasStatus {
+		header = append(header, "STATUS")
+	}
+	fmt.Fprintf(stdout, rowFmt, header...) //nolint:errcheck
+	for i, a := range aa {
 		typ := "formula"
 		if a.IsExec() {
 			typ = "exec"
@@ -383,11 +499,13 @@ func doOrderList(aa []orders.Order, stdout io.Writer) int {
 		if rig == "" {
 			rig = "-"
 		}
+		row := []any{a.Name, typ, a.Trigger, timing}
 		if hasRig {
-			fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %-15s %s\n", a.Name, typ, a.Trigger, timing, rig, pool) //nolint:errcheck
-		} else {
-			fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %s\n", a.Name, typ, a.Trigger, timing, pool) //nolint:errcheck
+			row = append(row, rig)
 		}
+		row = append(row, pool)
+		row = append(row, statusCell(i)...)
+		fmt.Fprintf(stdout, rowFmt, row...) //nolint:errcheck
 	}
 	return 0
 }
@@ -430,15 +548,32 @@ type orderJSON struct {
 	Timeout      string            `json:"timeout,omitempty"`
 	CheckTimeout string            `json:"check_timeout,omitempty"`
 	Enabled      bool              `json:"enabled"`
+	Idempotent   bool              `json:"idempotent"`
 	Source       string            `json:"source,omitempty"`
 	FormulaLayer string            `json:"formula_layer,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
+	// RequiresBackend is the order's requires_backend declaration.
+	RequiresBackend []string `json:"requires_backend,omitempty"`
+	// Inapplicable is set ("backend <name>") when the order's scope uses a
+	// backend its requires_backend rules out: the dispatcher does not run it
+	// there.
+	Inapplicable string `json:"inapplicable,omitempty"`
+}
+
+// orderToJSONForCity is orderToJSON plus the order's applicability to its
+// scope's backend.
+func orderToJSONForCity(cityPath string, cfg *config.City, a orders.Order) orderJSON {
+	row := orderToJSON(a)
+	if backend, inapplicable := orderInapplicableBackend(cityPath, cfg, a); inapplicable {
+		row.Inapplicable = "backend " + backend
+	}
+	return row
 }
 
 func doOrderListJSON(cityPath string, cfg *config.City, aa []orders.Order, stdout io.Writer) int {
 	rows := make([]orderJSON, 0, len(aa))
 	for _, a := range aa {
-		rows = append(rows, orderToJSON(a))
+		rows = append(rows, orderToJSONForCity(cityPath, cfg, a))
 	}
 	payload := orderListJSON{
 		SchemaVersion: "1",
@@ -463,7 +598,7 @@ func doOrderShowJSON(cityPath string, cfg *config.City, aa []orders.Order, name,
 		SchemaVersion: "1",
 		CityPath:      cityPath,
 		CityName:      effectiveJSONCityName(cfg, cityPath),
-		Order:         orderToJSON(a),
+		Order:         orderToJSONForCity(cityPath, cfg, a),
 	}
 	if err := writeCLIJSONLine(stdout, payload); err != nil {
 		return 1
@@ -500,9 +635,12 @@ func orderToJSON(a orders.Order) orderJSON {
 		Timeout:      a.Timeout,
 		CheckTimeout: a.CheckTimeout,
 		Enabled:      a.IsEnabled(),
+		Idempotent:   a.Idempotent,
 		Source:       a.Source,
 		FormulaLayer: a.FormulaLayer,
 		Env:          a.Env,
+
+		RequiresBackend: a.RequiresBackend,
 	}
 }
 
@@ -585,13 +723,21 @@ func doOrderShow(aa []orders.Order, name, rig string, stdout, stderr io.Writer) 
 			w(fmt.Sprintf("  %s=%s", key, a.Env[key]))
 		}
 	}
+	// Idempotent decides whether the order fails OPEN when its open-work gate
+	// times out under store contention (see order_dispatch gateFailClosed). It is
+	// load-bearing for diagnosing starved single-flight orders, so surface it.
+	w(fmt.Sprintf("Idempotent:  %t", a.Idempotent))
 	w(fmt.Sprintf("Source:      %s", a.Source))
 	return 0
 }
 
 // --- gc order run ---
 
-func cmdOrderRun(name, rig string, jsonOutput bool, vars map[string]string, stdout, stderr io.Writer) int {
+// cmdOrderRun is gc order run. An order whose requires_backend
+// rules out its scope's backend is refused unless force is set: a Dolt
+// cleanup run by hand on an http city would otherwise act on whatever Dolt
+// server the city's config still names.
+func cmdOrderRun(name, rig string, jsonOutput, force bool, vars map[string]string, stdout, stderr io.Writer) int {
 	cityPath, cfg, aa, code := loadOrdersWithCity(stderr, "gc order run")
 	if code != 0 {
 		return code
@@ -600,6 +746,13 @@ func cmdOrderRun(name, rig string, jsonOutput bool, vars map[string]string, stdo
 	if !ok {
 		fmt.Fprintf(stderr, "gc order run: order %q not found\n", name) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if backend, inapplicable := orderInapplicableBackend(cityPath, cfg, a); inapplicable {
+		if !force {
+			fmt.Fprintf(stderr, "gc order run: %s; refusing to run it (pass --force to run it anyway)\n", orderInapplicableReason(a, backend)) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		fmt.Fprintf(stderr, "gc order run: warning: %s; running it anyway because of --force\n", orderInapplicableReason(a, backend)) //nolint:errcheck // best-effort stderr
 	}
 	if err := orders.ValidateRequiredParams(a, vars); err != nil {
 		fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -632,7 +785,7 @@ func cmdOrderRun(name, rig string, jsonOutput bool, vars map[string]string, stdo
 			}
 			defer ep.Close() //nolint:errcheck // best-effort
 		}
-		return doOrderRunExecTracked(a, cityPath, cfg, orders.NewStore(store), ep, vars, stdout, stderr)
+		return doOrderRunExecTracked(a, cityPath, cfg, orderTrackingFrontDoor(cityPath, cfg, store), ep, vars, stdout, stderr)
 	}
 	store, storeCode := openOrderStoreForOrder(cityPath, cfg, a, stderr, "gc order run")
 	if store.Store == nil {
@@ -684,7 +837,7 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 			fmt.Fprintf(stderr, "gc order run: %v\n", cfgErr) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		return doOrderRunExecTracked(a, cityPath, cfg, orders.NewStore(store), ep, vars, stdout, stderr)
+		return doOrderRunExecTracked(a, cityPath, cfg, orderTrackingFrontDoor(cityPath, cfg, store), ep, vars, stdout, stderr)
 	}
 
 	// Capture event head before wisp creation (race-free cursor). Event runs
@@ -720,22 +873,26 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 
 	// Compile wisp from formula so graph workflows can be decorated with
 	// routing metadata before instantiation.
-	var searchPaths []string
-	if a.FormulaLayer != "" {
-		searchPaths = []string{a.FormulaLayer}
-	}
+	vars = orderFormulaVars(cfg, a, vars)
+	searchPaths := orderFormulaSearchPaths(cfg, a)
 	// Pass the unwrapped store to the generic molecule/graph-routing boundaries:
 	// the beads.OrdersStore wrapper does not promote optional capabilities, so
 	// handing it to molecule.Instantiate would hide the underlying
 	// GraphApplyStore and silently fall back to sequential creation. store stays
 	// the typed wrapper for the order-tracking bead operations below.
 	genericStore := store.Store
-	recipe, err := prepareOrderWispRecipe(context.Background(), genericStore, a, searchPaths, vars)
+	genericStoreWork := beads.WorkStore{Store: genericStore}
+	recipe, effectiveVars, err := prepareOrderWispRecipe(context.Background(), genericStoreWork, a, searchPaths, vars)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if err := molecule.ValidateRecipeRuntimeVars(recipe, molecule.Options{}); err != nil {
+	// Validate against the resolved invocation vars (declared defaults
+	// applied), not the caller's raw --var map. Passing an empty Options here
+	// drops them, and ValidateRecipeRuntimeVars reads opts.Vars — so every
+	// `required = true` var reports as missing however many --var flags were given,
+	// making any formula with a required var unfireable as an order.
+	if err := molecule.ValidateRecipeRuntimeVars(recipe, molecule.Options{Vars: effectiveVars}); err != nil {
 		fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -752,20 +909,59 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 		}
 	}
 
-	if err := applyOrderRecipeRouting(recipe, pool, vars, storeTarget, genericStore, cityName, cityPath, cfg); err != nil {
+	// Everything from here on writes the molecule, so it goes to the store that
+	// owns the class the molecule's beads belong to rather than to the
+	// order/scope store the tracking bead lives in — the same split dispatchWisp
+	// takes through graphStoreFor. The class is the classifier's verdict on the
+	// compiled recipe, not the formula's compiler version: a graph.v2 pour and a
+	// root-only wisp are graph class and belong in the binding, while a v1
+	// POURED order formula compiles to a molecule container whose every bead is
+	// work class and must stay on the work ledger, which is the only place
+	// `gc hook` looks for the steps it assigns.
+	//
+	// A one-shot command builds no CityRuntime, so the routes come from the
+	// one-shot funnel; on a city that relocates nothing resolveGraphStore hands
+	// back the exact store value it was given, so this stays the single store
+	// `gc order run` always used, including the optional-capability assertions
+	// molecule.Instantiate makes against it.
+	graphStore := resolveGraphStore(cliStorageRoutes(cityPath), genericStore, cfg, cityPath, nil)
+	moleculeStore := moleculeClassStore(recipe, genericStore, graphStore)
+	moleculeStoreMolecule := moleculeClassTarget(recipe, moleculeStore, moleculeStore)
+
+	if err := applyOrderRecipeRouting(recipe, pool, vars, storeTarget, moleculeStore, cityName, cityPath, cfg); err != nil {
 		fmt.Fprintf(stderr, "gc order run: routing decoration failed: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	cookResult, err := molecule.Instantiate(context.Background(), genericStore, recipe, molecule.Options{})
+	// Thread the same resolved invocation vars used for validation above into
+	// instantiation. An empty Options here falls back to formula defaults
+	// only, so every {{var}} referencing a caller-supplied value renders
+	// empty (or its default) on the created bead text instead of the
+	// caller's value (#4668).
+	stampOrderWispRuntimeVars(recipe, effectiveVars)
+
+	cookResult, err := molecule.Instantiate(context.Background(), moleculeStoreMolecule, recipe, molecule.Options{Vars: effectiveVars})
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	rootID := cookResult.RootID
+	if cookResult.GraphWorkflow {
+		// Two classes, two stores: the molecule store owns the root and its
+		// steps, the scope store owns the tracks edges of any input convoy the
+		// root names. Wrapping one store as both legs reads the convoy out of the
+		// ledger it does not live in.
+		if err := executionevent.EmitCurrent(ep, beads.GraphStore{Store: moleculeStore}, genericStoreWork, rootID, "order-run"); err != nil {
+			fmt.Fprintf(stderr, "warning: gc order run: projecting execution facts for %s: %v\n", rootID, err) //nolint:errcheck // successful order run is preserved
+		}
+	}
 
 	// Track the spawned root in the same store that created it so manual runs
-	// stay provider-aware and do not fall back to ambient bd CLI state.
+	// stay provider-aware and do not fall back to ambient bd CLI state. The
+	// order-run / order: / seq: labels are the run's evidence and they have to
+	// ride the bead they describe, which is resident wherever the molecule was
+	// materialized. cachedOrderStoresResolver reads that binding back, so
+	// `gc order check` still finds this run.
 	update := beads.UpdateOpts{
 		Labels: []string{"order-run:" + scoped},
 	}
@@ -778,7 +974,7 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 	if a.Pool != "" {
 		update.Metadata = map[string]string{beadmeta.RoutedToMetadataKey: pool}
 	}
-	if err := store.Update(rootID, update); err != nil {
+	if err := moleculeStore.Update(rootID, update); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling wisp: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -794,7 +990,7 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 	// (#3294). Create it closed: its CreatedAt is the cooldown marker, and a
 	// lingering open tracking bead would read as in-flight work and block
 	// re-dispatch (ga-jra/ga-lo8c). Best-effort: the wisp already launched.
-	if _, err := orders.NewStore(store).CreateRunClosed(scoped, orders.RunOutcomeNone, nil, ""); err != nil {
+	if _, err := orderTrackingFrontDoor(cityPath, cfg, store).CreateRunClosed(scoped, orders.RunOutcomeNone, nil, ""); err != nil {
 		fmt.Fprintf(stderr, "gc order run: recording tracking bead: %v\n", err) //nolint:errcheck
 	}
 
@@ -890,7 +1086,7 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		maxTimeout = cfg.Orders.MaxTimeoutDuration()
 	}
 	timeout := effectiveTimeout(a, maxTimeout)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := withOrderTimeout(context.Background(), timeout)
 	defer cancel()
 
 	target, err := resolveOrderExecTarget(cityPath, cfg, a)
@@ -904,6 +1100,18 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		return orderRunExecResult{code: 1, failureLabel: "exec-env-failed"}
 	}
 
+	outcomeFile, outcomeErr := newOrderOutcomeFile()
+	if outcomeErr != nil {
+		fmt.Fprintf(stderr, "gc order run: %v\n", outcomeErr) //nolint:errcheck // best-effort stderr
+	} else {
+		env = append(env, outcomeFile.envEntry())
+		defer func() {
+			if err := outcomeFile.remove(); err != nil {
+				fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr
+			}
+		}()
+	}
+
 	output, err := shellExecRunner(ctx, a.Exec, target.ScopeRoot, env)
 	// The exec env now projects the controller's GH_TOKEN/GITHUB_TOKEN into the
 	// child, so any order that echoes one would leak it. Redact the exec error
@@ -911,7 +1119,7 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 	// success paths, matching the controller dispatch path (order_dispatch.go).
 	redactionEnv := append(os.Environ(), env...)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc order run: exec failed: %s\n", execenv.RedactText(err.Error(), redactionEnv)) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc order run: exec failed: %s\n", execenv.RedactText(orderRunErrorText(ctx, err), redactionEnv)) //nolint:errcheck
 		if len(output) > 0 {
 			fmt.Fprintf(stderr, "%s", execenv.RedactText(string(output), redactionEnv)) //nolint:errcheck
 		}
@@ -921,6 +1129,9 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		fmt.Fprintf(stdout, "%s", execenv.RedactText(string(output), redactionEnv)) //nolint:errcheck
 	}
 	fmt.Fprintf(stdout, "Order %q executed (exec)\n", a.Name) //nolint:errcheck
+	if outcomeFile != nil {
+		printOrderRunOutcome(outcomeFile, a.Name, stdout, stderr)
+	}
 	return orderRunExecResult{code: 0}
 }
 
@@ -970,6 +1181,10 @@ type orderCheckJSONRow struct {
 	Trigger    string `json:"trigger"`
 	Due        bool   `json:"due"`
 	Reason     string `json:"reason"`
+	// Inapplicable is set ("backend <name>") when the order's requires_backend
+	// rules out its scope's backend. Such an order is never due: the
+	// dispatcher does not run it there.
+	Inapplicable string `json:"inapplicable,omitempty"`
 }
 
 func doOrderCheckJSON(aa []orders.Order, now time.Time, lastRunFn orders.LastRunFunc, jsonOutput bool, stdout, stderr io.Writer) int {
@@ -1061,6 +1276,38 @@ func doOrderCheckWithStoresResolverScoped(cityPath string, cfg *config.City, aa 
 	return doOrderCheckWithStoresResolverScopedJSON(cityPath, cfg, aa, now, ep, resolveStores, false, stdout, stderr)
 }
 
+// orderCheckFiredEventTailLimit bounds the newest-first order.fired read
+// below, and mirrors internal/doctor's orderFiringEventTailLimit in both the
+// value and the reason it is safe: the lastRunFn built below already falls
+// through to the authoritative order-run history (baseLastRunFn) whenever the
+// tail does not carry a fresh-enough fired event for an order, so bounding
+// this read can only cost the cooldown fast path, never manufacture a false
+// "never fired" the way an unguarded Limit would.
+//
+// The safety of that fall-through rests on the shape of the shortcut, not
+// on any timestamp ordering between the event and the order-run history:
+// the fired event is consulted only to return "not due" early, so losing it
+// can only move an order toward due, never away from it. The bound can
+// therefore advance a firing but cannot suppress one, which is the property
+// a scheduler needs. (Do not restate this as a claim that the bead is the
+// older record. orders.LastRunAcross takes the newest order-run evidence,
+// which a wisp root labeled after the event, or a later manual gc order run,
+// can push past the event's own timestamp.)
+//
+// One behavior does change, and it is inherent to bounding rather than
+// incidental. When the shortcut fired, baseLastRunFn was never called, so a
+// failing LastRun read on that order's store stayed masked. An order whose
+// event has been evicted now reaches that read, and lastRunErr aborts the
+// whole check. No bounded read can recover the evicted event, so this is the
+// cost of not walking the archives: a store failure that used to be hidden
+// behind a cached event is now reported.
+//
+// The tail read walks the active event log backward and stops at this many
+// matches; it never opens the gzipped archives, which is where the unbounded
+// List spent its time. A log holding fewer than this many order.fired events
+// is still walked to its start.
+const orderCheckFiredEventTailLimit = 2000
+
 func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City, aa []orders.Order, now time.Time, ep events.Provider, resolveStores orderStoresResolver, jsonOutput bool, stdout, stderr io.Writer) int {
 	if len(aa) == 0 {
 		if jsonOutput {
@@ -1082,7 +1329,12 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 
 	var firedEvents []events.Event
 	if ep != nil {
-		firedEvents, _ = ep.List(events.Filter{Type: events.OrderFired})
+		filter := events.Filter{Type: events.OrderFired}
+		if tp, ok := ep.(events.TailProvider); ok {
+			firedEvents, _ = tp.ListTail(filter, orderCheckFiredEventTailLimit)
+		} else {
+			firedEvents, _ = ep.List(filter)
+		}
 	}
 	latestFired := make(map[string]time.Time)
 	for _, event := range firedEvents {
@@ -1102,6 +1354,17 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 			if err := validateOrderCheckPreflight(a); err != nil {
 				fmt.Fprintf(stderr, "gc order check: %v\n", err) //nolint:errcheck // best-effort stderr
 				return 1
+			}
+			if backend, inapplicable := orderCheckInapplicable(cityPath, cfg, a); inapplicable {
+				result.Orders = append(result.Orders, orderCheckJSONRow{
+					Name:         a.Name,
+					Rig:          a.Rig,
+					ScopedName:   a.ScopedName(),
+					Trigger:      a.Trigger,
+					Reason:       orderInapplicableLabel(backend),
+					Inapplicable: "backend " + backend,
+				})
+				continue
 			}
 			typedStores, err := resolveStores(a)
 			if err != nil {
@@ -1182,6 +1445,18 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 			fmt.Fprintf(stderr, "gc order check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		if backend, inapplicable := orderCheckInapplicable(cityPath, cfg, a); inapplicable {
+			if hasRig {
+				rig := a.Rig
+				if rig == "" {
+					rig = "-"
+				}
+				fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %s\n", a.Name, a.Trigger, rig, "-", orderInapplicableLabel(backend)) //nolint:errcheck
+			} else {
+				fmt.Fprintf(stdout, "%-20s %-12s %-5s %s\n", a.Name, a.Trigger, "-", orderInapplicableLabel(backend)) //nolint:errcheck
+			}
+			continue
+		}
 		typedStores, err := resolveStores(a)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc order check: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1249,6 +1524,16 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 	return 1
 }
 
+// orderCheckInapplicable reports whether gc order check should show a as
+// inapplicable rather than evaluate its trigger. Without a city path (the
+// unscoped test seams) every order is evaluated.
+func orderCheckInapplicable(cityPath string, cfg *config.City, a orders.Order) (string, bool) {
+	if cityPath == "" {
+		return "", false
+	}
+	return orderInapplicableBackend(cityPath, cfg, a)
+}
+
 func validateOrderCheckPreflight(a orders.Order) error {
 	return validateOrderExecEnvOverrides(a)
 }
@@ -1256,16 +1541,16 @@ func validateOrderCheckPreflight(a orders.Order) error {
 // --- gc order history ---
 
 func cmdOrderHistory(name, rig string, stdout, stderr io.Writer) int {
-	return cmdOrderHistoryJSON(name, rig, false, stdout, stderr)
+	return cmdOrderHistoryJSON(name, rig, orderHistoryBounds{}, false, stdout, stderr)
 }
 
-func cmdOrderHistoryJSON(name, rig string, jsonOutput bool, stdout, stderr io.Writer) int {
+func cmdOrderHistoryJSON(name, rig string, bounds orderHistoryBounds, jsonOutput bool, stdout, stderr io.Writer) int {
 	cityPath, cfg, aa, code := loadAllOrdersWithCity(stderr, "gc order history")
 	if code != 0 {
 		return code
 	}
 	c, reason := orderHistoryAPIClient(cityPath)
-	return routeOrderHistory(cityPath, cfg, name, rig, aa, c, reason, jsonOutput, stdout, stderr)
+	return routeOrderHistory(cityPath, cfg, name, rig, aa, c, reason, bounds, jsonOutput, stdout, stderr)
 }
 
 // orderHistoryAPIClient returns (client, "") when the API path is available,
@@ -1283,7 +1568,7 @@ var orderHistoryAPIClient = func(cityPath string) (*api.Client, string) {
 // a single order is being queried and the controller is up; otherwise falls
 // back to the local iterator. Emits exactly one route=... log line per exit
 // path (gated on GC_DEBUG).
-func routeOrderHistory(cityPath string, cfg *config.City, name, rig string, aa []orders.Order, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+func routeOrderHistory(cityPath string, cfg *config.City, name, rig string, aa []orders.Order, c *api.Client, nilReason string, bounds orderHistoryBounds, jsonOutput bool, stdout, stderr io.Writer) int {
 	// Multi-order mode (no name provided) has no single scoped_name to
 	// request against /orders/history; stay on the local iterator so we
 	// produce the same aggregated output. The log line documents the
@@ -1291,19 +1576,30 @@ func routeOrderHistory(cityPath string, cfg *config.City, name, rig string, aa [
 	// missing route=api.
 	if name == "" {
 		logRoute(stderr, "order history", "fallback", "multi-order")
-		return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), jsonOutput, stdout, stderr)
+		return doOrderHistoryBounded(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), bounds, jsonOutput, stdout, stderr)
+	}
+
+	// The API has no wire representation for an unlimited read: omitting
+	// `limit` selects the server's own default (20), not "everything". Stay
+	// on the local iterator so `--limit 0` keeps meaning every retained run.
+	if bounds.Limit <= 0 {
+		logRoute(stderr, "order history", "fallback", "unlimited")
+		return doOrderHistoryBounded(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), bounds, jsonOutput, stdout, stderr)
 	}
 
 	var cr api.CachedRead[[]api.OrderHistoryView]
 	return routeRead(c, "order history", nilReason, stderr,
 		func() error {
 			var err error
-			cr, err = c.GetOrderHistory(orderScopedName(name, rig, aa), 0, "")
+			// The server already accepts the row bound; --since has no wire
+			// equivalent (the API's `before` is an upper bound), so the time
+			// window is applied to the response below.
+			cr, err = c.GetOrderHistory(orderScopedName(name, rig, aa), bounds.Limit, "")
 			return err
 		},
-		func() int { return renderOrderHistoryFromAPI(cr, name, rig, jsonOutput, stdout, stderr) },
+		func() int { return renderOrderHistoryFromAPI(cr, name, rig, bounds, jsonOutput, stdout, stderr) },
 		func() int {
-			return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), jsonOutput, stdout, stderr)
+			return doOrderHistoryBounded(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), bounds, jsonOutput, stdout, stderr)
 		},
 	)
 }
@@ -1322,12 +1618,46 @@ func orderScopedName(name, rig string, aa []orders.Order) string {
 	return name + ":rig:" + rig
 }
 
+// orderHistoryEntriesFromAPI decodes an API response into the entries the
+// local route prints, applying the --since window. The server honors the row
+// bound itself; the time window has no wire equivalent, so it is applied here
+// rather than silently dropped. Each created_at is parsed once: CreatedAt
+// keeps the full time for --json, and Executed carries the whole-second
+// RFC3339 form both routes print. A row whose created_at cannot be parsed is
+// an error, not a silently skipped row.
+func orderHistoryEntriesFromAPI(views []api.OrderHistoryView, bounds orderHistoryBounds) ([]orderHistoryJSONEntry, error) {
+	cutoff, hasCutoff := bounds.cutoff(time.Now())
+	entries := make([]orderHistoryJSONEntry, 0, len(views))
+	for _, v := range views {
+		createdAt, err := time.Parse(time.RFC3339Nano, v.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parsing API created_at %q: %w", v.CreatedAt, err)
+		}
+		if hasCutoff && createdAt.Before(cutoff) {
+			continue
+		}
+		entries = append(entries, orderHistoryJSONEntry{
+			Order:     v.Name,
+			Rig:       v.Rig,
+			BeadID:    v.BeadID,
+			Executed:  createdAt.Format(time.RFC3339),
+			CreatedAt: createdAt,
+		})
+	}
+	return entries, nil
+}
+
 // renderOrderHistoryFromAPI prints the API-sourced order history to match
 // doOrderHistoryWithStoresResolver's human output. Empty results and
-// rig-column presence are preserved; a staleness banner appends when the
-// supervisor cache age exceeds the shared threshold.
-func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, rig string, jsonOutput bool, stdout, stderr io.Writer) int {
-	entries := cr.Body
+// rig-column presence are preserved; human output is followed by the
+// cache-age footer on stderr when the server's cache is behind
+// (writeCacheAgeFooter).
+func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, rig string, bounds orderHistoryBounds, jsonOutput bool, stdout, stderr io.Writer) int {
+	entries, err := orderHistoryEntriesFromAPI(cr.Body, bounds)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc order history: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if len(entries) == 0 {
 		if jsonOutput {
 			return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", orderHistoryJSONResult{
@@ -1348,29 +1678,14 @@ func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, 
 	}
 
 	if jsonOutput {
-		payload := orderHistoryJSONResult{
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", orderHistoryJSONResult{
 			SchemaVersion: "1",
 			OK:            true,
 			Name:          name,
 			Rig:           rig,
-			Entries:       make([]orderHistoryJSONEntry, 0, len(entries)),
+			Entries:       entries,
 			Summary:       orderHistoryJSONSummary{Total: len(entries)},
-		}
-		for _, e := range entries {
-			createdAt, err := time.Parse(time.RFC3339Nano, e.CreatedAt)
-			if err != nil {
-				fmt.Fprintf(stderr, "gc order history: parsing API created_at %q: %v\n", e.CreatedAt, err) //nolint:errcheck // best-effort stderr
-				return 1
-			}
-			payload.Entries = append(payload.Entries, orderHistoryJSONEntry{
-				Order:     e.Name,
-				Rig:       e.Rig,
-				BeadID:    e.BeadID,
-				Executed:  createdAt.Format(time.RFC3339),
-				CreatedAt: createdAt,
-			})
-		}
-		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
+		})
 	}
 
 	hasRig := false
@@ -1388,18 +1703,16 @@ func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, 
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.Name, rig, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.Order, rig, e.BeadID, e.Executed) //nolint:errcheck
 		}
 	} else {
 		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.Name, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.Order, e.BeadID, e.Executed) //nolint:errcheck
 		}
 	}
 
-	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
-		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck
-	}
+	writeCacheAgeFooter(stderr, cr.AgeSeconds, cr.Refresh)
 	return 0
 }
 
@@ -1427,6 +1740,14 @@ func doOrderHistoryWithStoresResolver(name, rig string, aa []orders.Order, resol
 }
 
 func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, resolveStores orderStoresResolver, jsonOutput bool, stdout, stderr io.Writer) int {
+	return doOrderHistoryBounded(name, rig, aa, resolveStores, orderHistoryBounds{}, jsonOutput, stdout, stderr)
+}
+
+// doOrderHistoryBounded is doOrderHistoryWithStoresResolverJSON with an explicit
+// read bound. The per-order fetch is capped at bounds.Limit: after the merge the
+// output keeps only the newest Limit runs overall, so no single order can
+// contribute more than that, and fetching more would be pure waste.
+func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores orderStoresResolver, bounds orderHistoryBounds, jsonOutput bool, stdout, stderr io.Writer) int {
 	// Filter orders if name or rig specified.
 	targets := aa
 	if name != "" || rig != "" {
@@ -1450,6 +1771,7 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
+	cutoff, hasCutoff := bounds.cutoff(time.Now())
 
 	for _, a := range targets {
 		stores, err := resolveStores(a)
@@ -1461,7 +1783,7 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 			if store.Store == nil {
 				continue
 			}
-			results, err := orders.NewStore(store).RecentRuns(a.ScopedName(), 0)
+			results, err := orders.NewStore(store).RecentRuns(a.ScopedName(), bounds.Limit)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc order history: %v\n", err) //nolint:errcheck // best-effort stderr
 				if i == 0 && len(results) == 0 {
@@ -1472,6 +1794,9 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 				}
 			}
 			for _, r := range results {
+				if hasCutoff && r.CreatedAt.Before(cutoff) {
+					continue
+				}
 				key := a.ScopedName() + "\x00" + r.ID + "\x00" + r.CreatedAt.Format(time.RFC3339Nano)
 				if seenEntries[key] {
 					continue
@@ -1509,6 +1834,13 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 	sort.SliceStable(entries, func(i, j int) bool {
 		return entries[i].createdAt.After(entries[j].createdAt)
 	})
+	// Multi-order mode merges one bounded fetch per order, so the union can
+	// still exceed the requested bound; cut it here, after the newest-first
+	// sort, so the rows kept are the newest overall rather than the newest of
+	// whichever order happened to be iterated first.
+	if bounds.Limit > 0 && len(entries) > bounds.Limit {
+		entries = entries[:bounds.Limit]
+	}
 
 	if jsonOutput {
 		payload := orderHistoryJSONResult{
@@ -1580,7 +1912,24 @@ type orderHistoryJSONSummary struct {
 
 // --- gc order sweep-tracking ---
 
-func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dryRun, quiet bool, orderNames []string, stdout, stderr io.Writer) int {
+// defaultBulkDeleteConfirmThreshold is the built-in value of
+// bulkDeleteConfirmThreshold when GC_BULK_DELETE_CONFIRM_THRESHOLD is unset.
+const defaultBulkDeleteConfirmThreshold = 20
+
+// bulkDeleteConfirmThreshold returns the maximum number of eligible retention
+// deletions allowed without an explicit --confirm flag. Configurable via
+// GC_BULK_DELETE_CONFIRM_THRESHOLD (positive integer); default 20.
+func bulkDeleteConfirmThreshold() int {
+	if s := os.Getenv("GC_BULK_DELETE_CONFIRM_THRESHOLD"); s != "" {
+		var n int
+		if _, err := fmt.Sscanf(s, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultBulkDeleteConfirmThreshold
+}
+
+func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dryRun, quiet, confirm bool, orderNames []string, stdout, stderr io.Writer) int {
 	if staleAfter <= 0 {
 		fmt.Fprintln(stderr, "gc order sweep-tracking: --stale-after must be positive") //nolint:errcheck // best-effort stderr
 		return 1
@@ -1605,7 +1954,10 @@ func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dr
 		fmt.Fprintf(stderr, "gc order sweep-tracking: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	stores, openErr := orderTrackingSweepStoresForConfigTargets(cityPath, cfg, requiredTargets)
+	// wispStore is the store the sweep's wisp-subtree half runs against: on a
+	// split city the wisp roots this force-closes are graph class and live in
+	// the binding, not in any of the order stores beside them.
+	stores, wispStore, openErr := orderTrackingSweepStoresForConfigTargets(cityPath, cfg, requiredTargets)
 	if len(stores) == 0 {
 		if openErr != nil {
 			fmt.Fprintf(stderr, "gc order sweep-tracking: %v\n", openErr) //nolint:errcheck // best-effort stderr
@@ -1619,12 +1971,41 @@ func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dr
 	var sweepErr error
 	var retentionResult orderTrackingRetentionSweepResult
 	var retentionErr error
+	// Set when the bulk-delete confirm gate blocks the retention sweep. By that
+	// point stale-close has already run, so normal reporting still happens and
+	// the non-zero exit is deferred to the end of the function.
+	confirmGateBlocked := false
 	if dryRun {
-		result, sweepErr = sweepStaleOrderTrackingAcrossStoresDryRun(stores, now, staleAfter, onlyOrders, includeWisps)
+		result, sweepErr = sweepStaleOrderTrackingAcrossStoresDryRun(stores, wispStore, now, staleAfter, onlyOrders, includeWisps)
 	} else {
-		result, sweepErr = sweepStaleOrderTrackingAcrossStores(stores, now, staleAfter, onlyOrders, includeWisps)
-		retentionResult, retentionErr = sweepClosedOrderTrackingRetentionAcrossStores(stores, now, orderTrackingRetentionPolicyForConfig(cfg), onlyOrders)
-		result.trackingDeleted = retentionResult.deleted
+		result, sweepErr = sweepStaleOrderTrackingAcrossStores(stores, wispStore, now, staleAfter, onlyOrders, includeWisps)
+
+		// Bulk-delete confirm gate: before any retention deletions, count
+		// eligible beads and require --confirm when above
+		// GC_BULK_DELETE_CONFIRM_THRESHOLD. The gate covers only the retention
+		// sweep — stale-close runs first and unconditionally, so a tripped gate
+		// can never wedge the stale-close every caller depends on.
+		// Fail-closed: a store read error blocks deletion rather than proceeding
+		// unguarded — a degraded store is exactly when accidental mass deletion
+		// is most dangerous.
+		retentionPolicy := orderTrackingRetentionPolicyForConfig(cfg)
+		eligible, countErr := countClosedOrderTrackingRetentionEligible(stores, now, retentionPolicy, onlyOrders)
+		threshold := bulkDeleteConfirmThreshold()
+		switch {
+		case countErr != nil:
+			fmt.Fprintf(stderr, //nolint:errcheck // best-effort stderr
+				"gc order sweep-tracking: cannot count eligible beads for confirm gate: %v — aborting to avoid unguarded bulk delete\n",
+				countErr)
+			confirmGateBlocked = true
+		case eligible > threshold && !confirm:
+			fmt.Fprintf(stderr, //nolint:errcheck // best-effort stderr
+				"gc order sweep-tracking: %d beads would be deleted — rerun with --confirm to proceed (GC_BULK_DELETE_CONFIRM_THRESHOLD=%d)\n",
+				eligible, threshold)
+			confirmGateBlocked = true
+		default:
+			retentionResult, retentionErr = sweepClosedOrderTrackingRetentionAcrossStores(stores, now, retentionPolicy, onlyOrders)
+			result.trackingDeleted = retentionResult.deleted
+		}
 	}
 	if err := errors.Join(openErr, sweepErr, retentionErr); err != nil {
 		fmt.Fprintf(stderr, "gc order sweep-tracking: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1648,6 +2029,9 @@ func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dr
 		} else {
 			fmt.Fprintf(stdout, "%s %d stale order-tracking bead(s)%s\n", verb, result.trackingClosed, deletedClause) //nolint:errcheck // best-effort stdout
 		}
+	}
+	if confirmGateBlocked {
+		return 1
 	}
 	return 0
 }
@@ -1759,19 +2143,29 @@ func findOrder(aa []orders.Order, name, rig string) (orders.Order, bool) {
 const bdCursorRecentRunsLimit = 256
 
 func bdCursor(store beads.Store, orderName string) (uint64, error) {
-	beadList, err := store.List(beads.ListQuery{
-		Label:         "order:" + orderName,
-		IncludeClosed: true,
-		Limit:         bdCursorRecentRunsLimit,
-		Sort:          beads.SortCreatedDesc,
-		TierMode:      beads.TierBoth,
-		// Deliberately NOT an AllowBackingCreatedLimit caller. This read reduces to
-		// MaxSeqFromLabels — a max over seq, a DIFFERENT column than the created_at
-		// sort key — so the backing's id-ASC created-desc limit could drop the newest
-		// largest-id row carrying the max seq when a same-second burst exceeds the
-		// cap, regressing the event cursor into replaying consumed events. Fetch the
-		// full candidate set and let ApplyListQuery cut the canonical
-		// (created_at DESC, id DESC) prefix, which keeps the max-seq run at the front.
+	// One leg of bdCursorAcrossStores: run records live in the orders binding
+	// and, for v1 poured order-run roots (work class), on the work legs, so a
+	// leg that holds none of them is expected to miss.
+	var beadList []beads.Bead
+	err := beads.FederatedRead(func() (err error) {
+		beadList, err = store.List(beads.ListQuery{
+			// Keyed on the owned order-run:<name> label (coordclass.CoordinationOwned):
+			// only order dispatch writes it, so no plain bead can crowd the run
+			// records out of this bounded window (the #7766 review).
+			Label:         orders.RunLabel(orderName),
+			IncludeClosed: true,
+			Limit:         bdCursorRecentRunsLimit,
+			Sort:          beads.SortCreatedDesc,
+			TierMode:      beads.TierBoth,
+			// Deliberately NOT an AllowBackingCreatedLimit caller. This read reduces to
+			// MaxSeqFromLabels — a max over seq, a DIFFERENT column than the created_at
+			// sort key — so the backing's id-ASC created-desc limit could drop the newest
+			// largest-id row carrying the max seq when a same-second burst exceeds the
+			// cap, regressing the event cursor into replaying consumed events. Fetch the
+			// full candidate set and let ApplyListQuery cut the canonical
+			// (created_at DESC, id DESC) prefix, which keeps the max-seq run at the front.
+		})
+		return err
 	})
 	if err != nil {
 		if len(beadList) == 0 {
@@ -1779,9 +2173,14 @@ func bdCursor(store beads.Store, orderName string) (uint64, error) {
 		}
 		orderLogf("gc order: event cursor lookup partially failed for %s: %v", orderName, err)
 	}
-	labelSets := make([][]string, len(beadList))
-	for i, b := range beadList {
-		labelSets[i] = b.Labels
+	// Only a run record's seq is the order's cursor (orders.IsRunRecord): a
+	// plain bead carrying the order:<name> and seq:<n> labels moves nothing
+	// (architecture B v2, the #7766 review).
+	labelSets := make([][]string, 0, len(beadList))
+	for _, b := range beadList {
+		if orders.IsRunRecord(b) {
+			labelSets = append(labelSets, b.Labels)
+		}
 	}
 	return orders.MaxSeqFromLabels(labelSets), nil
 }
@@ -1808,6 +2207,7 @@ func bdCursorAcrossStores(orderName string, stores ...beads.Store) (uint64, erro
 func newOrderSweepNudgeMailCmd(stdout, stderr io.Writer) *cobra.Command {
 	nudgeTTL := nudgeMailSweepDefaultNudgeTTL
 	mailTTL := nudgeMailSweepDefaultMailTTL
+	unreadMailTTL := nudgeMailSweepDefaultUnreadMailTTL
 	dryRun := false
 	quiet := false
 	cmd := &cobra.Command{
@@ -1816,33 +2216,57 @@ func newOrderSweepNudgeMailCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Close stale delivered nudge beads and read mail beads.
 
 Nudge beads that are past --nudge-ttl and not in the live nudge queue are
-closed. Read mail beads past --mail-ttl are closed. A budget cap of ` + fmt.Sprintf("%d", nudgeMailSweepCloseBudget) + ` closes
+closed. Read mail beads past --mail-ttl are closed. Closing unread mail is
+opt-in: when --unread-mail-ttl (or [mail] unread_retention_ttl) is set, unread
+mail beads past it are also closed, so mail nobody ever reads ages out instead
+of accumulating forever. A budget cap of ` + fmt.Sprintf("%d", nudgeMailSweepCloseBudget) + ` closes
 per invocation prevents runaway sweeps under load.
 
 Use --dry-run to log what would be closed without making any changes.
 The controller watchdog also runs this sweep automatically every 5 minutes.`,
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdOrderSweepNudgeMail(nudgeTTL, mailTTL, dryRun, quiet, stdout, stderr) != 0 {
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			mailTTLExplicit := cmd.Flags().Changed("mail-ttl")
+			unreadMailTTLExplicit := cmd.Flags().Changed("unread-mail-ttl")
+			if cmdOrderSweepNudgeMail(nudgeTTL, mailTTL, unreadMailTTL, mailTTLExplicit, unreadMailTTLExplicit, dryRun, quiet, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().DurationVar(&nudgeTTL, "nudge-ttl", nudgeMailSweepDefaultNudgeTTL, "min age before a delivered nudge bead is GC'd")
-	cmd.Flags().DurationVar(&mailTTL, "mail-ttl", nudgeMailSweepDefaultMailTTL, "min age before a read mail bead is GC'd")
+	cmd.Flags().DurationVar(&mailTTL, "mail-ttl", nudgeMailSweepDefaultMailTTL, "min age before a read mail bead is GC'd; 0 disables the mail-close phase (default: cfg.Mail.RetentionTTL when set, else "+nudgeMailSweepDefaultMailTTL.String()+")")
+	cmd.Flags().DurationVar(&unreadMailTTL, "unread-mail-ttl", nudgeMailSweepDefaultUnreadMailTTL, "min age before an unread mail bead is GC'd; 0 disables (default: cfg.Mail.UnreadRetentionTTL when set, else disabled)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "log what would be closed; make no changes")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress success output")
 	return cmd
 }
 
-func cmdOrderSweepNudgeMail(nudgeTTL, mailTTL time.Duration, dryRun, quiet bool, stdout, stderr io.Writer) int {
+// validateNudgeMailSweepFlags checks the sweep-nudge-mail flags before any
+// city is resolved. --nudge-ttl must stay positive (there is no "disabled"
+// meaning for it). --mail-ttl may be an explicit 0 -- that is the CLI's way
+// to disable the mail-close phase (see nudgeMailSweepMailTTLForConfig /
+// sweepStaleNudgeMail) -- but a negative value is rejected either way, and an
+// unset flag is left for config resolution rather than validated here.
+// --unread-mail-ttl follows the same rule: an explicit 0 disables the opt-in
+// unread-mail phase, a negative value is rejected, and an unset flag is left
+// for config resolution.
+func validateNudgeMailSweepFlags(nudgeTTL, mailTTL, unreadMailTTL time.Duration, mailTTLExplicit, unreadMailTTLExplicit bool) error {
 	if nudgeTTL <= 0 {
-		fmt.Fprintln(stderr, "gc order sweep-nudge-mail: --nudge-ttl must be positive") //nolint:errcheck // best-effort stderr
-		return 1
+		return fmt.Errorf("--nudge-ttl must be positive")
 	}
-	if mailTTL <= 0 {
-		fmt.Fprintln(stderr, "gc order sweep-nudge-mail: --mail-ttl must be positive") //nolint:errcheck // best-effort stderr
+	if mailTTLExplicit && mailTTL < 0 {
+		return fmt.Errorf("--mail-ttl must not be negative")
+	}
+	if unreadMailTTLExplicit && unreadMailTTL < 0 {
+		return fmt.Errorf("--unread-mail-ttl must not be negative")
+	}
+	return nil
+}
+
+func cmdOrderSweepNudgeMail(nudgeTTL, mailTTL, unreadMailTTL time.Duration, mailTTLExplicit, unreadMailTTLExplicit, dryRun, quiet bool, stdout, stderr io.Writer) int {
+	if err := validateNudgeMailSweepFlags(nudgeTTL, mailTTL, unreadMailTTL, mailTTLExplicit, unreadMailTTLExplicit); err != nil {
+		fmt.Fprintf(stderr, "gc order sweep-nudge-mail: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	cityPath, err := resolveCity()
@@ -1859,25 +2283,44 @@ func cmdOrderSweepNudgeMail(nudgeTTL, mailTTL time.Duration, dryRun, quiet bool,
 	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 
 	// Load nudge state to protect live nudge IDs from being swept. A missing
-	// state file is not an error (LoadState returns empty state), so any error
+	// state file is not an error (the snapshot is empty), so any error
 	// here is a real read/parse failure: fail closed rather than sweeping with
 	// no live-ID protection, which could close beads for in-flight nudges.
-	nudgeState, stateErr := nudgequeue.LoadState(cityPath)
+	nudgeState, stateErr := openNudgeQueue(cityPath, beads.NudgesStore{}).Queue.Snapshot()
 	if stateErr != nil {
 		fmt.Fprintf(stderr, "gc order sweep-nudge-mail: %v\n", stateErr) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	statePtr := &nudgeState
 
-	now := time.Now()
-	if dryRun {
-		return cmdOrderSweepNudgeMailDryRun(store, statePtr, now, nudgeTTL, mailTTL, quiet, stdout, stderr)
+	if !mailTTLExplicit {
+		// Read the TTL default straight from city.toml. openStoreAtForCity above
+		// already loaded the city config through loadCityConfig, but it does not
+		// hand that config back to this caller, so the value is read again here.
+		mailTTL = nudgeMailSweepMailTTLForCity(cityPath, mailTTL, stderr)
 	}
-	return cmdOrderSweepNudgeMailRun(store, statePtr, now, nudgeTTL, mailTTL, quiet, stdout, stderr)
+	if !unreadMailTTLExplicit {
+		unreadMailTTL = nudgeMailSweepUnreadMailTTLForCity(cityPath, unreadMailTTL, stderr)
+	}
+
+	now := time.Now()
+	// Route each phase to its coordination class, the way the controller's
+	// nudge-mail sweep watchdog already does (city_runtime.go, via
+	// nudgesBeadStore/mailBeadStore). Left unrouted, the CLI sweep reads an empty
+	// backlog on a relocated city and reports success while the real one grows.
+	// cfg is nil deliberately: resolveClassStore ignores it, and loading config
+	// here would stomp the process-wide feature-flag globals (see the
+	// resolveCLIStorageRoutes doc).
+	nudges := cliNudgesStore(store, nil, cityPath)
+	mail := cliMailStore(store, nil, cityPath)
+	if dryRun {
+		return cmdOrderSweepNudgeMailDryRun(nudges, mail, statePtr, now, nudgeTTL, mailTTL, unreadMailTTL, quiet, stdout, stderr)
+	}
+	return cmdOrderSweepNudgeMailRun(nudges, mail, statePtr, now, nudgeTTL, mailTTL, unreadMailTTL, quiet, stdout, stderr)
 }
 
-func cmdOrderSweepNudgeMailDryRun(store beads.Store, nudgeState *nudgequeue.State, now time.Time, nudgeTTL, mailTTL time.Duration, quiet bool, stdout, stderr io.Writer) int {
-	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nudgeState, now, nudgeTTL, mailTTL, nudgeMailSweepCloseBudget)
+func cmdOrderSweepNudgeMailDryRun(nudges beads.NudgesStore, mail beads.MailStore, nudgeState *nudgequeue.State, now time.Time, nudgeTTL, mailTTL, unreadMailTTL time.Duration, quiet bool, stdout, stderr io.Writer) int {
+	counts, err := countStaleNudgeMail(nudges, mail, nudgeState, now, nudgeTTL, mailTTL, unreadMailTTL, nudgeMailSweepCloseBudget)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order sweep-nudge-mail: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1894,8 +2337,8 @@ func cmdOrderSweepNudgeMailDryRun(store beads.Store, nudgeState *nudgequeue.Stat
 	return 0
 }
 
-func cmdOrderSweepNudgeMailRun(store beads.Store, nudgeState *nudgequeue.State, now time.Time, nudgeTTL, mailTTL time.Duration, quiet bool, stdout, stderr io.Writer) int {
-	result, sweepErr := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nudgeState, now, nudgeTTL, mailTTL, nudgeMailSweepCloseBudget)
+func cmdOrderSweepNudgeMailRun(nudges beads.NudgesStore, mail beads.MailStore, nudgeState *nudgequeue.State, now time.Time, nudgeTTL, mailTTL, unreadMailTTL time.Duration, quiet bool, stdout, stderr io.Writer) int {
+	result, sweepErr := sweepStaleNudgeMail(nudges, mail, nudgeState, now, nudgeTTL, mailTTL, unreadMailTTL, nudgeMailSweepCloseBudget)
 
 	if sweepErr != nil {
 		// Per-bead errors are joined via errors.Join (Unwrap() []error): print each

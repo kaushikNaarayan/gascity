@@ -2,6 +2,7 @@ package graphv2
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
@@ -13,8 +14,12 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
+	"github.com/gastownhall/gascity/internal/coordclass"
+	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
 func TestPrepareInvocationCreatesInputConvoyForBeadTarget(t *testing.T) {
@@ -36,7 +41,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -46,7 +51,7 @@ title = "Inspect {{convoy_id}}"
 	if got := inv.Vars[ConvoyIDVar]; got != inv.InputConvoy {
 		t.Fatalf("vars[%s] = %q, want %q", ConvoyIDVar, got, inv.InputConvoy)
 	}
-	members, err := convoycore.Members(store, inv.InputConvoy, true)
+	members, err := convoycore.MembersIn(convoycore.MemberClasses{Convoy: beadstest.Work(store)}, inv.InputConvoy, true)
 	if err != nil {
 		t.Fatalf("Members: %v", err)
 	}
@@ -65,7 +70,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("input convoy metadata = %+v, want %+v", created.Metadata, wantMetadata)
 	}
 
-	again, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	again, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation again: %v", err)
 	}
@@ -75,7 +80,7 @@ title = "Inspect {{convoy_id}}"
 }
 
 func TestNormalizeInputConvoyRejectsNilStore(t *testing.T) {
-	_, err := NormalizeInputConvoy(nil, "target")
+	_, err := NormalizeInputConvoy(beads.WorkStore{}, "target")
 	if err == nil {
 		t.Fatal("NormalizeInputConvoy succeeded, want nil-store error")
 	}
@@ -85,7 +90,7 @@ func TestNormalizeInputConvoyRejectsNilStore(t *testing.T) {
 }
 
 func TestCreateSingleItemInputConvoyRejectsNilStore(t *testing.T) {
-	_, err := CreateSingleItemInputConvoy(nil, beads.Bead{ID: "target", Status: "open"})
+	_, err := CreateSingleItemInputConvoy(beads.WorkStore{}, beads.Bead{ID: "target", Status: "open"})
 	if err == nil {
 		t.Fatal("CreateSingleItemInputConvoy succeeded, want nil-store error")
 	}
@@ -167,7 +172,7 @@ title = "Inspect {{convoy_id}}"
 	if !isGraph {
 		t.Fatal("IsGraphV2Formula = false, want formula_compiler requirement to opt into graph semantics")
 	}
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -213,7 +218,7 @@ title = "Legacy working tree edit"
 	if err != nil {
 		t.Fatalf("Create target: %v", err)
 	}
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{formulaDir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{formulaDir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -247,7 +252,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Close target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want closed target error")
 	}
@@ -283,14 +288,14 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create existing input convoy: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
 	if inv.InputConvoy == existing.ID {
 		t.Fatalf("InputConvoy = %q, want a fresh input convoy", inv.InputConvoy)
 	}
-	members, err := convoycore.Members(store, inv.InputConvoy, true)
+	members, err := convoycore.MembersIn(convoycore.MemberClasses{Convoy: beadstest.Work(store)}, inv.InputConvoy, true)
 	if err != nil {
 		t.Fatalf("Members: %v", err)
 	}
@@ -318,7 +323,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create convoy: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, convoy.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, convoy.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -346,7 +351,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, map[string]string{"issue": target.ID})
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, map[string]string{"issue": target.ID})
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want reserved var error")
 	}
@@ -374,7 +379,7 @@ title = "Inspect {{convoy_id}} with {{missing}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want missing runtime var error")
 	}
@@ -415,7 +420,7 @@ id = "{target}.expanded"
 title = "Expanded {{convoy_id}}"
 `)
 
-	_, err := PrepareInvocation(context.Background(), beads.NewMemStore(), "parent", []string{dir}, "", nil)
+	_, err := PrepareInvocation(context.Background(), beadstest.Work(beads.NewMemStore()), "parent", []string{dir}, "", nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want targetless expanded convoy_id error")
 	}
@@ -449,7 +454,7 @@ title = "Targetless-only work"
 condition = "!{{convoy_id}}"
 `)
 
-	_, err := PrepareInvocation(context.Background(), beads.NewMemStore(), "parent", []string{dir}, "", nil)
+	_, err := PrepareInvocation(context.Background(), beadstest.Work(beads.NewMemStore()), "parent", []string{dir}, "", nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want targetless expanded condition convoy_id error")
 	}
@@ -473,7 +478,7 @@ title = "Only targetless"
 condition = "!{{convoy_id}}"
 `)
 
-	_, err := PrepareInvocation(context.Background(), beads.NewMemStore(), "work", []string{dir}, "", nil)
+	_, err := PrepareInvocation(context.Background(), beadstest.Work(beads.NewMemStore()), "work", []string{dir}, "", nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want targetless conditioned convoy_id error")
 	}
@@ -501,7 +506,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PreparePreviewInvocation(context.Background(), store, "work", []string{dir}, target.ID, false, nil)
+	inv, err := PreparePreviewInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, false, nil)
 	if err != nil {
 		t.Fatalf("PreparePreviewInvocation: %v", err)
 	}
@@ -538,7 +543,7 @@ title = "Inspect {{convoy_id}}"
 
 	// A routing identity (e.g. a workflow root's gc.routed_to value) has no
 	// bead-store entry; the preview must not fail the bead lookup.
-	inv, err := PreparePreviewInvocation(context.Background(), store, "work", []string{dir}, "myrig/worker", true, nil)
+	inv, err := PreparePreviewInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, "myrig/worker", true, nil)
 	if err != nil {
 		t.Fatalf("PreparePreviewInvocation: %v", err)
 	}
@@ -611,7 +616,7 @@ title = "Item {{convoy_id}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "parent", []string{dir}, target.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want expanded drain validation error")
 	}
@@ -659,7 +664,7 @@ title = "Legacy item"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "parent", []string{dir}, target.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want drain item graph.v2 error")
 	}
@@ -712,7 +717,7 @@ title = "Item {{convoy_id}} {{extra}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "parent", []string{dir}, target.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want drain item runtime var error")
 	}
@@ -758,7 +763,7 @@ title = "Item {{convoy_id}} {{extra}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "parent", []string{dir}, target.ID, map[string]string{"extra": "provided"})
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, map[string]string{"extra": "provided"})
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -808,7 +813,7 @@ title = "Item {{convoy_id}} {{extra}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "parent", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -892,7 +897,7 @@ title = "Inspect {{issue}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "legacy", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "legacy", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -935,12 +940,12 @@ title = "Inspect {{issue}}"
 		if err != nil {
 			t.Fatalf("Create member: %v", err)
 		}
-		if err := convoycore.TrackItem(store, convoy.ID, member.ID); err != nil {
+		if err := convoycore.TrackItemIn(convoycore.MemberClasses{Convoy: beadstest.Work(store)}, convoy.ID, member.ID); err != nil {
 			t.Fatalf("TrackItem: %v", err)
 		}
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "legacy", []string{dir}, convoy.ID, nil)
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "legacy", []string{dir}, convoy.ID, nil)
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want single-member alias error")
 	}
@@ -968,7 +973,7 @@ title = "Inspect {{convoy_id}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	inv, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation: %v", err)
 	}
@@ -999,7 +1004,7 @@ title = "Inspect {{issue}}"
 		t.Fatalf("Create target: %v", err)
 	}
 
-	_, err = PrepareInvocation(context.Background(), store, "legacy", []string{dir}, target.ID, map[string]string{"issue": "user-bead"})
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "legacy", []string{dir}, target.ID, map[string]string{"issue": "user-bead"})
 	if err == nil {
 		t.Fatal("PrepareInvocation succeeded, want reserved-var rejection")
 	}
@@ -1019,5 +1024,295 @@ func TestRootKeyIgnoresDeprecatedIssueRuntimeVar(t *testing.T) {
 	}, "", "")
 	if base != withAlias {
 		t.Fatalf("RootKey with alias vars = %q, want %q (issue/bead_id must not affect idempotence keys)", withAlias, base)
+	}
+}
+
+// depAddFailingStore fails every DepAdd, simulating the cross-store dep-add
+// failure that aborts input-convoy tracking mid-pour.
+type depAddFailingStore struct {
+	beads.Store
+}
+
+func (s depAddFailingStore) DepAdd(fromID, _, _ string) error {
+	return fmt.Errorf("resolving issue ID %s: no issue found matching %q", fromID, fromID)
+}
+
+func TestCreateSingleItemInputConvoyClosesConvoyOnTrackFailure(t *testing.T) {
+	mem := beads.NewMemStore()
+	target, err := mem.Create(beads.Bead{Title: "work item", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := depAddFailingStore{Store: mem}
+
+	_, err = CreateSingleItemInputConvoy(beadstest.Work(store), target)
+	if err == nil {
+		t.Fatal("CreateSingleItemInputConvoy succeeded, want tracking failure")
+	}
+	// The synthetic convoy minted for this pour must not survive as an open
+	// claim-attracting bead.
+	open, err := mem.List(beads.ListQuery{Type: "convoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open synthetic convoys after failed pour = %d, want 0 (ids: %v)", len(open), open)
+	}
+}
+
+// depListFailingStore mints and tracks convoys normally but fails every
+// DepList, simulating the cross-store membership read anomaly that makes
+// ResolveLegacyIssueAlias fail after PrepareInvocation has already minted the
+// synthetic input convoy.
+type depListFailingStore struct {
+	beads.Store
+}
+
+func (s depListFailingStore) DepList(_, _ string) ([]beads.Dep, error) {
+	return nil, fmt.Errorf("cross-store membership read failed")
+}
+
+func TestPrepareInvocationClosesSyntheticConvoyOnLegacyAliasFailure(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "legacy.formula.toml", `
+formula = "legacy"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[vars]
+[vars.issue]
+description = "legacy work bead"
+required = true
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{issue}}"
+`)
+	mem := beads.NewMemStore()
+	target, err := mem.Create(beads.Bead{Title: "work item", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	// DepAdd (convoy tracking) still succeeds, so NormalizeInputConvoy mints the
+	// synthetic convoy; the later DepList inside ResolveLegacyIssueAlias fails.
+	store := depListFailingStore{Store: mem}
+
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "legacy", []string{dir}, target.ID, nil)
+	if err == nil {
+		t.Fatal("PrepareInvocation succeeded, want legacy alias resolution failure")
+	}
+	if !strings.Contains(err.Error(), "resolving deprecated issue alias") {
+		t.Fatalf("error = %q, want deprecated issue alias failure", err)
+	}
+	// The synthetic convoy minted for the bead target before the alias failure
+	// must not survive as an open claim-attracting bead.
+	open, err := mem.List(beads.ListQuery{Type: "convoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open synthetic convoys after failed pour = %d, want 0 (ids: %v)", len(open), open)
+	}
+}
+
+// TestSyntheticInputConvoyIsWorkClassAndCoResidentWithItsTarget pins the
+// creation path against the classification.
+//
+// A synthetic input convoy is a WORK bead, and that is not a filing preference:
+// the convoy's whole content is a `tracks` edge to its target, and TrackItemIn
+// refuses an edge whose member is owned by another class store. So the two have
+// to agree — the classification says work, and the mint has to land where the
+// target is. NormalizeInputConvoy makes that structural by resolving the target
+// from the same handle it mints through; this test is what fails if a future
+// caller splits them.
+func TestSyntheticInputConvoyIsWorkClassAndCoResidentWithItsTarget(t *testing.T) {
+	work := beads.NewMemStore()
+	target, err := work.Create(beads.Bead{Title: "a work bead", Type: "task"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+
+	convoyID, err := NormalizeInputConvoy(beadstest.Work(work), target.ID)
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	convoy, err := work.Get(convoyID)
+	if err != nil {
+		t.Fatalf("the input convoy is not in the target's store: %v", err)
+	}
+	if got := coordclass.Classify(convoy); got != coordclass.ClassWork {
+		t.Fatalf("Classify(input convoy) = %s, want work; a convoy owned by any other class cannot hold a tracks edge to its work target", got)
+	}
+	tracked, err := convoycore.HasTrack(beadstest.Work(work), convoyID, target.ID)
+	if err != nil {
+		t.Fatalf("HasTrack: %v", err)
+	}
+	if !tracked {
+		t.Fatalf("input convoy %s does not track target %s", convoyID, target.ID)
+	}
+}
+
+func TestPrepareInvocationResolvesDefaultReferencingRoutingVar(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[vars.review_target]
+default = "{{binding_prefix}}reviewer"
+
+[[steps]]
+id = "review"
+title = "Review {{convoy_id}}"
+metadata = { "gc.run_target" = "{{review_target}}" }
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, map[string]string{"binding_prefix": "ops."})
+	if err != nil {
+		t.Fatalf("PrepareInvocation: %v", err)
+	}
+	if got := inv.Vars["review_target"]; got != "ops.reviewer" {
+		t.Fatalf("vars[review_target] = %q, want ops.reviewer", got)
+	}
+}
+
+const convoyIDDefaultFormula = `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[vars.subject]
+default = "{{convoy_id}}"
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{subject}}"
+`
+
+func TestPrepareInvocationResolvesDefaultReferencingConvoyID(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", convoyIDDefaultFormula)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	inv, err := PrepareInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation: %v", err)
+	}
+	if inv.InputConvoy == "" {
+		t.Fatal("InputConvoy is empty, want a resolved convoy")
+	}
+	// The default derives from this invocation's convoy, so the vars that
+	// root keys and the persisted runtime vars are built from leave it out,
+	// and instantiation derives it from the convoy_id the vars carry.
+	if got, ok := inv.Vars["subject"]; ok {
+		t.Fatalf("vars[subject] = %q, want the convoy-derived default left out", got)
+	}
+	if got := RuntimeVarsMetadata(inv.Vars); got != "" {
+		t.Fatalf("RuntimeVarsMetadata = %q, want nothing to persist", got)
+	}
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "work", []string{dir}, inv.Vars)
+	if err != nil {
+		t.Fatalf("CompileWithoutRuntimeVarValidation: %v", err)
+	}
+	result, err := molecule.Instantiate(context.Background(), beadstest.GraphMolecule(store), recipe, molecule.Options{Vars: inv.Vars})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	step, err := store.Get(result.IDMapping["work.inspect"])
+	if err != nil {
+		t.Fatalf("Get inspect step: %v", err)
+	}
+	if want := "Inspect " + inv.InputConvoy; step.Title != want {
+		t.Fatalf("step title = %q, want %q", step.Title, want)
+	}
+}
+
+func TestPreparePreviewInvocationResolvesDefaultReferencingConvoyID(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", convoyIDDefaultFormula)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	inv, err := PreparePreviewInvocation(context.Background(), beadstest.Work(store), "work", []string{dir}, target.ID, false, nil)
+	if err != nil {
+		t.Fatalf("PreparePreviewInvocation: %v", err)
+	}
+	if got, ok := inv.Vars["subject"]; ok {
+		t.Fatalf("vars[subject] = %q, want the convoy-derived default left out", got)
+	}
+	want := previewInputConvoyPrefix + target.ID
+	if got := formula.ApplyDefaults(inv.Formula, inv.Vars)["subject"]; got != want {
+		t.Fatalf("subject resolved from the preview vars = %q, want %q", got, want)
+	}
+}
+
+func TestPrepareInvocationRejectsDrainItemReferencingParentConvoyDerivedDefault(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "parent.formula.toml", `
+formula = "parent"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[vars.subject]
+default = "{{convoy_id}}"
+
+[[steps]]
+id = "drain"
+title = "Drain {{subject}}"
+
+[steps.drain]
+context = "separate"
+formula = "item"
+`)
+	writeFormula(t, dir, "item.formula.toml", `
+formula = "item"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "work"
+title = "Item {{convoy_id}} on {{subject}}"
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	// The parent's subject is its own convoy; an item formula that only
+	// references subject must not silently bind the parent's convoy.
+	_, err = PrepareInvocation(context.Background(), beadstest.Work(store), "parent", []string{dir}, target.ID, nil)
+	if err == nil {
+		t.Fatal("PrepareInvocation succeeded, want the drain item's unresolved subject rejected")
+	}
+	if !strings.Contains(err.Error(), "subject") {
+		t.Fatalf("error = %q, want the unresolved subject named", err)
+	}
+	matches, err := store.List(beads.ListQuery{Type: "convoy"})
+	if err != nil {
+		t.Fatalf("List input convoys: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("input convoys = %+v, want none before validation succeeds", matches)
 	}
 }

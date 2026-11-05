@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
+
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -491,7 +493,7 @@ func TestStructuredRawResponsePreservesProviderNativeFrame(t *testing.T) {
 		Template: "Chat",
 		Provider: "codex",
 		Format:   "raw",
-		Messages: []SessionRawMessageFrame{{Raw: raw}},
+		Messages: rawMessagesField([]SessionRawMessageFrame{{Raw: raw}}),
 	}
 	wire, err := json.Marshal(response)
 	if err != nil {
@@ -516,7 +518,7 @@ func TestStructuredCodexWebSearchOmitsNativeInputAndRawPreservesIt(t *testing.T)
 	h := newTestCityHandlerWith(t, fs, srv)
 	srv.sessionLogSearchPaths = []string{searchBase}
 
-	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	mgr := session.NewManagerWithOptions(beadstest.Sessions(fs.cityBeadStore), fs.sp, session.WithCityPath(fs.cityPath))
 	workDir := t.TempDir()
 	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
 		Template: "myrig/worker",
@@ -576,7 +578,7 @@ func TestStructuredCodexWebSearchOmitsNativeInputAndRawPreservesIt(t *testing.T)
 	}
 	wantRaw := []byte(`{"timestamp":"2026-06-01T00:04:01Z","type":"response_item","payload":{"type":"web_search_call","id":"call-codex-web-search","query":"structured tool result formats","input":{"query":"ignored fallback","scope":"web"},"action":{"type":"search","source":"web"}}}`)
 	foundExact := false
-	for _, frame := range rawResponse.Messages {
+	for _, frame := range rawTranscriptMessages(rawResponse) {
 		if bytes.Equal(frame.Raw, wantRaw) {
 			foundExact = true
 			break

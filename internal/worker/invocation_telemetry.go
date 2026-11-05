@@ -2,18 +2,22 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/pricing"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/gastownhall/gascity/internal/usage"
+	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
 )
 
 var (
@@ -43,14 +47,24 @@ func defaultPricingRegistry() *pricing.Registry {
 // keystroke-delivery time, so the transcript tail at that point holds
 // previously COMPLETED invocations — the turn this operation triggers is
 // recorded by the next prompt operation on the session. Entries beyond the
-// extractor's scan window (a 64KB tail for claude and codex) or after the
-// final prompt op of a session go unrecorded.
+// extractor's scan window — which for claude grows from the 64KB tail up to
+// 16MB until the persisted cursor is in view, and for codex stays at that
+// fixed 64KB tail (the per-family coverage ceiling is stated in full on
+// SweepSessionModelUsage) — or after the final prompt op of a session go
+// unrecorded.
 //
 // Coverage is per transcript provider family, driven by the
 // invocationUsageSpecs registry, with per-family discovery bounds:
 //
 //   - claude: Manager.TranscriptPath (session-key stat or ambiguity-guarded
 //     project-slug listing — cheap) + the Claude JSONL tail extractor.
+//   - opencode: the session's own export, mirrored under the OpenCode
+//     transcript root as <session_key>.json. Resolved by that key alone via
+//     sessionlog.FindOpenCodeSessionFileByID; a keyed miss (or no key yet)
+//     records nothing. Never by workdir, because sessions sharing a workdir
+//     would otherwise be attributed each other's export. The whole
+//     export is parsed (it is one JSON document, not an append-only log) and
+//     the provider-reported cost is preferred over the price table.
 //   - codex: identity-first. When the session bead carries a session_key
 //     (captured from the codex hook; codex rollout filenames end in the
 //     same uuid), the rollout is resolved by that suffix via
@@ -89,8 +103,13 @@ func defaultPricingRegistry() *pricing.Registry {
 // same session — whether in separate processes or on separate handles in one
 // process (the API server constructs a fresh handle per request) — can each
 // read the same stale cursor and double-record the pending batch.
-// invTelemetryMu only serializes ops that share a single handle instance.
-// Accepted as best-effort. RuntimeHandle prompt ops are permanently out of
+// invTelemetryMu only serializes ops that share a single handle instance. That
+// pending batch is now bounded by the grown scan window rather than the fixed
+// 64KB tail, so the duplicated OTel counter volume scales with backlog depth;
+// the facts still collapse on usage.ModelIdempotencyKey, the keyless counters
+// do not (see usagesSinceCursor). Accepted as best-effort.
+//
+// RuntimeHandle prompt ops are permanently out of
 // scope (decided in ga-tkvb31, not a pending gap): runtime-only sessions
 // have no transcript adapter, no session bead for the cursor, and no agent
 // identity, and will not gain bead-backed identity just for telemetry.
@@ -102,7 +121,7 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 	// whether the sidecar should be written, and the Message/Nudge callers expect
 	// the write on every successful turn. Best-effort and a no-op unless
 	// correlation is armed; it uses its own guard, not invTelemetryMu.
-	defer h.writeTranscriptSessionMeta()
+	defer h.recordTranscriptSessionMetaAfterTurn()
 
 	if operationEventsSuppressed(ctx) {
 		return
@@ -144,7 +163,11 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 			slog.String("session_id", id), slog.String("provider", providerFamily))
 		return
 	}
-	usages, err := spec.extract(h.adapter, path)
+	// Read the cursor BEFORE extracting: it bounds how far back the scan
+	// window must reach, so invocations appended since the last pass are not
+	// lost to the fixed tail window.
+	cursor := strings.TrimSpace(pr.Metadata[sessionpkg.MetadataKeyInvocationUsageCursor])
+	usages, err := spec.extract(h.adapter, path, cursor)
 	if err != nil {
 		slog.Debug("invocation telemetry: usage extraction failed; skipping",
 			slog.String("session_id", id), slog.String("provider", providerFamily), slog.Any("error", err))
@@ -155,7 +178,6 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 			slog.String("session_id", id), slog.String("provider", providerFamily))
 		return
 	}
-	cursor := strings.TrimSpace(pr.Metadata[sessionpkg.MetadataKeyInvocationUsageCursor])
 	pending := usagesAfterCursor(usages, cursor)
 	if len(pending) == 0 {
 		slog.Debug("invocation telemetry: no new invocations since cursor; skipping",
@@ -170,6 +192,7 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 	if agentName == "" {
 		agentName = strings.TrimSpace(info.SessionName)
 	}
+	formulaName := resolveFormulaName(h.resolveBead, h.formulaMemo, pr.Metadata, id)
 	// Model usage facts flow to the configured usage sink (gc costs / external
 	// aggregators), independent of the metrics above and of operation-event
 	// recording: a sink-only handle (CLI factory path) still emits. Resolved once
@@ -185,17 +208,12 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 		telemetry.RecordInvocationTokens(ctx, labels,
 			int64(u.InputTokens), int64(u.OutputTokens),
 			int64(u.CacheReadTokens), int64(u.CacheCreationTokens))
-		cost, priced := h.pricing.Estimate(providerFamily, u.Model, pricing.Usage{
-			PromptTokens:        u.InputTokens,
-			CompletionTokens:    u.OutputTokens,
-			CacheReadTokens:     u.CacheReadTokens,
-			CacheCreationTokens: u.CacheCreationTokens,
-		})
+		cost, priced := invocationCost(h.pricing, providerFamily, u)
 		if priced {
 			telemetry.RecordInvocationCostEstimate(ctx, labels, cost)
 		}
 		if emitFacts {
-			h.recordModelUsageFact(modelUsageFact(u, pr.Metadata, id, id, info.SessionName, providerFamily, cost, priced, now))
+			h.recordModelUsageFact(modelUsageFact(u, pr.Metadata, id, id, info.SessionName, providerFamily, cost, priced, now, formulaName))
 		}
 	}
 	// Best-effort: a failed cursor write means the next prompt op may
@@ -207,41 +225,65 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 	}
 }
 
+// invocationCost prices one invocation. A cost the provider's own transcript
+// recorded (OpenCode) wins over the price table: it reflects the upstream the
+// session actually routed through, which a static (family, model) table cannot
+// know. Without one the registry decides, and a miss is reported unpriced so
+// the fact keeps its tokens and is flagged rather than zero-filled.
+func invocationCost(registry *pricing.Registry, family string, u sessionlog.TailUsage) (float64, bool) {
+	if u.HasReportedCost {
+		return u.ReportedCostUSD, true
+	}
+	return registry.Estimate(family, u.Model, pricing.Usage{
+		PromptTokens:        u.InputTokens,
+		CompletionTokens:    u.OutputTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+	})
+}
+
 // modelUsageFact builds a model usage Fact from one transcript invocation. The
 // run id is resolved from the session bead through the shared
 // beadmeta.ResolveRunID — the same resolver the compute-fact emitter uses — so a
 // run's model and compute facts carry the same RunID and group together in
 // gc costs. The session bead id is carried verbatim as SessionID (the join key to
 // the manifold spend plane's EIA session_id and to recall transcripts), distinct
-// from the resolved RunID and from Worker (the session name). StepID carries the
-// session's gc.active_work_bead when present, and is empty only for ad-hoc,
-// manual, or idle sessions. The dedup identity is the invocation's provider message id (or the
+// from the resolved RunID and from Worker (the session name). StepID is left
+// unset: model usage is attributed at run level, not per formula step (see the
+// StepID note in the body). The dedup identity is the invocation's provider message id (or the
 // transcript entry uuid when none), so the best-effort cursor races noted on
 // recordInvocationTelemetry collapse a re-recorded invocation to one fact at the
 // sink via IdempotencyKey. Unpriced is true exactly when the pricing registry
 // had no entry for the (family, model) pair; cost is then left zero and must be
-// read as "not measured", never as a free invocation.
-func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sessionID, worker, providerFamily string, cost float64, priced bool, now time.Time) usage.Fact {
+// read as "not measured", never as a free invocation. At prefers the
+// transcript entry's own Timestamp when the extractor populated one, falling
+// back to now for providers whose tail extraction leaves it zero.
+func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sessionID, worker, providerFamily string, cost float64, priced bool, now time.Time, formulaName string) usage.Fact {
 	// beadID and sessionID are the session bead id and the run-id fallback — the
 	// same fields the retired ResolveRunID(bead.Metadata, bead.ID, sessionID) read
 	// from the raw bead. At the sole production call site they are equal (the
 	// handle's currentSessionID == the session bead id); the params stay distinct
 	// so the run-chain precedence contract is preserved verbatim.
 	runID := beadmeta.ResolveRunID(meta, beadID, sessionID)
-	// The run STEP: the session's current work bead's gc.step_id, stamped at the claim
-	// hook (gc.active_work_bead). Read from the SAME session-bead snapshot as runID so
-	// StepID always names a step under this RunID. Empty when the session isn't on a
-	// formula work bead (ad-hoc/manual/idle) — run-level attribution, matching events.
-	stepID := strings.TrimSpace(meta[beadmeta.ActiveWorkBeadMetadataKey])
+	// Model usage is attributed at run level: StepID stays unset. Per-step
+	// attribution was retired along with the gc.active_work_bead session pointer —
+	// the claim hook no longer stamps it (that was an unsafe fuzzy session-bead
+	// write), so no production source names the current step. Compute facts are
+	// already run-level, so both usage Kinds now roll up per run, matching events.
 	reqID := usageIdentity(u)
 	if !priced {
 		cost = 0
 	}
+	at := now
+	if !u.Timestamp.IsZero() {
+		at = u.Timestamp
+	}
 	return usage.Fact{
-		RunID:               runID,
-		SessionID:           strings.TrimSpace(sessionID),
-		StepID:              stepID,
+		RunID:     runID,
+		SessionID: strings.TrimSpace(sessionID),
+		// StepID intentionally unset — run-level attribution (see body note).
 		Worker:              strings.TrimSpace(worker),
+		FormulaName:         strings.TrimSpace(formulaName),
 		Kind:                usage.KindModel,
 		Model:               strings.TrimSpace(u.Model),
 		Provider:            strings.TrimSpace(providerFamily),
@@ -252,7 +294,7 @@ func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sess
 		CostUSDEstimate:     cost,
 		Unpriced:            !priced,
 		UpstreamReqID:       reqID,
-		At:                  now.UnixMilli(),
+		At:                  at.UnixMilli(),
 		IdempotencyKey:      usage.ModelIdempotencyKey(runID, reqID),
 	}
 }
@@ -267,7 +309,7 @@ func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sess
 // are swallowed so telemetry never affects operations.
 type invocationUsageSpec struct {
 	discover func(h *SessionHandle, id string, createdAt time.Time, meta map[string]string) string
-	extract  func(a SessionLogAdapter, path string) ([]sessionlog.TailUsage, error)
+	extract  func(a SessionLogAdapter, path, cursorID string) ([]sessionlog.TailUsage, error)
 }
 
 // codexInvocationDiscoveryWindow bounds how far after the wake anchor a
@@ -289,6 +331,10 @@ var invocationUsageSpecs = map[string]invocationUsageSpec{
 		discover: discoverCodexInvocationTranscript,
 		extract:  SessionLogAdapter.CodexTailUsage,
 	},
+	"opencode": {
+		discover: discoverOpenCodeInvocationTranscript,
+		extract:  SessionLogAdapter.OpenCodeTailUsage,
+	},
 }
 
 // invocationUsageFamily resolves a provider string to its registered
@@ -299,8 +345,11 @@ func invocationUsageFamily(provider string) string {
 	if strings.Contains(strings.ToLower(provider), "claude") {
 		return "claude"
 	}
-	if sessionlog.ProviderFamily(provider) == "codex" {
+	switch sessionlog.ProviderFamily(provider) {
+	case "codex":
 		return "codex"
+	case "opencode":
+		return "opencode"
 	}
 	return ""
 }
@@ -370,6 +419,94 @@ func discoverCodexInvocationTranscript(h *SessionHandle, _ string, createdAt tim
 	)
 }
 
+// actingBeadID returns the work bead the controller says the session is on:
+// the processing pointer (session.CurrentBeadIDKey), else the pool trigger
+// (gc.trigger_bead_id). Processing wins and there is no liveness check: the
+// terminal sweep recovers usage after the work closed and the pointer still
+// names it. The claim pointer is deliberately never read.
+func actingBeadID(meta map[string]string) string {
+	if id := strings.TrimSpace(meta[sessionpkg.CurrentBeadIDKey]); id != "" {
+		return id
+	}
+	return strings.TrimSpace(meta[beadmeta.TriggerBeadIDMetadataKey])
+}
+
+// errFormulaBeadAbsent is formulaOfActingBead's verdict that the acting bead or
+// its run root does not exist where the resolver looks. It is an error so the
+// memo does not keep it: the bead may be reachable on a later lookup.
+var errFormulaBeadAbsent = errors.New("usage attribution: acting bead or run root not found")
+
+// resolveFormulaName returns the formula the session's acting bead belongs to:
+// the gc.formula_name stamped on the acting bead's run root, empty when the
+// session has no acting bead, the bead or its root is gone, or the root was
+// not compiled from a formula. The session bead is never consulted: the
+// compiler stamps the name on the run root, and the session bead carries no
+// run chain of its own.
+//
+// It runs once per non-empty batch of invocations, after the empty-batch
+// returns, so a tick that has nothing to record pays no read. The walk costs at
+// most two reads (the acting bead, then its root when that differs) and the
+// memo makes a warm lookup free. beads.ErrNotFound is the normal miss (a
+// purged or burned wisp, or a bead in a rig that is not serving): it leaves the
+// label empty without a warning and is not remembered, so a bead that becomes
+// reachable later is attributed. Any other error leaves the label empty, warns
+// once for the batch, and is not remembered either, so the fact is still
+// emitted whole.
+func resolveFormulaName(resolve func(id string) (beads.Bead, error), memo *FormulaNameMemo, meta map[string]string, sessionID string) string {
+	actingID := actingBeadID(meta)
+	if actingID == "" || resolve == nil {
+		return ""
+	}
+	name, err := memo.resolve(actingID, func() (string, error) {
+		return formulaOfActingBead(resolve, actingID)
+	})
+	if errors.Is(err, errFormulaBeadAbsent) {
+		return ""
+	}
+	if err != nil {
+		slog.Warn("usage attribution: formula lookup failed; recording the fact without a formula name",
+			slog.String("session_id", sessionID), slog.String("acting_bead_id", actingID), slog.Any("error", err))
+		return ""
+	}
+	return name
+}
+
+// formulaOfActingBead walks acting bead -> run root and returns the root's
+// trimmed gc.formula_name. A bead that is its own root carries its own stamp.
+func formulaOfActingBead(resolve func(id string) (beads.Bead, error), actingID string) (string, error) {
+	acting, err := resolve(actingID)
+	if errors.Is(err, beads.ErrNotFound) {
+		slog.Debug("usage attribution: acting bead not found", slog.String("acting_bead_id", actingID))
+		return "", errFormulaBeadAbsent
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading acting bead: %w", err)
+	}
+	rootID := beadmeta.ResolveRunID(acting.Metadata, acting.ID, "")
+	if rootID == acting.ID {
+		return strings.TrimSpace(acting.Metadata[beadmeta.FormulaNameMetadataKey]), nil
+	}
+	root, err := resolve(rootID)
+	if errors.Is(err, beads.ErrNotFound) {
+		slog.Debug("usage attribution: run root not found",
+			slog.String("acting_bead_id", actingID), slog.String("root_bead_id", rootID))
+		return "", errFormulaBeadAbsent
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading run root %q: %w", rootID, err)
+	}
+	return strings.TrimSpace(root.Metadata[beadmeta.FormulaNameMetadataKey]), nil
+}
+
+// discoverOpenCodeInvocationTranscript resolves an OpenCode session's mirrored
+// export by its session_key, which names the file. A keyed miss returns "" with
+// NO workdir fallback: the newest export in a shared workdir may belong to
+// another conversation, and attributing it would be misattribution. A session
+// without a key yet likewise records nothing.
+func discoverOpenCodeInvocationTranscript(h *SessionHandle, _ string, _ time.Time, meta map[string]string) string {
+	return sessionlog.FindOpenCodeSessionFileByID(h.adapter.SearchPaths, strings.TrimSpace(meta["session_key"]))
+}
+
 // usageIdentity returns the dedup identity of one invocation: the provider
 // message id when present (shared by every content-block entry of one API
 // response, stable across prompt-operation boundaries), falling back to the
@@ -413,6 +550,14 @@ func usagesAfterCursor(usages []sessionlog.TailUsage, cursor string) []sessionlo
 // IdempotencyKey dedup (usage.ReadFacts) collapses any overlap with
 // already-recorded facts, so recovering the whole bounded tail cannot
 // double-count.
+//
+// That dedup covers the fact sink ONLY. sweepResolvedTranscript also emits OTel
+// counters (RecordInvocationTokens, RecordInvocationCostEstimate) for every
+// entry it folds, unconditionally and before the sink write; those counters are
+// monotonic and carry no idempotency key, so an out-of-window cursor
+// re-increments them for the whole window. The burst is bounded by the
+// extractor's window and self-corrects on the next pass — the cursor advances
+// to the newest entry — but the overlap it already counted is permanent.
 func usagesSinceCursor(usages []sessionlog.TailUsage, cursor string) []sessionlog.TailUsage {
 	if len(usages) == 0 {
 		return nil
@@ -442,28 +587,88 @@ func usagesSinceCursor(usages []sessionlog.TailUsage, cursor string) []sessionlo
 //
 // It is best-effort. The returned settled reports whether the interval is fully
 // accounted for and needs no retry: true when the transcript was read (even if
-// nothing new was pending) OR the miss is permanent (unregistered family, or a
-// terminal codex session that never captured a session_key); false when the miss
-// is transient (no transcript discovered yet, an extraction error, or a sink
-// Record failure) so the caller should retry on a later tick. err is reserved for
+// nothing new was pending) OR the miss is permanent (unregistered family; a
+// keyless codex session whose bounded workdir+window fallback found no unambiguous
+// rollout in a CLEAN scan — a closed session's rollout is already on disk, so that
+// miss is ambiguity/out-of-window/TZ, which no retry resolves; or a keyless claude
+// session whose transcript lookup refused an ambiguous shared workdir, which no
+// retry resolves either while the pool shares that directory); false when the
+// miss is transient (a keyed codex rollout not discovered yet, a keyless codex
+// scan clouded by a transient IO fault, a keyless claude transcript lookup that
+// failed to read the store, a keyless claude session that is UNAMBIGUOUS but whose
+// transcript is not on disk yet, an extraction error, or a sink Record
+// failure) so the caller should retry on a later tick. err is reserved for
 // a sink Record failure; the cursor is then advanced only through the last
 // successfully recorded entry so the retry resumes at the gap rather than
 // skipping it. Every gate is slog.Debug'd so a fleet-wide zero is attributable in
 // the field instead of silently swallowed.
 //
-// Coverage ceiling (known, intentional — do NOT widen): discovery and extraction
-// read only the extractor's bounded transcript tail (a 64KB window per family),
-// so a very long autonomous interval recovers only its final few invocations —
-// earlier model/cost facts of that interval are lost. Widening the tail re-opens
-// the unbounded-scan and misattribution risks that bound exists to prevent;
-// fuller recovery is a separate, deliberate change.
+// Coverage ceiling, per transcript family — the two families differ, and the
+// difference is deliberate:
+//
+//   - claude: cursor-bounded growth, capped at 16MB — once a cursor exists.
+//     SessionLogAdapter.TailUsage routes to sessionlog.ExtractTailUsageSince,
+//     whose window doubles from the 64KB tail until the persisted cursor is
+//     in view, the whole file is in view, or the growth cap is reached — so a
+//     very long autonomous interval recovers its whole backlog rather than
+//     only its final few invocations. Only entries older than that capped
+//     window are lost, and the extractor logs the path, window, and cursor
+//     when it drops them.
+//     Before a cursor exists none of that applies. PersistInvocationUsageCursor
+//     no-ops on an empty value, so the cursor stays unset until some seam
+//     records an invocation; until then ExtractTailUsageSince short-circuits to
+//     one fixed tailChunkSize (64KB) read, never entering the growth loop and
+//     so never emitting the cap log. That first pass is the pre-change
+//     behavior — everything older than 64KB is dropped silently — and the
+//     cursor it then persists becomes the growth loop's stop condition, so no
+//     later pass reaches back across the gap. Both sweep lanes take this path:
+//     SweepSessionModelUsage and SweepSessionModelUsageAtPath share
+//     sweepResolvedTranscript, which reads the cursor from session-bead
+//     metadata.
+//   - codex: still the fixed 64KB tail, and still silently lossy.
+//     SessionLogAdapter.CodexTailUsage accepts the cursor and discards it, so a
+//     very long autonomous interval recovers only its final few invocations and
+//     the earlier model/cost facts of that interval are lost with no log line.
+//     Widening it needs its own correctness argument rather than this one: the
+//     codex extractor collapses on cumulative totals rather than per-message
+//     identity, so the cursor is not a usable stop condition there.
+//
+// Neither risk the old blanket "do not widen" ceiling cited survives
+// cursor-bounded growth, which is why claude was widened. The scan is not
+// unbounded: it terminates at the cursor, at EOF, or at the growth cap. And it
+// cannot misattribute: with the cursor at byte P and EOF at E, a cap-hit window
+// is exactly [E-16MB, E], every byte of which is after P — so every entry
+// returned is genuinely newer than the cursor, and the only loss is
+// [P, E-16MB), which is precisely what the extractor's cap log reports.
 //
 // Overlap with the prompt-op seam is safe: both stamp usage.ModelIdempotencyKey,
 // which usage.ReadFacts collapses, so an invocation recorded by both beats folds
-// to one fact. meta is the fresh session-bead metadata (RunID/StepID resolution,
+// to one fact. meta is the fresh session-bead metadata (RunID resolution,
 // the session_key, work dir, and cursor all read from it), and now stamps the
 // emitted facts.
 func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta map[string]string, now time.Time) (emitted int, settled bool, err error) {
+	return f.sweepSessionModelUsage(ctx, id, meta, now, f.discoverSweepTranscript)
+}
+
+// SweepClosedIntervalModelUsage is SweepSessionModelUsage for the awake
+// interval a session close ended, which the row may have left since: meta is
+// that interval's view of the row (session.UsageClosedIntervalMetadata).
+// Discovery reads meta alone (discoverClosedIntervalTranscript), so a reopened
+// row's newer conversation never stands in for the closed one.
+func (f *Factory) SweepClosedIntervalModelUsage(ctx context.Context, id string, meta map[string]string, now time.Time) (emitted int, settled bool, err error) {
+	return f.sweepSessionModelUsage(ctx, id, meta, now, f.discoverClosedIntervalTranscript)
+}
+
+// sweepSessionModelUsage is the sweep both entry points share, over the
+// transcript discovery that resolves the path and classifies a miss
+// (discoverSweepTranscript's results).
+func (f *Factory) sweepSessionModelUsage(
+	ctx context.Context,
+	id string,
+	meta map[string]string,
+	now time.Time,
+	discover func(family, id string, meta map[string]string, now time.Time) (path string, scanClean, emptyIsPermanent bool),
+) (emitted int, settled bool, err error) {
 	id = strings.TrimSpace(id)
 	if f == nil || id == "" || meta == nil {
 		return 0, true, nil
@@ -482,30 +687,129 @@ func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta ma
 			slog.String("session_id", id), slog.String("provider", strings.TrimSpace(meta["provider"])))
 		return 0, true, nil
 	}
-	if family == "codex" && strings.TrimSpace(meta["session_key"]) == "" {
-		// Permanent: a terminal codex session that never captured its session_key
-		// (SessionStart hook bypassed) has no keyed rollout to find, and no later
-		// hook will fire while it is asleep — retrying cannot help.
-		slog.Debug("model-usage sweep: codex session has no session_key; settling",
-			slog.String("session_id", id))
-		return 0, true, nil
+	path, scanClean, emptyIsPermanent := discover(family, id, meta, now)
+	keyless := strings.TrimSpace(meta["session_key"]) == ""
+	keylessCodex := family == "codex" && keyless
+	keylessClaude := family == "claude" && keyless
+	if (keylessCodex || keylessClaude) && !scanClean {
+		// The (cwd, wake-window) fallback hit a transient IO fault (a non-ENOENT
+		// readdir or a cwd-probe open failure — EMFILE/ESTALE). That clouds the whole
+		// scan whether or not a path was found: an empty result may have hidden the
+		// only rollout, and a lone hit may have hidden a second same-cwd, in-window
+		// rollout that would make it ambiguous. Either way the result is
+		// non-definitive, so record nothing and leave the interval unsettled for a
+		// later, unclouded tick; the recently-closed sweep window bounds the retries.
+		// The claude case is the same shape: a TranscriptPath store-read error is
+		// non-definitive, unlike its shared-workdir ambiguity refusal, which returns
+		// an empty path with a nil error and settles as a clean miss below.
+		slog.Debug("model-usage sweep: keyless transcript scan was non-definitive; will retry",
+			slog.String("session_id", id), slog.String("provider", family))
+		return 0, false, nil
 	}
-	path := f.discoverSweepTranscript(family, id, meta, now)
 	if path == "" {
+		if (keylessCodex || keylessClaude) && emptyIsPermanent {
+			// Clean, PERMANENT miss: the keyless codex workdir fallback found nothing
+			// (ambiguity / out-of-window / TZ), or the claude lookup REFUSED a shared
+			// workdir it cannot disambiguate. Neither is resolved by a retry, so settle
+			// so compute can commit and the recently-closed window is not re-swept
+			// every tick. (A keyed miss below stays transient, and so does a keyless
+			// claude session that is unambiguous but whose transcript is merely not
+			// written yet: both may simply not be flushed.)
+			slog.Debug("model-usage sweep: keyless transcript miss is permanent; settling",
+				slog.String("session_id", id), slog.String("provider", family))
+			return 0, true, nil
+		}
 		// Transient: the rollout may not be flushed yet at interval end, so leave the
 		// interval unsettled for a retry on a later tick.
 		slog.Debug("model-usage sweep: no transcript discovered; will retry",
 			slog.String("session_id", id), slog.String("provider", family))
 		return 0, false, nil
 	}
-	usages, extractErr := f.Adapter().InvocationUsage(family, path)
+	return f.sweepResolvedTranscript(ctx, family, id, meta, path, now)
+}
+
+// DiscoverSweepTranscript resolves the transcript path for a model-usage
+// sweep without reading it. It preserves the same bounded keyed and keyless
+// discovery rules as SweepSessionModelUsage so callers can safely memoize a
+// stable rollout path across repeated incremental sweeps.
+//
+// settled classifies a miss with the same meaning SweepSessionModelUsage gives
+// it, so a caller that memoizes discovery can distinguish the two kinds: true
+// means there is definitively nothing to find (an unregistered provider family;
+// a keyless codex session whose bounded workdir+window fallback came up empty
+// on a CLEAN scan; or a keyless claude session whose transcript lookup cleanly
+// refused an ambiguous shared workdir) and re-running discovery is pure waste;
+// false means the miss is transient (a keyed rollout not flushed yet, a keyless
+// codex scan clouded by an I/O fault, which leaves both an empty result and a
+// lone hit non-definitive, a keyless claude lookup that failed to read the store,
+// or an unambiguous keyless claude session whose transcript is not written yet)
+// and a later attempt may resolve it. A found path is always settled.
+func (f *Factory) DiscoverSweepTranscript(id string, meta map[string]string, now time.Time) (path string, settled bool) {
+	id = strings.TrimSpace(id)
+	if f == nil || id == "" || meta == nil {
+		return "", true
+	}
+	family := invocationUsageFamily(sessionpkg.ProviderFamilyFromMetadata(meta, ""))
+	if _, ok := invocationUsageSpecs[family]; !ok {
+		return "", true
+	}
+	path, scanClean, emptyIsPermanent := f.discoverSweepTranscript(family, id, meta, now)
+	keyless := strings.TrimSpace(meta["session_key"]) == ""
+	keylessCodex := family == "codex" && keyless
+	keylessClaude := family == "claude" && keyless
+	if (keylessCodex || keylessClaude) && !scanClean {
+		return "", false
+	}
+	if path == "" {
+		// Match SweepSessionModelUsage settle: only a clean keyless miss that no retry
+		// can resolve (codex out-of-window/ambiguity, or the claude shared-workdir
+		// ambiguity refusal) memoizes as settled. A claude transcript that is merely
+		// not written yet stays unsettled so the live lane rediscovers it.
+		return "", (keylessCodex || keylessClaude) && emptyIsPermanent
+	}
+	return path, true
+}
+
+// SweepSessionModelUsageAtPath performs the same cursor-guarded extraction,
+// fact emission, metrics, and cursor persistence as SweepSessionModelUsage,
+// using an already-resolved transcript path instead of repeating discovery.
+// An empty path is a transient miss so callers can retry on a later tick.
+func (f *Factory) SweepSessionModelUsageAtPath(ctx context.Context, id string, meta map[string]string, path string, now time.Time) (emitted int, settled bool, err error) {
+	id = strings.TrimSpace(id)
+	if f == nil || id == "" || meta == nil {
+		return 0, true, nil
+	}
+	sink := f.usageSink
+	if sink == nil || sink == usage.Discard {
+		return 0, true, nil
+	}
+	family := invocationUsageFamily(sessionpkg.ProviderFamilyFromMetadata(meta, ""))
+	if _, ok := invocationUsageSpecs[family]; !ok {
+		slog.Debug("model-usage sweep (at path): unregistered provider family; skipping",
+			slog.String("session_id", id), slog.String("provider", strings.TrimSpace(meta["provider"])))
+		return 0, true, nil
+	}
+	if strings.TrimSpace(path) == "" {
+		return 0, false, nil
+	}
+	return f.sweepResolvedTranscript(ctx, family, id, meta, path, now)
+}
+
+// sweepResolvedTranscript owns the post-discovery model-usage sweep shared by
+// the discovery-driven and already-resolved entry points.
+func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string, meta map[string]string, path string, now time.Time) (emitted int, settled bool, err error) {
+	sink := f.usageSink
+	// Read the cursor BEFORE extracting: it bounds how far back the scan
+	// window must reach, so a sweep that falls more than one window behind
+	// still recovers the whole backlog instead of the tail's last few entries.
+	cursor := strings.TrimSpace(meta[sessionpkg.MetadataKeyInvocationUsageCursor])
+	usages, extractErr := f.Adapter().InvocationUsage(family, path, cursor)
 	if extractErr != nil {
 		// Transient: a torn mid-write tail can fail the parse; retry on a later tick.
 		slog.Debug("model-usage sweep: usage extraction failed; will retry",
 			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", extractErr))
 		return 0, false, nil
 	}
-	cursor := strings.TrimSpace(meta[sessionpkg.MetadataKeyInvocationUsageCursor])
 	pending := usagesSinceCursor(usages, cursor)
 	if len(pending) == 0 {
 		// Swept: the transcript was read and the cursor is already current.
@@ -517,14 +821,10 @@ func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta ma
 	}
 	workerName := strings.TrimSpace(meta["session_name"])
 	agentName := sweepAgentName(meta)
+	formulaName := resolveFormulaName(f.resolveBead, f.formulaMemo, meta, id)
 	lastRecorded := ""
 	for _, u := range pending {
-		cost, priced := registry.Estimate(family, u.Model, pricing.Usage{
-			PromptTokens:        u.InputTokens,
-			CompletionTokens:    u.OutputTokens,
-			CacheReadTokens:     u.CacheReadTokens,
-			CacheCreationTokens: u.CacheCreationTokens,
-		})
+		cost, priced := invocationCost(registry, family, u)
 		// Mirror the prompt-op seam's OTel metrics so the agents this sweep recovers
 		// facts for also get live gc.agent.tokens.* / cost series — the family keys
 		// the label identically to the emitted fact's Provider so metrics and facts
@@ -541,7 +841,7 @@ func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta ma
 		if priced {
 			telemetry.RecordInvocationCostEstimate(ctx, labels, cost)
 		}
-		fact := modelUsageFact(u, meta, id, id, workerName, family, cost, priced, now)
+		fact := modelUsageFact(u, meta, id, id, workerName, family, cost, priced, now, formulaName)
 		if recErr := sink.Record(ctx, fact); recErr != nil {
 			// Stop at the first failure and advance the cursor only through the last
 			// success, so the next sweep resumes here instead of skipping the gap.
@@ -566,7 +866,9 @@ func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta ma
 
 // discoverSweepTranscript resolves the transcript for the end-of-interval model
 // sweep: claude through the manager's keyed lookup, codex through the captured
-// session_key matched against the rollout filename suffix. The codex lookup is
+// session_key matched against the rollout filename suffix, opencode through the
+// session_key that names its mirrored export (keyed only; a miss is transient
+// and never falls back to the workdir). The codex lookup is
 // bounded to the awake interval's day window via
 // sessionlog.FindCodexSessionFileByID(notBefore=awake_started_at,
 // notAfter=slept_at||now) — NOT the unbounded date-tree walk — because this runs
@@ -574,29 +876,110 @@ func (f *Factory) SweepSessionModelUsage(ctx context.Context, id string, meta ma
 // per terminal session per tick could stall the tick. FindCodexSessionFileByID
 // still resolves resumed sessions whose rollout predates this interval: the
 // keyed lookup also scans the session UUID's own creation day (UUIDv7 hint ±2
-// days), which is where a resumed rollout was first written. A codex session
-// with no captured session_key yields "": the sweep has no window fallback,
-// matching the keyed-miss-records-nothing contract of the prompt-op codex
-// discovery.
-func (f *Factory) discoverSweepTranscript(family, id string, meta map[string]string, now time.Time) string {
+// days), which is where a resumed rollout was first written.
+//
+// A codex session with NO captured session_key — the graph.v2 wisp case, where
+// no capture path ever ran — falls back to sessionlog.FindCodexSessionFileNear,
+// the SAME bounded (cwd, wake-window) lookup the prompt-op seam runs for
+// fresh-wake keyless codex (discoverCodexInvocationTranscript). It is anchored at
+// the interval START (awake_started_at) with the same fixed
+// codexInvocationDiscoveryWindow, NOT the interval span: a rollout's filename
+// timestamp is the codex START (≈ the interval start), not its end, so a small
+// forward window catches a fresh wisp's rollout while keeping the scan to ~one day
+// directory — the interval span could be days for a long-awake session or a stale
+// slept_at, re-opening the unbounded-scan risk this bound exists to prevent. Wisps
+// run in per-wisp worktrees, so the session_meta cwd disambiguates on its own;
+// FindCodexSessionFileNear still REFUSES ambiguity (more than one in-window rollout
+// under the same cwd yields "") so a reused workdir records nothing rather than
+// misattributing.
+//
+// The returned scanClean reports whether the lookup was definitive, for both
+// keyless families. For the keyless-codex fallback it is false when the (cwd,
+// wake-window) scan hit a transient IO fault (a non-ENOENT readdir or a cwd-probe
+// open failure — EMFILE/ESTALE). That clouds BOTH an empty path (a miss that may
+// have hidden the only rollout) AND a lone hit (a fault may have hidden a second
+// same-cwd rollout, making the singleton non-definitive), so the caller retries
+// rather than recording or settling either. For the claude manager lookup it is
+// false when the transcript lookup returned an error — a store read failure, which
+// says nothing about whether a transcript exists. The keyed codex and opencode
+// lookups always return scanClean true.
+//
+// The returned emptyIsPermanent is meaningful only when path is empty on a CLEAN
+// lookup: it reports whether a retry could ever resolve the miss. It is true for
+// the keyless-codex fallback (a closed session's rollout is already on disk, so a
+// clean zero is ambiguity/out-of-window/TZ) and for the claude manager's
+// shared-workdir ambiguity refusal and its no-workdir case — neither changes while
+// the pool shares that directory. It is FALSE for a claude session that is
+// unambiguous but whose transcript simply has not been written yet, and for a keyed
+// codex miss, both of which a later tick may resolve.
+func (f *Factory) discoverSweepTranscript(family, id string, meta map[string]string, now time.Time) (path string, scanClean bool, emptyIsPermanent bool) {
 	switch family {
 	case "codex":
-		key := strings.TrimSpace(meta["session_key"])
-		if key == "" {
-			slog.Debug("model-usage sweep: codex session has no session_key; skipping",
-				slog.String("session_id", id))
-			return ""
-		}
+		workDir := contract.WorkerDirFromMetadata(meta)
 		notBefore, notAfter := sweepIntervalWindow(meta, now)
-		return sessionlog.FindCodexSessionFileByID(
-			f.searchPaths, contract.WorkerDirFromMetadata(meta), key, notBefore, notAfter)
-	default:
-		path, terr := f.manager.TranscriptPath(id, f.searchPaths)
-		if terr != nil {
-			return ""
+		if key := strings.TrimSpace(meta["session_key"]); key != "" {
+			return sessionlog.FindCodexSessionFileByID(
+				f.searchPaths, workDir, key, notBefore, notAfter), true, false
 		}
-		return strings.TrimSpace(path)
+		// Keyless fallback (Design B): resolve by cwd + wake window. Requires a
+		// workdir to key on and a non-zero interval start to anchor the window;
+		// without either, FindCodexSessionFileNear cannot bound its scan and the
+		// sweep records nothing — a clean, permanent miss.
+		if workDir == "" || notBefore.IsZero() {
+			slog.Debug("model-usage sweep: keyless codex has no workdir/anchor for fallback; skipping",
+				slog.String("session_id", id))
+			return "", true, true
+		}
+		scanPath, scanClean := sessionlog.FindCodexSessionFileNearScan(
+			f.searchPaths, workDir, notBefore, codexInvocationDiscoveryWindow)
+		return scanPath, scanClean, true
+	case "opencode":
+		// Keyed only, like discoverOpenCodeInvocationTranscript: the export is
+		// named for the session_key, and the manager's workdir fallback could
+		// hand back another conversation's export. A miss (or no key yet) is
+		// transient — the export may not be mirrored yet.
+		return sessionlog.FindOpenCodeSessionFileByID(
+			f.searchPaths, strings.TrimSpace(meta["session_key"])), true, false
+	default:
+		path, lookup, terr := f.manager.TranscriptPathClassified(id, f.searchPaths)
+		if terr != nil {
+			return "", false, false
+		}
+		switch lookup {
+		case sessionpkg.TranscriptAmbiguous, sessionpkg.TranscriptNoWorkDir:
+			// Refused on purpose, or nothing to search: permanent for this epoch.
+			return "", true, true
+		case sessionpkg.TranscriptAbsent:
+			// Unambiguous, but the transcript is not on disk yet — a later tick may
+			// find it, so this miss must stay transient.
+			return "", true, false
+		default:
+			return strings.TrimSpace(path), true, false
+		}
 	}
+}
+
+// discoverClosedIntervalTranscript is discoverSweepTranscript for the interval
+// a session close ended. Codex and opencode already resolve from meta. Claude
+// resolves by meta's session_key alone: the manager's lookup reads the row's
+// current key, which a reopen's fresh wake replaces, and on a keyed miss it
+// lists the session history of the work dir, a read a closed interval would
+// repeat on every retry. A keyed miss stays transient (the transcript may not
+// be on disk yet); without a key nothing names the closed conversation's
+// transcript, so the miss is permanent.
+func (f *Factory) discoverClosedIntervalTranscript(family, id string, meta map[string]string, now time.Time) (path string, scanClean, emptyIsPermanent bool) {
+	if family != "claude" {
+		return f.discoverSweepTranscript(family, id, meta, now)
+	}
+	key := strings.TrimSpace(meta["session_key"])
+	if key == "" {
+		return "", true, true
+	}
+	searchPaths := f.searchPaths
+	if len(searchPaths) == 0 {
+		searchPaths = sessionlog.DefaultSearchPaths()
+	}
+	return workertranscript.DiscoverKeyedPath(searchPaths, family, meta["work_dir"], key), true, false
 }
 
 // sweepAgentName resolves the metric AgentName label for a swept session from
@@ -613,21 +996,19 @@ func sweepAgentName(meta map[string]string) string {
 }
 
 // sweepIntervalWindow derives the codex discovery date window from a terminal
-// session's awake interval: [awake_started_at, slept_at]. When slept_at is
-// missing or not after the start (stale for non-sleep terminal states), it falls
-// back to now as the interval end, so notAfter is always set and never reversed —
-// FindCodexSessionFileByID requires a non-zero notAfter and refuses a reversed
-// range. The finder pads both ends by a local day, so an off-by-seconds bound
-// cannot drop the rollout's day directory.
+// session's awake interval: [awake_started_at, sessionpkg.UsageIntervalEnd].
+// slept_at is refreshed by both SleepPatch and AcknowledgeDrainPatch, so a
+// drained session tightens notAfter from now to its drain-ack time, and a usage
+// close marker bounds a session closed straight from a live state. When neither
+// lies after the start (a terminal exit that does not refresh slept_at, or a
+// value carried over from a prior awake interval), it falls back to now as the
+// interval end, so notAfter is always set and never reversed — FindCodexSessionFileByID requires
+// a non-zero notAfter and refuses a reversed range. The finder pads both ends by
+// a local day, so an off-by-seconds bound — including the tighter drain-ack
+// bound — cannot drop the rollout's day directory.
 func sweepIntervalWindow(meta map[string]string, now time.Time) (notBefore, notAfter time.Time) {
-	notAfter = now
 	if started, err := time.Parse(time.RFC3339, strings.TrimSpace(meta["awake_started_at"])); err == nil {
 		notBefore = started
 	}
-	if sleptRaw := strings.TrimSpace(meta["slept_at"]); sleptRaw != "" {
-		if slept, err := time.Parse(time.RFC3339, sleptRaw); err == nil && slept.After(notBefore) {
-			notAfter = slept
-		}
-	}
-	return notBefore, notAfter
+	return notBefore, sessionpkg.UsageIntervalEnd(meta, notBefore, now)
 }

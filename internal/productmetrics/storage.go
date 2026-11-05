@@ -25,6 +25,12 @@ var (
 	errStorageClosed              = errors.New("productmetrics: storage handle is closed")
 	errStorageReadLimit           = errors.New("productmetrics: storage read limit exceeded")
 	errStorageUnsafeRecordShape   = errors.New("productmetrics: storage record has an unsafe filesystem shape")
+	// errStorageRecordReplaced marks a read whose record was replaced or
+	// unlinked between name lookup and descriptor validation, so no stable
+	// incarnation was observed. It is joined to the validation error, never
+	// returned alone; only a caller whose writers all hold the record's lock
+	// may read it as a concurrent state change.
+	errStorageRecordReplaced = errors.New("productmetrics: storage record was replaced during the read")
 )
 
 const (
@@ -165,6 +171,12 @@ const (
 
 type storageWriteResult struct {
 	state storageWriteState
+	// record identifies the exact file this write installed at the target
+	// name (rename preserves the temporary file's inode). Callers that mint
+	// exact-record authority from a subsequent path re-open must require the
+	// re-opened record to match, or a peer's byte-identical replacement
+	// landing between the rename and the re-open is silently adopted.
+	record recordIncarnation
 }
 
 type recordIncarnation struct {
@@ -398,6 +410,7 @@ type storageDirectoryBackend interface {
 	unlinkEnumeratedEntry(storageEntry) error
 	removeEnumeratedDirectory(storageEntry) error
 	removeEnumeratedCleanupDirectory(storageEntry) error
+	tryAcquireLock(string) (storageLockBackend, bool, error)
 	acquireLock(context.Context, string) (storageLockBackend, error)
 	cleanupOnlyHandle() bool
 }
@@ -870,6 +883,17 @@ func (directory *storageDir) acquireLock(ctx context.Context, name string) (*adv
 		return nil, err
 	}
 	return &advisoryLock{backend: backend}, nil
+}
+
+func (directory *storageDir) tryAcquireUploaderLock() (*advisoryLock, bool, error) {
+	if directory == nil || directory.backend == nil {
+		return nil, false, errStorageClosed
+	}
+	backend, acquired, err := directory.backend.tryAcquireLock(uploaderLockName)
+	if err != nil || !acquired {
+		return nil, false, err
+	}
+	return &advisoryLock{backend: backend}, true, nil
 }
 
 func (lock *advisoryLock) Release() error {

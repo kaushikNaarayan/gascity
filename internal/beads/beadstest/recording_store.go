@@ -14,8 +14,8 @@ import (
 // writes to the raw bead op it replaces.
 type RecordedCall struct {
 	// Op is the Store method that was invoked: "Create", "Update", "Close",
-	// "Reopen", "CloseAll", "SetMetadata", "SetMetadataBatch", "Delete",
-	// "DepAdd", or "DepRemove".
+	// "Reopen", "CloseAll", "SetMetadata", "SetMetadataBatch", "SetLocalString",
+	// "Delete", "DepAdd", or "DepRemove".
 	Op string
 
 	// ID is the target bead id for ops that address a single bead. For Create
@@ -141,6 +141,7 @@ func cloneBead(b beads.Bead) beads.Bead {
 func cloneOpts(o beads.UpdateOpts) beads.UpdateOpts {
 	o.Labels = cloneStrings(o.Labels)
 	o.RemoveLabels = cloneStrings(o.RemoveLabels)
+	o.UnsetMetadata = cloneStrings(o.UnsetMetadata)
 	o.Metadata = cloneMeta(o.Metadata)
 	return o
 }
@@ -186,6 +187,13 @@ func (r *RecordingStore) SetMetadata(id, key, value string) error {
 func (r *RecordingStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	r.record(RecordedCall{Op: "SetMetadataBatch", ID: id, Metadata: cloneMeta(kvs)})
 	return r.Store.SetMetadataBatch(id, kvs)
+}
+
+// SetLocalString records the clone-local write then delegates. GetLocalString
+// is a read and, like Get, is passed straight through unrecorded.
+func (r *RecordingStore) SetLocalString(id, key, value string) error {
+	r.record(RecordedCall{Op: "SetLocalString", ID: id, Key: key, Value: value})
+	return r.Store.SetLocalString(id, key, value)
 }
 
 // Delete records the delete then delegates.

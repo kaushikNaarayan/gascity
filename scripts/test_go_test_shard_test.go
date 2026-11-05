@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/bazeltest"
 )
 
 type goTestShardFixture struct {
@@ -22,6 +24,8 @@ type goTestShardFixture struct {
 	productEnvFile  string
 	allTestArgsFile string
 	probeFile       string
+	// listFile, when written, replaces the fake `go test -list` output.
+	listFile string
 }
 
 func newGoTestShardFixture(t *testing.T) goTestShardFixture {
@@ -42,6 +46,7 @@ func newGoTestShardFixtureWithExit(t *testing.T, productExit int) goTestShardFix
 	productEnvFile := filepath.Join(tmpDir, "product-env")
 	allTestArgsFile := filepath.Join(tmpDir, "all-test-args")
 	probeFile := filepath.Join(tmpDir, "metadata-probes")
+	listFile := filepath.Join(tmpDir, "test-list")
 	fakeGo := fmt.Sprintf(`#!/bin/sh
 set -eu
 case "${1:-}" in
@@ -64,29 +69,61 @@ case "${1:-}" in
     printf '%%s\n' "$@" >> %q
     is_list=0
     is_json=0
+    run_regex=''
+    cover_profile=''
+    previous=''
     for arg in "$@"; do
       [ "$arg" != "-list" ] || is_list=1
       [ "$arg" != "-json" ] || is_json=1
+      [ "$previous" != "-run" ] || run_regex="$arg"
+      [ "$previous" != "-coverprofile" ] || cover_profile="$arg"
+      previous="$arg"
     done
     if [ "$is_list" = 1 ]; then
+      if [ -f %q ]; then
+        cat %q
+        exit 0
+      fi
       printf '%%s\n' TestAlpha TestBeta TestGamma 'ok  github.com/gastownhall/gascity/example  0.001s'
       exit 0
     fi
     printf '%%s\n' "$@" >> %q
     env | LC_ALL=C sort >> %q
     if [ "$is_json" = 1 ]; then
-      printf '%%s\n' \
-        '{"Action":"run","Package":"github.com/gastownhall/gascity/example","Test":"TestAlpha"}' \
-        '{"Action":"fail","Package":"github.com/gastownhall/gascity/example","Test":"TestAlpha","Elapsed":0.25}' \
-        '{"Action":"run","Package":"github.com/gastownhall/gascity/example","Test":"TestGamma"}' \
-        '{"Action":"pass","Package":"github.com/gastownhall/gascity/example","Test":"TestGamma","Elapsed":0.125}' \
-        '{"Action":"fail","Package":"github.com/gastownhall/gascity/example","Elapsed":0.3}'
+      case "$run_regex" in
+        *TestNoEvents*) ;;
+        *)
+          printf '%%s\n' \
+            '{"Action":"run","Package":"github.com/gastownhall/gascity/example","Test":"TestAlpha"}' \
+            '{"Action":"fail","Package":"github.com/gastownhall/gascity/example","Test":"TestAlpha","Elapsed":0.25}' \
+            '{"Action":"run","Package":"github.com/gastownhall/gascity/example","Test":"TestGamma"}' \
+            '{"Action":"pass","Package":"github.com/gastownhall/gascity/example","Test":"TestGamma","Elapsed":0.125}' \
+            '{"Action":"fail","Package":"github.com/gastownhall/gascity/example","Elapsed":0.3}'
+          ;;
+      esac
     fi
+    # One block per test the -run regex selects, so a merged profile shows
+    # which runs it holds.
+    if [ -n "$cover_profile" ]; then
+      case "$run_regex" in
+        *TestNoCover*) ;;
+        *)
+          printf 'mode: set\n' > "$cover_profile"
+          printf '%%s\n' "$run_regex" | sed -e 's/^\^(//' -e 's/)\$$//' | tr '|' '\n' |
+            while IFS= read -r name; do
+              printf 'github.com/gastownhall/gascity/example/%%s.go:1.1,2.2 1 1\n' "$name"
+            done >> "$cover_profile"
+          ;;
+      esac
+    fi
+    case "$run_regex" in
+      *TestChunkFail*) exit 7 ;;
+    esac
     exit %d
     ;;
   *) exit 99 ;;
 esac
-`, filepath.Join(tmpDir, "gopath"), filepath.Join(tmpDir, "gocache"), filepath.Join(tmpDir, "gomodcache"), filepath.Join(tmpDir, "gotmp"), filepath.Join(tmpDir, "goroot"), probeFile, allTestArgsFile, productArgsFile, productEnvFile, productExit)
+`, filepath.Join(tmpDir, "gopath"), filepath.Join(tmpDir, "gocache"), filepath.Join(tmpDir, "gomodcache"), filepath.Join(tmpDir, "gotmp"), filepath.Join(tmpDir, "goroot"), probeFile, allTestArgsFile, listFile, listFile, productArgsFile, productEnvFile, productExit)
 	if err := os.WriteFile(filepath.Join(binDir, "go"), []byte(fakeGo), 0o755); err != nil {
 		t.Fatalf("write fake go: %v", err)
 	}
@@ -107,11 +144,29 @@ esac
 		productEnvFile:  productEnvFile,
 		allTestArgsFile: allTestArgsFile,
 		probeFile:       probeFile,
+		listFile:        listFile,
 	}
 }
 
 func (f goTestShardFixture) command(extraEnv ...string) *exec.Cmd {
-	cmd := goTestShardCommand(f.repoRoot, "./example", "1", "2")
+	return f.commandForShard("1", "2", extraEnv...)
+}
+
+func (f goTestShardFixture) commandForShard(shardIndex, shardTotal string, extraEnv ...string) *exec.Cmd {
+	return f.commandForShardWithBash("", shardIndex, shardTotal, extraEnv...)
+}
+
+func (f goTestShardFixture) commandForShardWithBash(bashPath, shardIndex, shardTotal string, extraEnv ...string) *exec.Cmd {
+	cmd := goTestShardCommand(f.repoRoot, "./example", shardIndex, shardTotal)
+	if bashPath != "" {
+		cmd = shardTestCommand(
+			bashPath,
+			filepath.Join(f.repoRoot, "scripts", "test-go-test-shard"),
+			"./example",
+			shardIndex,
+			shardTotal,
+		)
+	}
 	cmd.Dir = f.repoRoot
 	cmd.Env = append([]string{
 		"PATH=" + f.binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
@@ -125,8 +180,41 @@ func (f goTestShardFixture) command(extraEnv ...string) *exec.Cmd {
 	return cmd
 }
 
+// assertSeededGitConfig checks the runner pinned GIT_CONFIG_GLOBAL to the
+// seeded per-user config (scripts/test-gitconfig-path) rather than pinning the
+// exact path: the helper's name embeds uid and a repo hash, so the contract
+// here is containment in the fixture TMPDIR plus a real, writable file.
+func (f goTestShardFixture) assertSeededGitConfig(t *testing.T, env map[string]string) {
+	t.Helper()
+	gitConfig := env["GIT_CONFIG_GLOBAL"]
+	if gitConfig == "" {
+		t.Fatalf("direct product environment lacks GIT_CONFIG_GLOBAL:\n%#v", env)
+	}
+	if !strings.HasPrefix(gitConfig, f.tmpDir+string(os.PathSeparator)) {
+		t.Errorf("GIT_CONFIG_GLOBAL %q escapes the fixture TMPDIR %q", gitConfig, f.tmpDir)
+	}
+	if info, err := os.Stat(gitConfig); err != nil {
+		t.Errorf("GIT_CONFIG_GLOBAL %q does not exist: %v", gitConfig, err)
+	} else if info.Mode().Perm()&0o200 == 0 {
+		t.Errorf("GIT_CONFIG_GLOBAL %q is not writable (mode %v)", gitConfig, info.Mode())
+	}
+}
+
+func writeGoTestManifest(t *testing.T, dir string, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, "tests.manifest")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write test manifest: %v", err)
+	}
+	return path
+}
+
 func goTestShardCommand(repoRoot string, args ...string) *exec.Cmd {
-	return exec.Command(filepath.Join(repoRoot, "scripts", "test-go-test-shard"), args...)
+	return shardTestCommand(filepath.Join(repoRoot, "scripts", "test-go-test-shard"), args...)
+}
+
+func shardTestCommand(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
 }
 
 func runShardCommand(t *testing.T, cmd *exec.Cmd) (int, []byte) {
@@ -173,7 +261,7 @@ func TestProviderOverridesAndSuiteContractsCrossMakeIsolation(t *testing.T) {
 	acceptanceFlags := map[string]string{"-tags": "acceptance_a"}
 	bdstoreFlags := map[string]string{
 		"-tags": "integration",
-		"-run":  "^(TestBdStoreConformance|TestBdStoreMailWispInsert)$",
+		"-run":  "^(TestBdStoreConformance|TestBdStoreDeleteBatchOrphansExternalDependents|TestBdStoreMailWispInsert|TestPinnedBdStoreCommandRunnerReportsSilentFallback|TestPinnedBdStoreCommandRunnerUsesExactEnvironmentAndKeepsStdoutJSON)$",
 	}
 	tests := []struct {
 		name         string
@@ -184,9 +272,9 @@ func TestProviderOverridesAndSuiteContractsCrossMakeIsolation(t *testing.T) {
 		wantFlags    map[string]string
 		wantPackages []string
 	}{
-		{name: "acceptance sqlite", target: "test-acceptance", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", provider: "sqlite", exitCode: 23, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
-		{name: "acceptance file", target: "test-acceptance", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", provider: "file", exitCode: 37, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
-		{name: "acceptance default", target: "test-acceptance", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", exitCode: 23, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
+		{name: "acceptance sqlite", target: "test-acceptance-go", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", provider: "sqlite", exitCode: 23, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
+		{name: "acceptance file", target: "test-acceptance-go", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", provider: "file", exitCode: 37, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
+		{name: "acceptance default", target: "test-acceptance-go", envName: "GC_ACCEPTANCE_BEADS_PROVIDER", exitCode: 23, wantFlags: acceptanceFlags, wantPackages: []string{"./test/acceptance/..."}},
 		{name: "integration sqlite", target: "test-integration-bdstore", envName: "GC_BEADS", provider: "sqlite", exitCode: 37, wantFlags: bdstoreFlags, wantPackages: []string{"./test/integration"}},
 		{name: "integration file", target: "test-integration-bdstore", envName: "GC_BEADS", provider: "file", exitCode: 23, wantFlags: bdstoreFlags, wantPackages: []string{"./test/integration"}},
 		{name: "integration default", target: "test-integration-bdstore", envName: "GC_BEADS", exitCode: 37, wantFlags: bdstoreFlags, wantPackages: []string{"./test/integration"}},
@@ -318,7 +406,8 @@ func TestGoTestShardWithoutTimingPreservesDirectProductContract(t *testing.T) {
 	wantEnv := map[string]string{
 		"PATH": fixture.binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME": fixture.homeDir, "USER": "", "LOGNAME": "", "SHELL": "/bin/sh",
-		"LANG": "C.UTF-8", "TMPDIR": fixture.tmpDir, "XDG_RUNTIME_DIR": "",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"LANG":                "C.UTF-8", "TMPDIR": fixture.tmpDir, "XDG_RUNTIME_DIR": "",
 		"GOPATH": filepath.Join(fixture.tmpDir, "gopath"), "GOCACHE": filepath.Join(fixture.tmpDir, "gocache"),
 		"GOMODCACHE": filepath.Join(fixture.tmpDir, "gomodcache"), "GOTMPDIR": filepath.Join(fixture.tmpDir, "gotmp"),
 		"GOROOT": filepath.Join(fixture.tmpDir, "goroot"), "GOENV": "", "GOFLAGS": "", "GO111MODULE": "",
@@ -326,13 +415,207 @@ func TestGoTestShardWithoutTimingPreservesDirectProductContract(t *testing.T) {
 		"GOSUMDB": "", "GOINSECURE": "", "GOVCS": "", "GOWORK": "", "GC_FAST_UNIT": "0",
 		"CGO_CPPFLAGS": "", "CGO_LDFLAGS": "", "GC_TEST_SHARD_INDEX": "1", "GC_TEST_SHARD_TOTAL": "2",
 	}
-	if got := fixtureEnvironment(t, readFixtureFile(t, fixture.productEnvFile)); !maps.Equal(got, wantEnv) {
+	got := fixtureEnvironment(t, readFixtureFile(t, fixture.productEnvFile))
+	fixture.assertSeededGitConfig(t, got)
+	delete(got, "GIT_CONFIG_GLOBAL")
+	if !maps.Equal(got, wantEnv) {
 		t.Fatalf("direct product environment = %#v, want %#v", got, wantEnv)
 	}
 	if probes, err := os.ReadFile(fixture.probeFile); err == nil {
 		t.Fatalf("timing-disabled shard ran metadata probes:\n%s", probes)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("inspect timing-disabled metadata probes: %v", err)
+	}
+}
+
+func TestGoTestShardManifestSkipsDiscoveryAndPreservesModuloSelection(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	manifest := writeGoTestManifest(t, fixture.tmpDir,
+		"# Source-checked fixture inventory.",
+		"",
+		"TestAlpha",
+		"TestBeta",
+		"TestGamma",
+		"TestDelta",
+		"TestEpsilon",
+	)
+	status, output := runShardCommand(t, fixture.commandForShard("2", "3", "GO_TEST_MANIFEST="+manifest))
+	if status != 23 {
+		t.Fatalf("manifest shard exit = %d, want product exit 23\n%s", status, output)
+	}
+
+	wantArgs := "test\n-timeout\n1m\n./example\n-run\n^(TestBeta|TestEpsilon)$\n"
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs {
+		t.Fatalf("manifest product argv:\n%s\nwant:\n%s", got, wantArgs)
+	}
+	if allArgs := readFixtureFile(t, fixture.allTestArgsFile); allArgs != wantArgs {
+		t.Fatalf("manifest mode ran discovery or extra go test invocations:\n%s\nwant exactly one final invocation:\n%s", allArgs, wantArgs)
+	}
+}
+
+func TestGoTestShardManifestFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		manifest  func(*testing.T, goTestShardFixture) string
+		wantError string
+	}{
+		{
+			name: "unreadable",
+			manifest: func(_ *testing.T, fixture goTestShardFixture) string {
+				return filepath.Join(fixture.tmpDir, "missing.manifest")
+			},
+			wantError: "go test manifest is not readable",
+		},
+		{
+			name: "empty",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "# comments are not entries", "")
+			},
+			wantError: "go test manifest contains no tests",
+		},
+		{
+			name: "invalid regex syntax",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "TestAlpha|TestBeta")
+			},
+			wantError: "invalid go test manifest entry",
+		},
+		{
+			name: "malformed whitespace",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "Test Alpha")
+			},
+			wantError: "invalid go test manifest entry",
+		},
+		{
+			name: "duplicate",
+			manifest: func(t *testing.T, fixture goTestShardFixture) string {
+				return writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestAlpha")
+			},
+			wantError: "duplicate go test manifest entry: TestAlpha",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newGoTestShardFixtureWithExit(t, 0)
+			manifest := tt.manifest(t, fixture)
+			status, output := runShardCommand(t, fixture.command("GO_TEST_MANIFEST="+manifest))
+			if status == 0 {
+				t.Fatalf("invalid manifest unexpectedly succeeded:\n%s", output)
+			}
+			if !strings.Contains(string(output), tt.wantError) {
+				t.Fatalf("manifest error output:\n%s\nwant substring %q", output, tt.wantError)
+			}
+			if allArgs, err := os.ReadFile(fixture.allTestArgsFile); err == nil {
+				t.Fatalf("invalid manifest invoked go test:\n%s", allArgs)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("inspect invalid-manifest go test calls: %v", err)
+			}
+		})
+	}
+}
+
+func TestGoTestShardManifestRejectsNULBytesBeforeInvokingGo(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := filepath.Join(fixture.tmpDir, "nul.manifest")
+	if err := os.WriteFile(manifest, []byte("TestAl\x00pha\n"), 0o644); err != nil {
+		t.Fatalf("write NUL manifest: %v", err)
+	}
+
+	status, output := runShardCommand(t, fixture.command("GO_TEST_MANIFEST="+manifest))
+	if status == 0 {
+		t.Fatalf("NUL manifest unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "NUL bytes or could not be validated") {
+		t.Fatalf("NUL manifest error output:\n%s\nwant NUL/malformed diagnostic", output)
+	}
+	if allArgs, err := os.ReadFile(fixture.allTestArgsFile); err == nil {
+		t.Fatalf("NUL manifest invoked go test:\n%s", allArgs)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect NUL-manifest go test calls: %v", err)
+	}
+}
+
+func TestGoTestShardManifestAcceptsFirstEntryWithBash32Nounset(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha")
+	bashPath := findBash32(t)
+	if bashPath == "" {
+		assertManifestDuplicateScanGuardsEmptyArray(t, filepath.Join(fixture.repoRoot, "scripts", "test-go-test-shard"))
+	}
+
+	cmd := fixture.commandForShardWithBash(bashPath, "1", "1", "GO_TEST_MANIFEST="+manifest)
+	status, output := runShardCommand(t, cmd)
+	if status != 23 {
+		t.Fatalf("single-entry manifest shard exit = %d, want product exit 23 (bash=%q)\n%s", status, bashPath, output)
+	}
+	wantArgs := "test\n-timeout\n1m\n./example\n-run\n^(TestAlpha)$\n"
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs {
+		t.Fatalf("single-entry manifest product argv:\n%s\nwant:\n%s", got, wantArgs)
+	}
+	if allArgs := readFixtureFile(t, fixture.allTestArgsFile); allArgs != wantArgs {
+		t.Fatalf("single-entry manifest ran discovery or extra go test invocations:\n%s", allArgs)
+	}
+}
+
+func findBash32(t *testing.T) string {
+	t.Helper()
+	candidates := []string{os.Getenv("BASH32"), "bash3.2", "bash-3.2", "bash"}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		path, err := exec.LookPath(candidate)
+		if err != nil {
+			continue
+		}
+		if _, duplicate := seen[path]; duplicate {
+			continue
+		}
+		seen[path] = struct{}{}
+		output, err := shardTestCommand(path, "--version").CombinedOutput()
+		if err == nil && strings.Contains(string(output), "version 3.2") {
+			return path
+		}
+	}
+	return ""
+}
+
+func assertManifestDuplicateScanGuardsEmptyArray(t *testing.T, scriptPath string) {
+	t.Helper()
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read test-go-test-shard source: %v", err)
+	}
+	source := string(content)
+	if count := strings.Count(source, `for existing in "${tests[@]}"; do`); count != 1 {
+		t.Fatalf("manifest duplicate scans = %d, want exactly one", count)
+	}
+	countIndex := strings.Index(source, "manifest_test_count=0")
+	guardIndex := strings.Index(source, "if (( manifest_test_count > 0 )); then")
+	loopIndex := strings.Index(source, `for existing in "${tests[@]}"; do`)
+	appendIndex := strings.Index(source, `tests+=("$line")`)
+	incrementIndex := strings.Index(source, "manifest_test_count=$((manifest_test_count + 1))")
+	guardEnd := -1
+	if loopIndex >= 0 {
+		if relative := strings.Index(source[loopIndex:], "\n    fi\n"); relative >= 0 {
+			guardEnd = loopIndex + relative
+		}
+	}
+	if countIndex < 0 || countIndex >= guardIndex || guardIndex >= loopIndex || loopIndex >= guardEnd || guardEnd >= appendIndex || appendIndex >= incrementIndex {
+		t.Fatalf("manifest duplicate scan is not structurally guarded before the first array append")
 	}
 }
 
@@ -492,7 +775,9 @@ func TestGoTestShardTimingArtifactFailureIsAdvisory(t *testing.T) {
 
 func TestGoTestShardPreservesAcceptanceAuthEnv(t *testing.T) {
 	repoRoot := filepath.Dir(t.TempDir())
-	if wd, err := os.Getwd(); err == nil {
+	if root := bazeltest.OverrideRoot(); root != "" {
+		repoRoot = root // bazel runfiles trees are partial; the shard needs the module graph
+	} else if wd, err := os.Getwd(); err == nil {
 		repoRoot = filepath.Dir(wd)
 	}
 
@@ -506,8 +791,13 @@ func TestGoTestShardPreservesAcceptanceAuthEnv(t *testing.T) {
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
+		"TMPDIR=" + t.TempDir(),
 		"GO_TEST_TIMEOUT=1m",
 		"ANTHROPIC_AUTH_TOKEN=synthetic-token",
+		// Isolated HOME redirects GOMODCACHE into t.TempDir(); a toolchain
+		// download there defeats TempDir cleanup (read-only module files).
+		// Keep it in a shared cache instead.
+		"GOMODCACHE=" + filepath.Join(os.TempDir(), "gc-shard-test-gomodcache"),
 	}
 
 	out, err := cmd.CombinedOutput()
@@ -518,7 +808,9 @@ func TestGoTestShardPreservesAcceptanceAuthEnv(t *testing.T) {
 
 func TestGoTestShardRunsWithoutPreservedProviderEnv(t *testing.T) {
 	repoRoot := filepath.Dir(t.TempDir())
-	if wd, err := os.Getwd(); err == nil {
+	if root := bazeltest.OverrideRoot(); root != "" {
+		repoRoot = root // bazel runfiles trees are partial; the shard needs the module graph
+	} else if wd, err := os.Getwd(); err == nil {
 		repoRoot = filepath.Dir(wd)
 	}
 
@@ -532,11 +824,293 @@ func TestGoTestShardRunsWithoutPreservedProviderEnv(t *testing.T) {
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
+		"TMPDIR=" + t.TempDir(),
 		"GO_TEST_TIMEOUT=1m",
+		// Keep toolchain downloads out of the isolated HOME; its read-only
+		// module files would defeat t.TempDir cleanup.
+		"GOMODCACHE=" + filepath.Join(os.TempDir(), "gc-shard-test-gomodcache"),
 	}
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("test-go-test-shard failed without preserved provider env: %v\n%s", err, out)
 	}
+}
+
+// productRunRegexes returns the -run argument of every product invocation the
+// fake go recorded, in invocation order.
+func productRunRegexes(t *testing.T, raw string) []string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
+	var regexes []string
+	for i, line := range lines {
+		if line == "-run" && i+1 < len(lines) {
+			regexes = append(regexes, lines[i+1])
+		}
+	}
+	return regexes
+}
+
+// runRegexNames splits an anchored "^(A|B|...)$" -run argument back into its
+// test names.
+func runRegexNames(t *testing.T, regex string) []string {
+	t.Helper()
+	if !strings.HasPrefix(regex, "^(") || !strings.HasSuffix(regex, ")$") {
+		t.Fatalf("-run argument %q is not an anchored alternation", regex)
+	}
+	return strings.Split(strings.TrimSuffix(strings.TrimPrefix(regex, "^("), ")$"), "|")
+}
+
+func TestGoTestShardChunksRunRegexUnderArgumentLimit(t *testing.T) {
+	t.Parallel()
+
+	// Linux's MAX_ARG_STRLEN bounds every argv string, NUL included.
+	const maxArgStrlen = 128 * 1024
+	// A cmd/gc-sized shard: one in six of these names is 3,000 tests whose
+	// single joined regex (~160 KB) exceeds Linux's 128 KiB MAX_ARG_STRLEN,
+	// the exec failure behind ga-f4ovjm.47.
+	const shardTotal = 6
+	var all []string
+	for i := range 18000 {
+		all = append(all, fmt.Sprintf("TestSyntheticCommandBehaviorWithADescriptiveName%05d", i))
+	}
+	var want []string
+	for i, name := range all {
+		if i%shardTotal == 0 {
+			want = append(want, name)
+		}
+	}
+	if joined := len("^(" + strings.Join(want, "|") + ")$"); joined <= maxArgStrlen {
+		t.Fatalf("fixture regex is only %d bytes; it must exceed the 128 KiB argument limit", joined)
+	}
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	if err := os.WriteFile(fixture.listFile, []byte(strings.Join(all, "\n")+"\nok  \texample\t0.1s\n"), 0o644); err != nil {
+		t.Fatalf("write test list: %v", err)
+	}
+	status, output := runShardCommand(t, fixture.commandForShard("1", fmt.Sprint(shardTotal)))
+	if status != 0 {
+		t.Fatalf("shard exit = %d, want 0\n%.4000s", status, output)
+	}
+
+	regexes := productRunRegexes(t, readFixtureFile(t, fixture.productArgsFile))
+	if len(regexes) < 2 {
+		t.Fatalf("shard ran %d go test invocations, want the selection split into several chunks", len(regexes))
+	}
+	var got []string
+	for i, regex := range regexes {
+		// go test hands the regex to the test binary as "-test.run=<regex>".
+		if size := len("-test.run=") + len(regex) + 1; size > maxArgStrlen {
+			t.Errorf("chunk %d reaches the test binary as a %d-byte argument, over the %d-byte MAX_ARG_STRLEN", i+1, size, maxArgStrlen)
+		}
+		got = append(got, runRegexNames(t, regex)...)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("chunks ran %d names, want each of the %d selected names exactly once in order", len(got), len(want))
+	}
+	if !strings.Contains(string(output), fmt.Sprintf("chunk %d of %d", len(regexes), len(regexes))) {
+		t.Fatalf("shard output does not label its chunks:\n%.4000s", output)
+	}
+}
+
+func TestGoTestShardChunkFailureFailsShardAfterRunningEveryChunk(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestChunkFail", "TestGamma")
+	// "^(TestChunkFail)$" is the longest single-name regex at 17 bytes, so a
+	// 17-byte budget gives every name its own chunk.
+	status, output := runShardCommand(t, fixture.commandForShard("1", "1",
+		"GO_TEST_MANIFEST="+manifest, "GO_TEST_RUN_REGEX_MAX_BYTES=17"))
+	if status != 7 {
+		t.Fatalf("shard exit = %d, want the failing chunk's exit 7\n%s", status, output)
+	}
+	want := []string{"^(TestAlpha)$", "^(TestChunkFail)$", "^(TestGamma)$"}
+	if got := productRunRegexes(t, readFixtureFile(t, fixture.productArgsFile)); !slices.Equal(got, want) {
+		t.Fatalf("chunk -run arguments = %q, want %q", got, want)
+	}
+	if !strings.Contains(string(output), "chunk 2 of 3: FAIL status=7") {
+		t.Fatalf("shard output does not name the failing chunk:\n%s", output)
+	}
+}
+
+func TestGoTestShardRejectsInvalidRunRegexBudget(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	status, output := runShardCommand(t, fixture.command("GO_TEST_RUN_REGEX_MAX_BYTES=0"))
+	if status != 1 || !strings.Contains(string(output), "GO_TEST_RUN_REGEX_MAX_BYTES must be a positive integer") {
+		t.Fatalf("invalid budget: exit %d\n%s", status, output)
+	}
+	if _, err := os.Stat(fixture.productArgsFile); !os.IsNotExist(err) {
+		t.Fatalf("invalid budget still invoked the product run: err=%v", err)
+	}
+}
+
+func TestGoTestShardChunkedTimingMergesIntoRequestedArtifact(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixture(t)
+	timingFile := filepath.Join(fixture.tmpDir, "timing.json")
+	// A 13-byte budget fits "^(TestAlpha)$" alone, splitting the shard's two
+	// selected tests into two observable runs.
+	status, output := runShardCommand(t, fixture.command(
+		"GO_TEST_TIMING_FILE="+timingFile,
+		"GO_TEST_TIMING_NAME=cmd-gc-process-1-of-2",
+		"GO_TEST_RUN_REGEX_MAX_BYTES=13",
+	))
+	if status != 23 {
+		t.Fatalf("shard exit = %d, want product exit 23\n%s", status, output)
+	}
+	want := []string{"^(TestAlpha)$", "^(TestGamma)$"}
+	if got := productRunRegexes(t, readFixtureFile(t, fixture.productArgsFile)); !slices.Equal(got, want) {
+		t.Fatalf("chunk -run arguments = %q, want %q", got, want)
+	}
+
+	data, err := os.ReadFile(timingFile)
+	if err != nil {
+		t.Fatalf("read merged timing artifact: %v\n%s", err, output)
+	}
+	var artifact observableTimingArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("decode merged timing artifact: %v\n%s", err, data)
+	}
+	if artifact.ShardID != "cmd-gc-process-1-of-2" {
+		t.Fatalf("merged timing shard id = %q", artifact.ShardID)
+	}
+	// The fake go emits the same three terminal events per run, so the merge
+	// must carry both runs' units.
+	if len(artifact.Units) != 6 {
+		t.Fatalf("merged timing has %d units, want 6 (3 per chunk): %+v", len(artifact.Units), artifact.Units)
+	}
+	assertNoChunkArtifacts(t, timingFile)
+}
+
+// assertNoChunkArtifacts fails when a chunk's file outlived the shard beside
+// the artifact it was merged into.
+func assertNoChunkArtifacts(t *testing.T, artifact string) {
+	t.Helper()
+	leftovers, err := filepath.Glob(artifact + ".*")
+	if err != nil {
+		t.Fatalf("glob chunk artifacts: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("chunk artifacts were not cleaned up: %v", leftovers)
+	}
+}
+
+func TestGoTestShardSingleChunkCoverageWritesRequestedProfile(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	coverProfile := filepath.Join(fixture.tmpDir, "coverage.txt")
+	status, output := runShardCommand(t, fixture.command("GO_TEST_COVERPROFILE="+coverProfile))
+	if status != 0 {
+		t.Fatalf("shard exit = %d, want 0\n%s", status, output)
+	}
+
+	wantArgs := "test\n-timeout\n1m\n-coverpkg=./...\n-coverprofile\n" + coverProfile + "\n./example\n-run\n^(TestAlpha|TestGamma)$\n"
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs {
+		t.Fatalf("single-chunk coverage product argv:\n%s\nwant:\n%s", got, wantArgs)
+	}
+	wantProfile := "mode: set\n" +
+		"github.com/gastownhall/gascity/example/TestAlpha.go:1.1,2.2 1 1\n" +
+		"github.com/gastownhall/gascity/example/TestGamma.go:1.1,2.2 1 1\n"
+	if got := readFixtureFile(t, coverProfile); got != wantProfile {
+		t.Fatalf("coverage profile:\n%s\nwant:\n%s", got, wantProfile)
+	}
+}
+
+func TestGoTestShardChunkedCoverageMergesEveryChunkIntoRequestedProfile(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestBeta", "TestGamma")
+	coverProfile := filepath.Join(fixture.tmpDir, "coverage.txt")
+	if err := os.WriteFile(coverProfile, []byte("mode: set\ngithub.com/gastownhall/gascity/example/TestStale.go:1.1,2.2 1 1\n"), 0o644); err != nil {
+		t.Fatalf("write stale coverage profile: %v", err)
+	}
+	// A 13-byte budget fits "^(TestAlpha)$" alone, so every name is a chunk.
+	status, output := runShardCommand(t, fixture.commandForShard("1", "1",
+		"GO_TEST_MANIFEST="+manifest,
+		"GO_TEST_COVERPROFILE="+coverProfile,
+		"GO_TEST_RUN_REGEX_MAX_BYTES=13",
+	))
+	if status != 0 {
+		t.Fatalf("shard exit = %d, want 0\n%s", status, output)
+	}
+
+	// go test truncates its -coverprofile when it starts, so each chunk writes
+	// its own while every chunk keeps the shared -coverpkg instrumentation.
+	var wantArgs strings.Builder
+	for i, name := range []string{"TestAlpha", "TestBeta", "TestGamma"} {
+		fmt.Fprintf(&wantArgs, "test\n-timeout\n1m\n-coverpkg=./...\n-coverprofile\n%s.chunk-%d\n./example\n-run\n^(%s)$\n", coverProfile, i+1, name)
+	}
+	if got := readFixtureFile(t, fixture.productArgsFile); got != wantArgs.String() {
+		t.Fatalf("chunked coverage product argv:\n%s\nwant:\n%s", got, wantArgs.String())
+	}
+	wantProfile := "mode: set\n" +
+		"github.com/gastownhall/gascity/example/TestAlpha.go:1.1,2.2 1 1\n" +
+		"github.com/gastownhall/gascity/example/TestBeta.go:1.1,2.2 1 1\n" +
+		"github.com/gastownhall/gascity/example/TestGamma.go:1.1,2.2 1 1\n"
+	if got := readFixtureFile(t, coverProfile); got != wantProfile {
+		t.Fatalf("merged coverage profile:\n%s\nwant every chunk's blocks:\n%s", got, wantProfile)
+	}
+	assertNoChunkArtifacts(t, coverProfile)
+}
+
+func TestGoTestShardChunkedCoverageMergeFailureFailsShard(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestNoCover")
+	coverProfile := filepath.Join(fixture.tmpDir, "coverage.txt")
+	if err := os.WriteFile(coverProfile, []byte("mode: set\ngithub.com/gastownhall/gascity/example/TestStale.go:1.1,2.2 1 1\n"), 0o644); err != nil {
+		t.Fatalf("write stale coverage profile: %v", err)
+	}
+	// "^(TestNoCover)$" is 15 bytes, so each name is a chunk, and the fake go
+	// writes no profile for the TestNoCover chunk.
+	status, output := runShardCommand(t, fixture.commandForShard("1", "1",
+		"GO_TEST_MANIFEST="+manifest,
+		"GO_TEST_COVERPROFILE="+coverProfile,
+		"GO_TEST_RUN_REGEX_MAX_BYTES=15",
+	))
+	if status != 1 {
+		t.Fatalf("shard exit = %d, want 1 for an incomplete coverage profile\n%s", status, output)
+	}
+	if !strings.Contains(string(output), "could not merge 2 chunk coverage profiles into "+coverProfile) {
+		t.Fatalf("shard output does not report the failed coverage merge:\n%s", output)
+	}
+	if _, err := os.Stat(coverProfile); !os.IsNotExist(err) {
+		t.Fatalf("shard left a coverage profile it could not complete: err=%v", err)
+	}
+	assertNoChunkArtifacts(t, coverProfile)
+}
+
+func TestGoTestShardChunkedTimingRemovesStaleArtifactWhenMergeFails(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGoTestShardFixtureWithExit(t, 0)
+	manifest := writeGoTestManifest(t, fixture.tmpDir, "TestAlpha", "TestNoEvents")
+	timingFile := filepath.Join(fixture.tmpDir, "timing.json")
+	if err := os.WriteFile(timingFile, []byte(`{"schema":1,"shard_id":"earlier-run","units":[]}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write stale timing artifact: %v", err)
+	}
+	// "^(TestNoEvents)$" is 16 bytes, so each name is a chunk, and the fake go
+	// emits no test events, hence no timing artifact, for the TestNoEvents one.
+	status, output := runShardCommand(t, fixture.commandForShard("1", "1",
+		"GO_TEST_MANIFEST="+manifest,
+		"GO_TEST_TIMING_FILE="+timingFile,
+		"GO_TEST_RUN_REGEX_MAX_BYTES=16",
+	))
+	if status != 0 {
+		t.Fatalf("shard exit = %d, want 0: timing is advisory\n%s", status, output)
+	}
+	if !strings.Contains(string(output), "could not merge 2 chunk timing artifacts into "+timingFile) {
+		t.Fatalf("shard output does not report the failed timing merge:\n%s", output)
+	}
+	if data, err := os.ReadFile(timingFile); !os.IsNotExist(err) {
+		t.Fatalf("an earlier run's timing artifact survived as this shard's: err=%v\n%s", err, data)
+	}
+	assertNoChunkArtifacts(t, timingFile)
 }

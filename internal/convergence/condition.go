@@ -2,17 +2,23 @@ package convergence
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/doltauth"
+	"github.com/gastownhall/gascity/internal/gchome"
 	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
@@ -24,11 +30,58 @@ const (
 	textFileBusyRetryDelay    = 25 * time.Millisecond
 )
 
-// conditionPATH resolves the tool directories gate scripts actually need.
-// This keeps the env narrow while ensuring gate scripts use the same bd/gc
-// binaries as the running city instead of whatever older copy happens to live
-// in /usr/local/bin.
+// ErrConditionNotRegular reports that a gate condition path resolved, inside its
+// containment boundary, to something other than a regular file (a directory,
+// device, socket or FIFO).
+var ErrConditionNotRegular = errors.New("not a regular file")
+
+// ErrConditionNotExecutable reports that a gate condition path resolved to a
+// regular file with no execute permission bit set.
+var ErrConditionNotExecutable = errors.New("file is not executable")
+
+// conditionGCHome resolves the gc state directory for gate subprocesses. Gate
+// HOME is intentionally sandboxed to the city, so it cannot also be used for
+// gc's machine-level cache and registry state.
+func conditionGCHome() string {
+	return gchome.ResolveReadOnly().Path()
+}
+
+// conditionToolNames are the tools gate scripts call by name.
+var conditionToolNames = []string{"bd", "gc", "dolt", "jq"}
+
+// conditionTools resolves each tool gate scripts call by name to the binary
+// the running city uses. gc is the running binary itself when this process is
+// a gc binary; every other tool, and gc otherwise, resolves on this process's
+// PATH. Tools that do not resolve are omitted.
+func conditionTools() map[string]string {
+	tools := make(map[string]string, len(conditionToolNames))
+	for _, name := range conditionToolNames {
+		if path, err := exec.LookPath(name); err == nil {
+			if abs, absErr := filepath.Abs(path); absErr == nil {
+				path = abs
+			}
+			tools[name] = path
+		}
+	}
+	if exe, err := os.Executable(); err == nil && filepath.Base(exe) == "gc" {
+		tools["gc"] = exe
+	}
+	return tools
+}
+
+// conditionPATH builds the PATH for gate scripts: narrow, and resolving each
+// tool in conditionToolNames to exactly the binary conditionTools chose, never
+// to whatever older copy happens to live elsewhere.
+//
+// Listing the resolved tools' directories is not enough. One directory can
+// hold several of these tools, for example bd beside an older gc in
+// ~/.local/bin, and the first directory listed would then shadow a tool
+// resolved from a later one. So PATH starts with a directory of links, one per
+// tool, to the exact resolved binary. The resolved directories and SafePATH
+// follow for anything else a script runs. When the link directory cannot be
+// prepared, PATH falls back to the resolved directories alone.
 func conditionPATH() string {
+	tools := conditionTools()
 	dirs := make([]string, 0, 8)
 	seen := make(map[string]struct{})
 	addDir := func(dir string) {
@@ -41,8 +94,11 @@ func conditionPATH() string {
 		seen[dir] = struct{}{}
 		dirs = append(dirs, dir)
 	}
-	for _, name := range []string{"bd", "gc", "dolt", "jq"} {
-		if path, err := exec.LookPath(name); err == nil {
+	if linkDir, err := conditionToolLinkDir(conditionGCHome(), tools); err == nil {
+		addDir(linkDir)
+	}
+	for _, name := range conditionToolNames {
+		if path, ok := tools[name]; ok {
 			addDir(filepath.Dir(path))
 		}
 	}
@@ -50,6 +106,67 @@ func conditionPATH() string {
 		addDir(dir)
 	}
 	return strings.Join(dirs, ":")
+}
+
+// conditionToolLinkDir returns a directory under gcHome holding one symlink
+// per tool, named for the tool and pointing at its resolved binary. The
+// directory is named for its contents, so a given set of tools reuses one
+// directory and a changed set gets a new one; it is built under a temporary
+// name and renamed into place, so a concurrent gate never sees a partial set.
+func conditionToolLinkDir(gcHome string, tools map[string]string) (string, error) {
+	if gcHome == "" || len(tools) == 0 {
+		return "", errors.New("no gc home or no tools")
+	}
+	names := make([]string, 0, len(tools))
+	for name := range tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	sum := sha256.New()
+	for _, name := range names {
+		_, _ = fmt.Fprintf(sum, "%s=%s\n", name, tools[name])
+	}
+	parent := filepath.Join(gcHome, "run", "gate-tools")
+	dir := filepath.Join(parent, hex.EncodeToString(sum.Sum(nil))[:16])
+	if conditionToolLinksMatch(dir, tools) {
+		return dir, nil
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.MkdirTemp(parent, ".tmp-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp) //nolint:errcheck // best-effort cleanup of an unused staging dir
+	for _, name := range names {
+		if err := os.Symlink(tools[name], filepath.Join(tmp, name)); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Rename(tmp, dir); err != nil && !conditionToolLinksMatch(dir, tools) {
+		return "", err
+	}
+	if !conditionToolLinksMatch(dir, tools) {
+		return "", fmt.Errorf("gate tool links in %s do not match", dir)
+	}
+	return dir, nil
+}
+
+// conditionToolLinksMatch reports whether dir holds exactly a link per tool to
+// its resolved binary.
+func conditionToolLinksMatch(dir string, tools map[string]string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != len(tools) {
+		return false
+	}
+	for name, target := range tools {
+		got, err := os.Readlink(filepath.Join(dir, name))
+		if err != nil || got != target {
+			return false
+		}
+	}
+	return true
 }
 
 // ConditionEnv builds the environment variables for a gate condition script.
@@ -72,10 +189,41 @@ type ConditionEnv struct {
 	AgentModel           string // may be empty
 }
 
+// conditionBeadsCredentialsFile resolves the beads credentials file gate
+// commands must read.
+//
+// Gate commands run with HOME=<CityPath> so they cannot see the controller's
+// home directory. bd resolves its credentials file from HOME, so under the
+// sandbox its own default lands on <CityPath>/.config/beads/credentials — a
+// path that never exists — and every bd read inside a gate fails to
+// authenticate (gastownhall/gascity ga-pqlgh).
+//
+// The fix threads one explicit file path across the sandbox boundary instead of
+// widening HOME: the whitelist stays enumerable, .ssh/.gnupg stay invisible, and
+// no secret material is copied into the city directory (which is listable and
+// backed up). An ambient BEADS_CREDENTIALS_FILE wins, because operators already
+// use it to select scoped stores. Otherwise the OS default resolved against the
+// controller's real home is used, and only when it exists — exporting a path
+// that does not resolve would mask bd's own fallback for no gain.
+func conditionBeadsCredentialsFile() string {
+	if path := strings.TrimSpace(os.Getenv("BEADS_CREDENTIALS_FILE")); path != "" {
+		return path
+	}
+	path := doltauth.DefaultCredentialsPath()
+	if path == "" {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	return path
+}
+
 // Environ returns the environment variable slice for exec.Cmd.
 // Only whitelisted variables: PATH (safe default), HOME, TMPDIR, convergence
-// vars, Dolt/Beads connection env, and GC_INTEGRATION_REAL_BD when present for
-// integration-test bd shims.
+// vars, Dolt/Beads connection env, the resolved beads credentials file, and
+// GC_INTEGRATION_REAL_BD when present for integration-test bd shims.
 func (ce ConditionEnv) Environ() []string {
 	// Use CityPath as HOME to sandbox gate scripts from the
 	// controller's home directory (which may contain .ssh, .gnupg, etc).
@@ -90,6 +238,7 @@ func (ce ConditionEnv) Environ() []string {
 	env := []string{
 		"PATH=" + conditionPATH(),
 		"HOME=" + home,
+		"GC_HOME=" + conditionGCHome(),
 		"TMPDIR=" + os.TempDir(),
 		"BEADS_DIR=" + filepath.Join(storePath, ".beads"),
 		"GC_BEAD_ID=" + ce.BeadID,
@@ -128,6 +277,9 @@ func (ce ConditionEnv) Environ() []string {
 	}
 	if realBD := os.Getenv("GC_INTEGRATION_REAL_BD"); realBD != "" {
 		env = append(env, "GC_INTEGRATION_REAL_BD="+realBD)
+	}
+	if credentials := conditionBeadsCredentialsFile(); credentials != "" {
+		env = append(env, "BEADS_CREDENTIALS_FILE="+credentials)
 	}
 	for _, key := range []string{
 		"BEADS_DOLT_AUTO_START",
@@ -187,7 +339,7 @@ func containedIn(absPath, root string) bool {
 // imported and registry-installed packs can live outside the city/store roots.
 // Callers must only pass absolute paths from surfaces they trust. Returns the
 // canonical absolute path after symlink resolution and an exec-eligible file
-// check.
+// check. Unlaunchable targets are classified by IsConditionUnlaunchable.
 func ResolveConditionPath(envelope, base, conditionPath string) (string, error) {
 	if conditionPath == "" {
 		return "", fmt.Errorf("resolving gate condition path: empty path")
@@ -199,18 +351,25 @@ func ResolveConditionPath(envelope, base, conditionPath string) (string, error) 
 		base = envelope
 	}
 
-	// Canonicalize envelope and base first so that symlinked workspace
-	// roots (e.g., /tmp → /private/tmp on macOS) don't cause false
-	// rejections and so the post-resolution containment check below
-	// compares like with like.
-	canonEnvelope, err := filepath.EvalSymlinks(envelope)
-	if err != nil {
-		canonEnvelope = filepath.Clean(envelope) // best-effort if envelope doesn't exist yet
-	}
-	canonBase, err := filepath.EvalSymlinks(base)
-	if err != nil {
-		canonBase = filepath.Clean(base) // best-effort if base doesn't exist yet
-	}
+	// Canonicalize envelope and base first via pathutil.NormalizePathForCompare,
+	// which absolutizes before resolving symlinks (falling back to a
+	// best-effort ancestor walk when the path doesn't exist yet). This keeps
+	// symlinked workspace roots (e.g., /tmp → /private/tmp on macOS) from
+	// causing false rejections, keeps a relative envelope/base (e.g. ".")
+	// from staying relative while a resolved target becomes absolute via a
+	// symlink — which broke filepath.Rel in the containment checks below —
+	// and ensures the post-resolution containment check compares like with
+	// like.
+	//
+	// NormalizePathForCompare does more than absolutize-and-resolve: on
+	// darwin it also collapses the /private/tmp and /private/var host
+	// aliases back to /tmp and /var, which is the REVERSE direction from
+	// bare filepath.EvalSymlinks. Any value compared against canonEnvelope
+	// or canonBase must therefore go through pathutil too — a bare
+	// EvalSymlinks result is in a different convention and will mismatch on
+	// darwin even when the paths name the same location.
+	canonEnvelope := pathutil.NormalizePathForCompare(envelope)
+	canonBase := pathutil.NormalizePathForCompare(base)
 
 	var absPath string
 	if filepath.IsAbs(conditionPath) {
@@ -231,6 +390,11 @@ func ResolveConditionPath(envelope, base, conditionPath string) (string, error) 
 
 	// Resolve symlinks to the real path. Scripts may be symlinked from
 	// a shared tooling directory (e.g., ~/tooling/scripts/).
+	// canonical-path-exception: existence/resolvability only, not comparison
+	// preparation. This call's error path is the behavior — a dangling or
+	// unresolvable conditionPath must fail gate resolution here, so it
+	// cannot be replaced with pathutil.NormalizePathForCompare, which never
+	// errors.
 	resolved, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		return "", fmt.Errorf("resolving gate condition path: %w", err)
@@ -241,8 +405,16 @@ func ResolveConditionPath(envelope, base, conditionPath string) (string, error) 
 	// Re-validate the symlink-resolved path against the same envelope-OR-base
 	// rule to close the symlink-escape gap (gastownhall/gascity#2354 review).
 	// Absolute paths still skip — same rationale as the pre-resolution check.
+	//
+	// Use pathutil.PathWithin rather than the lexical containedIn: resolved
+	// comes from bare filepath.EvalSymlinks, so on darwin it carries the
+	// /private prefix that canonEnvelope/canonBase have had collapsed away.
+	// PathWithin normalizes both operands, so the alias collapse applies
+	// symmetrically. (The pre-resolution check above keeps containedIn:
+	// absPath is derived from canonBase, so both sides already share a
+	// convention there.)
 	if !filepath.IsAbs(conditionPath) {
-		if !containedIn(resolved, canonEnvelope) && !containedIn(resolved, canonBase) {
+		if !pathutil.PathWithin(canonEnvelope, resolved) && !pathutil.PathWithin(canonBase, resolved) {
 			return "", fmt.Errorf("resolving gate condition path: symlink target outside containment: %s", conditionPath)
 		}
 	}
@@ -253,13 +425,29 @@ func ResolveConditionPath(envelope, base, conditionPath string) (string, error) 
 		return "", fmt.Errorf("resolving gate condition path: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("resolving gate condition path: not a regular file: %s", resolved)
+		return "", fmt.Errorf("resolving gate condition path: %w: %s", ErrConditionNotRegular, resolved)
 	}
 	if info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("resolving gate condition path: file is not executable: %s", resolved)
+		return "", fmt.Errorf("resolving gate condition path: %w: %s", ErrConditionNotExecutable, resolved)
 	}
 
 	return resolved, nil
+}
+
+// IsConditionUnlaunchable reports whether err, as returned by
+// ResolveConditionPath, means the declared condition names nothing that can be
+// executed: the target is missing (including a dangling symlink), is not a
+// regular file, or is not executable. These are repaired out of band (ship the
+// script, chmod it) and never by re-running. Containment refusals (traversal,
+// symlink escape) and argument errors are deliberately not unlaunchable, with
+// one exception: a dangling symlink whose absent target lies outside
+// containment still reports unlaunchable, because the post-resolution
+// containment check needs a resolved target and a dangling link has none. Once
+// that target exists, the same path is a containment refusal.
+func IsConditionUnlaunchable(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, ErrConditionNotRegular) ||
+		errors.Is(err, ErrConditionNotExecutable)
 }
 
 // RunCondition executes a gate condition script with the given environment.
