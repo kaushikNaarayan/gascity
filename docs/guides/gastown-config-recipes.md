@@ -58,7 +58,7 @@ source = "https://github.com/gastownhall/gascity-packs/tree/main/gastown"
 version = "sha:33d3a430a67d1782ad364556cb566bdb01d0afe3"
 
 [[rigs.patches]]
-agent = "gastown.polecat"
+agent = "polecat"
 
 [rigs.patches.pool]
 max = 10
@@ -76,7 +76,7 @@ source = "https://github.com/gastownhall/gascity-packs/tree/main/gastown"
 version = "sha:33d3a430a67d1782ad364556cb566bdb01d0afe3"
 
 [[rigs.patches]]
-agent = "gastown.polecat"
+agent = "polecat"
 provider = "codex"
 ```
 
@@ -130,7 +130,7 @@ source = "https://github.com/gastownhall/gascity-packs/tree/main/gastown"
 version = "sha:33d3a430a67d1782ad364556cb566bdb01d0afe3"
 
 [[rigs.patches]]
-agent = "gastown.refinery"
+agent = "refinery"
 idle_timeout = "4h"
 ```
 
@@ -176,7 +176,7 @@ agent. Override it per rig:
 name = "myproject"
 
 [[rigs.patches]]
-agent = "gastown.polecat"
+agent = "polecat"
 default_sling_formula = "mol-scoped-work"
 ```
 

@@ -247,12 +247,16 @@ For rig-specific customization, patch under the rig:
 name = "backend"
 
 [[rigs.patches]]
-agent = "gastown.polecat"
+agent = "polecat"
 provider = "gemini"
 
 [rigs.patches.pool]
 max = 8
 ```
+
+A rig patch names the agent by its bare name (`polecat`), not the
+binding-qualified `gastown.polecat` that a city-level `[[patches.agent]]`
+uses.
 
 ## Formula and Order Files
 
