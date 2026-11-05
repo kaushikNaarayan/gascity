@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	beadslib "github.com/steveyegge/beads"
 )
 
 type idleProbeConn struct{ closed *atomic.Int32 }
@@ -86,5 +88,42 @@ func TestNativeDoltConnMaxIdleBelowReadTimeout(t *testing.T) {
 	readTimeout := 15000 * time.Millisecond
 	if nativeDoltConnMaxIdleTime >= readTimeout/2 {
 		t.Fatalf("idle %v must be < half of read_timeout %v", nativeDoltConnMaxIdleTime, readTimeout)
+	}
+}
+
+// idleWiringStorage is a beadslib.Storage that exposes its *sql.DB the way the
+// real server-mode DoltStore does. Only DB() is exercised on this path.
+type idleWiringStorage struct {
+	beadslib.Storage
+	db *sql.DB
+}
+
+func (s idleWiringStorage) DB() *sql.DB { return s.db }
+
+// openNativeStorage is the single seam through which every native open and
+// reconnect passes. This pins that it applies the idle bound: deleting the
+// boundNativeConnIdle call there must fail this test, otherwise the gcf-b3kkh
+// fix silently becomes a no-op while the helper tests stay green.
+func TestOpenNativeStorageBoundsPoolIdle(t *testing.T) {
+	var closed atomic.Int32
+	db := sql.OpenDB(idleProbeConnector{closed: &closed})
+	defer func() { _ = db.Close() }()
+
+	oldOpen := nativeDoltOpenBestAvailable
+	oldIdle := nativeDoltConnMaxIdleTime
+	t.Cleanup(func() {
+		nativeDoltOpenBestAvailable = oldOpen
+		nativeDoltConnMaxIdleTime = oldIdle
+	})
+	nativeDoltConnMaxIdleTime = 50 * time.Millisecond
+	nativeDoltOpenBestAvailable = func(context.Context, string) (beadslib.Storage, error) {
+		return idleWiringStorage{db: db}, nil
+	}
+
+	if _, _, err := openNativeStorage(context.Background(), t.TempDir(), map[string]string{}, false); err != nil {
+		t.Fatalf("openNativeStorage: %v", err)
+	}
+	if got := pingAndIdle(t, db, &closed, 2200*time.Millisecond); got == 0 {
+		t.Fatal("openNativeStorage did not bound the pool idle time: idle connection was not retired")
 	}
 }

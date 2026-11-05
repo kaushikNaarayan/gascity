@@ -360,8 +360,9 @@ func OpenNativeStorage(ctx context.Context, scopeRoot string, env map[string]str
 // idle connection. beads v1.1.1 defaults to 20s with liveness checks off, which
 // outlives the managed Dolt listener read_timeout (15s default): the server
 // reaps the socket first and the next query on it fails with EOF (gcf-b3kkh).
-// Keep this well under config.DefaultDoltReadTimeoutMillis.
-const nativeDoltConnMaxIdleTime = 5 * time.Second
+// Keep this well under config.DefaultDoltReadTimeoutMillis. A var only so the
+// wiring test can shorten it; production code never reassigns it.
+var nativeDoltConnMaxIdleTime = 5 * time.Second
 
 // boundNativeConnIdle sets the pool idle bound on storages that expose their
 // *sql.DB (beads RawDBAccessor) without forking beads. Storages without it are
