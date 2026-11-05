@@ -30,6 +30,12 @@ esac
 # shellcheck disable=SC1091
 . "$__SCRIPT_DIR/order_outcome.sh"
 
+# Run the whole sweep (and every gc child it forks per rig) at background CPU
+# and IO priority so it never competes with interactive agent work. Best-effort:
+# hosts without renice/ionice still run the sweep.
+renice -n 10 -p "$$" >/dev/null 2>&1 || true
+ionice -c3 -p "$$" >/dev/null 2>&1 || true
+
 # Where the recovery summary goes. Cities that staff a coordinator role (e.g.
 # the gastown pack's mayor) can point this at it; "human" is the reserved
 # recipient alias that resolves in every city, including core-only ones.
