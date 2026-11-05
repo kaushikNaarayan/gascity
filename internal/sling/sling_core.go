@@ -29,6 +29,11 @@ const (
 	sourceWorkflowLaunchVisibilityRetryDelay = 100 * time.Millisecond
 )
 
+// attachFormulaTimeout bounds attaching a formula to a bead (source-workflow
+// lock wait plus instantiation). Without it a held lock blocks gc sling
+// forever and the synthetic input convoy minted for the attach is orphaned.
+var attachFormulaTimeout = 60 * time.Second
+
 func depsTracef(deps SlingDeps, format string, args ...any) {
 	if deps.Tracer != nil {
 		deps.Tracer(format, args...)
@@ -487,24 +492,35 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 // prefix ("formula" vs "default formula"); graph-vs-legacy behavior is
 // byte-identical across both entry points.
 func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID, formulaName, method, errLabel string, result SlingResult) (SlingResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), attachFormulaTimeout)
+	defer cancel()
+	result, err := attachFormulaToBeadCtx(ctx, opts, deps, querier, beadID, formulaName, method, errLabel, result)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		return result, fmt.Errorf("attaching %s %q to %s timed out after %s (another gc sling or workflow launch on this bead may be holding its source-workflow lock, or the bead store is unresponsive): %w",
+			errLabel, formulaName, beadID, attachFormulaTimeout, err)
+	}
+	return result, err
+}
+
+func attachFormulaToBeadCtx(ctx context.Context, opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID, formulaName, method, errLabel string, result SlingResult) (SlingResult, error) {
 	a := opts.Target
 	formulaVars := BuildSlingFormulaVars(formulaName, beadID, opts.Vars, a, deps)
 	searchPaths := SlingFormulaSearchPaths(deps, a)
-	graphInv, isGraph, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, beadID, opts, deps, a)
+	graphInv, isGraph, err := prepareGraphV2FormulaInvocation(ctx, formulaName, beadID, opts, deps, a)
 	if err != nil {
 		return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 	}
 	if isGraph {
 		formulaVars = graphInv.Vars
 		result.Deprecations = append(result.Deprecations, graphInv.Deprecations...)
-		if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
+		if err := validateSlingFormulaRuntimeVars(ctx, formulaName, searchPaths, molecule.Options{
 			Title: opts.Title,
 			Vars:  formulaVars,
 		}); err != nil {
 			graphv2.CloseSyntheticInputConvoy(deps.Store, graphInv.InputConvoy, beadID)
 			return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 		}
-		lockedResult, lockedErr := withGraphV2SourceWorkflowLock(context.Background(), deps, beadID, func() (SlingResult, error) {
+		lockedResult, lockedErr := withGraphV2SourceWorkflowLock(ctx, deps, beadID, func() (SlingResult, error) {
 			if err := CheckNoMoleculeChildrenAllowLiveWorkflow(querier, beadID, deps.Store, &result); err != nil {
 				return result, fmt.Errorf("%w", err)
 			}
@@ -523,7 +539,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			if err != nil {
 				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 			}
-			mResult, err := InstantiateSlingFormula(context.Background(), formulaName, searchPaths, molecule.Options{
+			mResult, err := InstantiateSlingFormula(ctx, formulaName, searchPaths, molecule.Options{
 				Title:            opts.Title,
 				Vars:             formulaVars,
 				PriorityOverride: BeadPriorityOverride(deps.Store, graphInv.InputConvoy),
@@ -560,7 +576,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		}
 		return lockedResult, lockedErr
 	}
-	if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
+	if err := validateSlingFormulaRuntimeVars(ctx, formulaName, searchPaths, molecule.Options{
 		Title: opts.Title,
 		Vars:  formulaVars,
 	}); err != nil {
@@ -574,7 +590,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		return result, fmt.Errorf("%w", err)
 	}
 	run := func() (SlingResult, error) {
-		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             formulaVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
@@ -607,7 +623,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		return finalize(opts, deps, beadID, method, result)
 	}
 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
-		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             formulaVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
@@ -620,7 +636,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	if !isGraph {
 		return run()
 	}
-	return withSourceWorkflowLaunchLock(context.Background(), deps, beadID, opts.Force, runGraph)
+	return withSourceWorkflowLaunchLock(ctx, deps, beadID, opts.Force, runGraph)
 }
 
 // slingPlainBead handles plain bead routing (no formula).
