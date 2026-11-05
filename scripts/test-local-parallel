@@ -23,6 +23,9 @@ fi
 mode="$1"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# shellcheck source=gt2-test-guard.sh
+source "$repo_root/scripts/gt2-test-guard.sh"
+assert_not_gt2_heavy_run || exit 1
 # shellcheck source=lib/test-slice.sh
 source "$repo_root/scripts/lib/test-slice.sh"
 gc_test_slice_reexec "$repo_root/scripts/test-local-parallel" "$@"
