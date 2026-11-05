@@ -530,10 +530,19 @@ func beadMatchesNamedSessionResolutionFilter(b beads.Bead, identity, sessionName
 	return false
 }
 
-// FindNamedSessionConflict finds the first live session bead that blocks a configured named session.
+// FindNamedSessionConflict finds the first live session bead that blocks a
+// configured named session. A candidate must also be continuity-eligible
+// (see NamedSessionContinuityEligible) to count: this mirrors
+// FindCanonicalNamedSessionBead's own canonical-eligibility gate. Without
+// this, an OPEN bead in a continuity-ineligible shape (state=failed-create,
+// or continuity_eligible=false explicitly) could never be canonical yet
+// could still permanently block re-materialization via the alias/session-name
+// conflict clauses in BeadConflictsWithNamedSession -- with no error and no
+// trace record, since the mode="always" gate in buildDesiredState never
+// executes on a conflict (gcf-i93).
 func FindNamedSessionConflict(candidates []beads.Bead, spec NamedSessionSpec) (beads.Bead, bool) {
 	for _, b := range candidates {
-		if !IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+		if !IsSessionBeadOrRepairable(b) || b.Status == "closed" || !NamedSessionContinuityEligible(b) {
 			continue
 		}
 		if BeadConflictsWithNamedSession(b, spec) {
@@ -545,10 +554,11 @@ func FindNamedSessionConflict(candidates []beads.Bead, spec NamedSessionSpec) (b
 
 // FindNamedSessionConflictInfo is the session.Info mirror of
 // FindNamedSessionConflict: it finds the first live session Info that blocks a
-// configured named session.
+// configured named session. See FindNamedSessionConflict's doc for why a
+// candidate must also be continuity-eligible.
 func FindNamedSessionConflictInfo(candidates []Info, spec NamedSessionSpec) (Info, bool) {
 	for _, i := range candidates {
-		if !IsSessionBeadOrRepairableInfo(i) || i.Closed {
+		if !IsSessionBeadOrRepairableInfo(i) || i.Closed || !NamedSessionInfoContinuityEligible(i) {
 			continue
 		}
 		if InfoConflictsWithNamedSession(i, spec) {
