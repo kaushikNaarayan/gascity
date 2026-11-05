@@ -423,6 +423,14 @@ func dispatchNudgeTargetBounded(target nudgeTarget, store, sessStore beads.Store
 // a pass that delivered nothing for a busy seat. Any read error answers false: the
 // patrol tick remains the backstop.
 func queuedNudgesStillDue(cityPath string, now time.Time) bool {
+	return queuedNudgesStillDueExcluding(cityPath, now, nil)
+}
+
+// queuedNudgesStillDueExcluding is queuedNudgesStillDue ignoring the item IDs in
+// skip: items the dispatcher knows can never claim this pass (fenced to a closed
+// session, parked inside nudgeOrphanGrace). Counting them keeps the retry timer
+// pinned at its ceiling while nothing is deliverable (gcf-puxup.1).
+func queuedNudgesStillDueExcluding(cityPath string, now time.Time, skip map[string]bool) bool {
 	if cityPath == "" {
 		return false
 	}
@@ -431,7 +439,7 @@ func queuedNudgesStillDue(cityPath string, now time.Time) bool {
 		return false
 	}
 	live := func(it nudgequeue.Item) bool {
-		return it.Agent != "" && (it.ExpiresAt.IsZero() || it.ExpiresAt.After(now))
+		return it.Agent != "" && !skip[it.ID] && (it.ExpiresAt.IsZero() || it.ExpiresAt.After(now))
 	}
 	for _, it := range state.Pending {
 		if live(it) && (it.DeliverAfter.IsZero() || !it.DeliverAfter.After(now)) {

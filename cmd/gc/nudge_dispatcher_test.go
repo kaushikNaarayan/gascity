@@ -284,7 +284,7 @@ func TestNudgeDispatchSessionSnapshotExactFenceAvoidsFullList(t *testing.T) {
 	cr := &CityRuntime{cityPath: dir, standaloneCityStore: store, cfg: &config.City{Daemon: config.DaemonConfig{NudgeDispatcher: "supervisor"}, Agents: []config.Agent{{Name: "worker", Provider: "codex"}}}, sp: fake}
 	old := nudgeDispatchFullSnapshot
 	t.Cleanup(func() { nudgeDispatchFullSnapshot = old })
-	nudgeDispatchFullSnapshot = func(*CityRuntime) *sessionBeadSnapshot {
+	nudgeDispatchFullSnapshot = func(*CityRuntime, *config.City) *sessionBeadSnapshot {
 		t.Fatal("full session list touched for exact fence")
 		return nil
 	}
@@ -327,7 +327,7 @@ func TestNudgeDispatchSessionSnapshotAliasFallsBackToFullList(t *testing.T) {
 	old := nudgeDispatchFullSnapshot
 	t.Cleanup(func() { nudgeDispatchFullSnapshot = old })
 	fullListCalls := 0
-	nudgeDispatchFullSnapshot = func(*CityRuntime) *sessionBeadSnapshot {
+	nudgeDispatchFullSnapshot = func(*CityRuntime, *config.City) *sessionBeadSnapshot {
 		fullListCalls++
 		return newSessionBeadSnapshotFromInfos(nil)
 	}

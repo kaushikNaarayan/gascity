@@ -114,7 +114,14 @@ func (cr *CityRuntime) graphBeadStore() beads.GraphStore {
 // Returned as the strongly-typed beads.SessionStore so the session class stays
 // statically visible; the wrapper carries the same underlying store value.
 func (cr *CityRuntime) sessionsBeadStore() beads.SessionStore {
-	return beads.SessionStore{Store: resolveSessionStore(cr.storageRoutes, cr.cityBeadStore(), cr.cfg, cr.cityPath, cr.rec)}
+	return cr.sessionsBeadStoreFor(cr.cfg)
+}
+
+// sessionsBeadStoreFor is sessionsBeadStore resolved against a caller-held cfg
+// snapshot, for goroutines that must not read cr.cfg while config reload swaps
+// it (the nudge wake worker, gcf-puxup.1).
+func (cr *CityRuntime) sessionsBeadStoreFor(cfg *config.City) beads.SessionStore {
+	return beads.SessionStore{Store: resolveSessionStore(cr.storageRoutes, cr.cityBeadStore(), cfg, cr.cityPath, cr.rec)}
 }
 
 // mailBeadStore returns the runtime's mail (message) bead store: the configured
@@ -132,7 +139,12 @@ func (cr *CityRuntime) mailBeadStore() beads.MailStore {
 // strongly-typed beads.NudgesStore so the nudges class stays statically visible;
 // the wrapper carries the same underlying store value.
 func (cr *CityRuntime) nudgesBeadStore() beads.NudgesStore {
-	return beads.NudgesStore{Store: resolveNudgesStore(cr.storageRoutes, cr.cityBeadStore(), cr.cfg, cr.cityPath, cr.rec)}
+	return cr.nudgesBeadStoreFor(cr.cfg)
+}
+
+// nudgesBeadStoreFor is nudgesBeadStore resolved against a caller-held cfg snapshot.
+func (cr *CityRuntime) nudgesBeadStoreFor(cfg *config.City) beads.NudgesStore {
+	return beads.NudgesStore{Store: resolveNudgesStore(cr.storageRoutes, cr.cityBeadStore(), cfg, cr.cityPath, cr.rec)}
 }
 
 // ordersBeadStore returns the runtime's order-tracking bead store for the given

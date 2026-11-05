@@ -208,6 +208,7 @@ type CityRuntime struct {
 	nudgeRetryMu        sync.Mutex                   // guards nudgeRetryTimer and nudgeRetryDelay
 	nudgeRetryTimer     *time.Timer                  // pending re-arm of the nudge dispatcher (gcf-adu3i)
 	nudgeRetryDelay     time.Duration                // current retry backoff; 0 = not retrying
+	nudgePassAbandoned  atomic.Bool                  // the in-flight pass was given up on by its tick; it re-wakes itself on return (gcf-x6ne2)
 	nudgePassInFlight   atomic.Bool                  // a nudge dispatch pass is running (or was abandoned still running); single-flight (gcf-x6ne2)
 	reloadMu            sync.Mutex                   // guards activeReload
 	activeReload        *reloadRequest
@@ -799,6 +800,11 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		if _, err := startNudgeWakeListener(ctx, cr.cityPath, cr.nudgeWakeCh, cr.stderr, cr.logPrefix); err != nil {
 			fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v (falling back to patrol-only delivery)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
 		}
+		// Drain wakes on their own goroutine so a long reconcile tick in the
+		// main select loop cannot delay delivery to a live idle seat
+		// (gcf-puxup.1). nudgeWakeCh has capacity 1, so wakes coalesce; passes
+		// skip (and re-arm) while a pass is in flight, never block (nudgePassInFlight).
+		go cr.runNudgeWakeDrain(ctx)
 	}
 
 	// Reload acceptance runs on its own goroutine so that a slow tick
@@ -855,10 +861,6 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			pokeDB.arm(debounce)
 		case <-pokeDB.fired():
 			runTick("poke")
-		case <-cr.nudgeWakeCh:
-			cr.safeTick(func() {
-				cr.nudgeDispatchTick(ctx)
-			}, "nudge-wake")
 		case <-cr.controlDispatcherCh:
 			ctrlDB.arm(debounce)
 		case <-ctrlDB.fired():
@@ -1514,8 +1516,21 @@ func (cr *CityRuntime) tick(
 	tickCompleted = true
 }
 
-var nudgeDispatchFullSnapshot = func(cr *CityRuntime) *sessionBeadSnapshot {
-	return cr.loadSessionBeadSnapshot()
+// nudgeDispatchFullSnapshot loads the authoritative full session snapshot for
+// the nudge dispatcher against the caller-held cfg snapshot, never cr.cfg: the
+// dispatcher runs on the wake goroutine while config reload swaps cr.cfg under
+// serviceStateMu (gcf-puxup.1, qa race on a4c703be5).
+var nudgeDispatchFullSnapshot = func(cr *CityRuntime, cfg *config.City) *sessionBeadSnapshot {
+	store := cr.sessionsBeadStoreFor(cfg)
+	if store.Store == nil {
+		return nil
+	}
+	sessionBeads, err := loadSessionBeadSnapshot(store.Store)
+	if err != nil {
+		fmt.Fprintf(cr.stderr, "%s: loading session beads: %v\n", cr.logPrefix, err) //nolint:errcheck
+		return nil
+	}
+	return sessionBeads
 }
 
 // nudgeDispatchSessionSnapshot avoids the reconcile-wide session list on the
@@ -1524,6 +1539,13 @@ var nudgeDispatchFullSnapshot = func(cr *CityRuntime) *sessionBeadSnapshot {
 // snapshot: aliases are mutable and cannot be resolved safely from a queue
 // record alone.
 func (cr *CityRuntime) nudgeDispatchSessionSnapshot() *sessionBeadSnapshot {
+	cfg, _ := cr.nudgeServiceSnapshot()
+	return cr.nudgeDispatchSessionSnapshotFor(cfg)
+}
+
+// nudgeDispatchSessionSnapshotFor is nudgeDispatchSessionSnapshot against a
+// caller-held cfg snapshot.
+func (cr *CityRuntime) nudgeDispatchSessionSnapshotFor(cfg *config.City) *sessionBeadSnapshot {
 	state, err := nudgequeue.LoadState(cr.cityPath)
 	if err != nil {
 		return nil
@@ -1542,7 +1564,7 @@ func (cr *CityRuntime) nudgeDispatchSessionSnapshot() *sessionBeadSnapshot {
 	}
 	for _, item := range state.Pending {
 		if !collect(item) {
-			return nudgeDispatchFullSnapshot(cr)
+			return nudgeDispatchFullSnapshot(cr, cfg)
 		}
 	}
 	// An expired claim is retried by dispatchAllQueuedNudges in the same tick,
@@ -1552,18 +1574,18 @@ func (cr *CityRuntime) nudgeDispatchSessionSnapshot() *sessionBeadSnapshot {
 			continue
 		}
 		if !collect(item) {
-			return nudgeDispatchFullSnapshot(cr)
+			return nudgeDispatchFullSnapshot(cr, cfg)
 		}
 	}
 	if len(ids) == 0 {
 		return newSessionBeadSnapshotFromInfos(nil)
 	}
-	front := sessionFrontDoor(cr.sessionsBeadStore().Store)
+	front := sessionFrontDoor(cr.sessionsBeadStoreFor(cfg).Store)
 	infos := make([]sessionpkg.Info, 0, len(ids))
 	for id := range ids {
 		info, getErr := front.Get(id)
 		if getErr != nil {
-			return nudgeDispatchFullSnapshot(cr)
+			return nudgeDispatchFullSnapshot(cr, cfg)
 		}
 		infos = append(infos, info)
 	}
@@ -3404,10 +3426,23 @@ const nudgeBudgetRewakeDelay = time.Second
 // stuck reads cannot pile up), and when it finally returns it re-wakes the
 // dispatcher.
 func (cr *CityRuntime) nudgeDispatchTick(ctx context.Context, phases ...func(name string, d time.Duration)) {
-	if !nudgeDispatcherIsSupervisor(cr.cfg) {
+	// The wake goroutine calls this off the reconciler goroutine, and config
+	// reload swaps cfg/sp under serviceStateMu: take one consistent snapshot and
+	// use it for the whole pass, so a pass never pairs an old cfg with a new sp
+	// (gcf-puxup.1, qa race on 414a27863).
+	cfg, sp := cr.nudgeServiceSnapshot()
+	if !nudgeDispatcherIsSupervisor(cfg) {
 		return
 	}
 	if !cr.nudgePassInFlight.CompareAndSwap(false, true) {
+		// Single-flight (gcf-x6ne2): never block behind a pass, a hung store read
+		// would otherwise stall the wake drain too. A pass that is merely slow
+		// finishes soon, but a wake consumed now would be lost, so re-arm it. An
+		// ABANDONED pass re-wakes when it returns; re-arming here would spin once a
+		// second against a read that never comes back.
+		if !cr.nudgePassAbandoned.Load() {
+			cr.rearmNudgeWake(nudgeBudgetRewakeDelay)
+		}
 		cr.logNudgeTick("nudge dispatcher: previous pass still in flight, skipping tick")
 		return
 	}
@@ -3436,10 +3471,11 @@ func (cr *CityRuntime) nudgeDispatchTick(ctx context.Context, phases ...func(nam
 				panicVal = r
 				mu.Unlock()
 			}
+			cr.nudgePassAbandoned.Store(false)
 			cr.nudgePassInFlight.Store(false)
 			close(done)
 		}()
-		cr.nudgeDispatchPass(ctx, guarded...)
+		cr.nudgeDispatchPassWith(ctx, cfg, sp, guarded...)
 	}()
 	limit := parseNudgeDispatchTickBudget(nil) + nudgeDispatchTickGrace
 	if nudgeDispatchTickHardLimitOverride > 0 {
@@ -3459,6 +3495,7 @@ func (cr *CityRuntime) nudgeDispatchTick(ctx context.Context, phases ...func(nam
 		mu.Lock()
 		abandoned = true
 		mu.Unlock()
+		cr.nudgePassAbandoned.Store(true)
 		cr.logNudgeTick(fmt.Sprintf("nudge dispatcher: pass exceeded %s, abandoned (a store read is not returning); tick continues", limit))
 		go func() {
 			<-done
@@ -3484,37 +3521,89 @@ func (cr *CityRuntime) logNudgeTick(msg string) {
 	}
 }
 
-// nudgeDispatchPass is the body of one dispatch pass; see nudgeDispatchTick.
-func (cr *CityRuntime) nudgeDispatchPass(_ context.Context, phases ...func(name string, d time.Duration)) {
+// runNudgeWakeDrain drains nudgeWakeCh until ctx is done. It runs on its own
+// goroutine so a long reconcile tick cannot delay delivery to a live idle seat
+// (gcf-puxup.1). Each wake runs one tick, which never blocks behind another pass:
+// it skips (and re-arms) while one is in flight, and gives up on a hung one.
+func (cr *CityRuntime) runNudgeWakeDrain(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cr.nudgeWakeCh:
+			cr.safeTick(func() {
+				cr.nudgeDispatchTick(ctx)
+			}, "nudge-wake")
+		}
+	}
+}
+
+// nudgeServiceSnapshot returns cfg and sp as one consistent pair; config reload
+// swaps both under serviceStateMu.
+func (cr *CityRuntime) nudgeServiceSnapshot() (*config.City, runtime.Provider) {
+	cr.serviceStateMu.RLock()
+	defer cr.serviceStateMu.RUnlock()
+	return cr.cfg, cr.sp
+}
+
+// rearmNudgeWake queues one wake after delay; wakes coalesce on the channel.
+func (cr *CityRuntime) rearmNudgeWake(delay time.Duration) {
+	wake := cr.nudgeWakeCh
+	if wake == nil {
+		return
+	}
+	time.AfterFunc(delay, func() {
+		select {
+		case wake <- struct{}{}:
+		default: // a wake is already pending; it will run the pass
+		}
+	})
+}
+
+// nudgeDispatchPass runs one pass against a fresh cfg/sp snapshot.
+func (cr *CityRuntime) nudgeDispatchPass(ctx context.Context, phases ...func(name string, d time.Duration)) {
+	cfg, sp := cr.nudgeServiceSnapshot()
+	cr.nudgeDispatchPassWith(ctx, cfg, sp, phases...)
+}
+
+// nudgeDispatchPassWith is the body of one dispatch pass; see nudgeDispatchTick.
+// cfg and sp are the tick's snapshot and are used for the whole pass.
+func (cr *CityRuntime) nudgeDispatchPassWith(_ context.Context, cfg *config.City, sp runtime.Provider, phases ...func(name string, d time.Duration)) {
 	span := func(name string, start time.Time) {
 		for _, f := range phases {
 			f(name, time.Since(start))
 		}
 	}
 	delivered := 0
+	var parked map[string]bool
 	// Whatever happens below, if due items are still queued afterwards (a seat was
 	// mid-turn when the pass ran, so the quiescence gate refused it), re-arm: without
 	// this nothing retries until an unrelated enqueue or the patrol tick (gcf-adu3i).
 	defer func() {
 		retryStart := time.Now()
-		cr.scheduleNudgeRetry(delivered)
+		cr.scheduleNudgeRetryExcluding(delivered, parked)
 		span("retry_schedule", retryStart)
 	}()
+	// Items fenced to a closed session never claim: re-fence them to the agent's
+	// live session or dead-letter them before the dispatch pass (gcf-puxup.1).
+	sweepStart := time.Now()
+	parked = cr.sweepOrphanedNudges(cfg, time.Now())
+	span("orphan_sweep", sweepStart)
 	// Nudge ops route through the nudges accessor; the session snapshot it pairs
 	// them with is loaded via the sessions accessor inside loadSessionBeadSnapshot.
 	// Both collapse to the city store today.
-	store := cr.nudgesBeadStore()
+	store := cr.nudgesBeadStoreFor(cfg)
 	if store.Store == nil {
 		return
 	}
 	snapshotStart := time.Now()
-	sessionBeads := cr.nudgeDispatchSessionSnapshot()
+	sessionBeads := cr.nudgeDispatchSessionSnapshotFor(cfg)
 	span("session_snapshot", snapshotStart)
 	if sessionBeads == nil {
 		return
 	}
 	passStart := time.Now()
-	out, err := dispatchAllQueuedNudgesBudgeted(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr, parseNudgeDispatchTickBudget(cr.stderr))
+	out, err := dispatchAllQueuedNudgesBudgeted(cr.cityPath, cfg, store.Store, cr.sessionsBeadStoreFor(cfg).Store, sp, sessionBeads, cr.stderr, parseNudgeDispatchTickBudget(cr.stderr))
 	span("dispatch_pass", passStart)
 	delivered = out.Delivered
 	if err != nil {
@@ -3549,13 +3638,19 @@ var (
 // target costs one cheap pass per nudgeRetryMaxDelay. Nothing is re-queued here:
 // the pass itself still claims each item exactly once.
 func (cr *CityRuntime) scheduleNudgeRetry(delivered int) {
+	cr.scheduleNudgeRetryExcluding(delivered, nil)
+}
+
+// scheduleNudgeRetryExcluding is scheduleNudgeRetry ignoring the queue item IDs in
+// skip when deciding whether anything is still due.
+func (cr *CityRuntime) scheduleNudgeRetryExcluding(delivered int, skip map[string]bool) {
 	cr.nudgeRetryMu.Lock()
 	defer cr.nudgeRetryMu.Unlock()
 	if cr.nudgeRetryTimer != nil {
 		cr.nudgeRetryTimer.Stop()
 		cr.nudgeRetryTimer = nil
 	}
-	if !queuedNudgesStillDue(cr.cityPath, time.Now()) {
+	if !queuedNudgesStillDueExcluding(cr.cityPath, time.Now(), skip) {
 		cr.nudgeRetryDelay = 0
 		return
 	}

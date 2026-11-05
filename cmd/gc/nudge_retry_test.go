@@ -262,7 +262,7 @@ func TestNudgeDispatchTickReportsSubPhases(t *testing.T) {
 		}
 		got = append(got, name)
 	})
-	want := []string{"session_snapshot", "dispatch_pass", "retry_schedule"}
+	want := []string{"orphan_sweep", "session_snapshot", "dispatch_pass", "retry_schedule"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("phases = %v, want %v", got, want)
 	}
