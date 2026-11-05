@@ -73,52 +73,10 @@ func TestMailboxAddressesCodec(t *testing.T) {
 					"session_name":  "sn-1",
 				},
 			},
-			want: []string{"mayor", "sess-1", "deacon", "polecat"},
-		},
-		{
-			name: "no addresses falls back to session_name",
-			bead: beads.Bead{Metadata: map[string]string{"session_name": "sn-1"}},
-			want: []string{"sn-1"},
-		},
-		{
-			name: "id only",
-			bead: beads.Bead{ID: "sess-1"},
-			want: []string{"sess-1"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := MailboxAddresses(tt.bead); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("MailboxAddresses = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestMailboxAddressesIncludingRuntimeNameCodec pins the API-dup semantics that
-// MailboxAddressesIncludingRuntimeName preserves: unlike MailboxAddresses (the
-// CLI fork, tested above), it appends session_name UNCONDITIONALLY (last),
-// keeping runtime session mailboxes reachable via API reads (bf576b04a).
-func TestMailboxAddressesIncludingRuntimeNameCodec(t *testing.T) {
-	tests := []struct {
-		name string
-		bead beads.Bead
-		want []string
-	}{
-		{
-			name: "session_name appended last even when other addresses resolve",
-			bead: beads.Bead{
-				ID: "sess-1",
-				Metadata: map[string]string{
-					"alias":         "mayor",
-					"alias_history": "deacon,mayor,polecat",
-					"session_name":  "sn-1",
-				},
-			},
 			want: []string{"mayor", "sess-1", "deacon", "polecat", "sn-1"},
 		},
 		{
-			name: "session_name deduped against primary",
+			name: "no addresses falls back to session_name",
 			bead: beads.Bead{Metadata: map[string]string{"session_name": "sn-1"}},
 			want: []string{"sn-1"},
 		},
@@ -135,8 +93,8 @@ func TestMailboxAddressesIncludingRuntimeNameCodec(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := MailboxAddressesIncludingRuntimeName(tt.bead); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("MailboxAddressesIncludingRuntimeName = %#v, want %#v", got, tt.want)
+			if got := MailboxAddresses(tt.bead); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("MailboxAddresses = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
@@ -197,7 +155,7 @@ func TestStoreMailboxAddressReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MailboxAddresses: %v", err)
 	}
-	if want := []string{"mayor", "sess-1", "deacon"}; !reflect.DeepEqual(addrs, want) {
+	if want := []string{"mayor", "sess-1", "deacon", "sn-1"}; !reflect.DeepEqual(addrs, want) {
 		t.Errorf("MailboxAddresses = %#v, want %#v", addrs, want)
 	}
 

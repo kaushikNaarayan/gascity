@@ -972,7 +972,7 @@ func TestResolveMailTargets_BareRigScopedNamedUsesUniqueLiveConfiguredNamedSessi
 	if target.display != "frontend/rig-worker" {
 		t.Fatalf("display = %q, want frontend/rig-worker", target.display)
 	}
-	want := []string{"frontend/rig-worker", b.ID, "old-frontend-worker"}
+	want := []string{"frontend/rig-worker", b.ID, "old-frontend-worker", "frontend--rig-worker"}
 	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
 		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
 	}
@@ -1018,7 +1018,7 @@ func TestResolveMailTargetsWithConfig_RuntimeNameUsesLiveConfiguredNamedSessionM
 	if target.display != "gcw/gas-city-architect" {
 		t.Fatalf("display = %q, want gcw/gas-city-architect", target.display)
 	}
-	want := []string{"gcw/gas-city-architect", b.ID, "gas-city-architect"}
+	want := []string{"gcw/gas-city-architect", b.ID, "gas-city-architect", "gas-city-wbern/gas-city-architect"}
 	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
 		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
 	}
@@ -1122,7 +1122,7 @@ mode = "always"
 	if target.display != "gcw/gas-city-architect" {
 		t.Fatalf("display = %q, want gcw/gas-city-architect", target.display)
 	}
-	want := []string{"gcw/gas-city-architect", "gc-1", "gas-city-architect"}
+	want := []string{"gcw/gas-city-architect", "gc-1", "gas-city-architect", "gas-city-wbern/gas-city-architect"}
 	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
 		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
 	}

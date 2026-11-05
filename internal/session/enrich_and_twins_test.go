@@ -183,8 +183,5 @@ func TestMailboxInfoTwinsMatchBeadForms(t *testing.T) {
 		if got, want := MailboxAddressesFromInfo(info), MailboxAddresses(b); !reflect.DeepEqual(got, want) {
 			t.Errorf("shape %d: MailboxAddressesFromInfo=%#v, MailboxAddresses=%#v", i, got, want)
 		}
-		if got, want := MailboxAddressesIncludingRuntimeNameFromInfo(info), MailboxAddressesIncludingRuntimeName(b); !reflect.DeepEqual(got, want) {
-			t.Errorf("shape %d: ...IncludingRuntimeNameFromInfo=%#v, ...IncludingRuntimeName=%#v", i, got, want)
-		}
 	}
 }
