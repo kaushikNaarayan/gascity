@@ -233,6 +233,78 @@ func TestRestartRefusesRecentENOSPCUnlessForced(t *testing.T) {
 	}
 }
 
+// writeStaleENOSPCLog seeds the dolt log with an ENOSPC line so the restart
+// guard refuses, and returns nothing: the cases below only differ in the
+// free-space floor they set.
+func writeStaleENOSPCLog(t *testing.T, cityPath string) {
+	t.Helper()
+	logPath := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "dolt.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir dolt log dir: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("fatal: no space left on device\n"), 0o644); err != nil {
+		t.Fatalf("write dolt log: %v", err)
+	}
+}
+
+// TestRestartENOSPCRefusalReportsCurrentFreeSpace pins that the refusal says
+// what the disk looks like NOW. The guard only reads log history, so with
+// plenty of free space the ENOSPC line may be stale server state (the wedge
+// the restart command exists for); the message must say so and still refuse
+// without --force.
+func TestRestartENOSPCRefusalReportsCurrentFreeSpace(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	writeStaleENOSPCLog(t, cityPath)
+
+	// A 1-byte floor makes any real filesystem count as having room.
+	out, err := runRestartWithEnv(t, cityPath, root, []string{
+		fmt.Sprintf("GC_DOLT_PORT=%d", port), "GC_DOLT_MIN_FREE_BYTES=1",
+	})
+	if err == nil {
+		t.Fatalf("restart must still refuse without --force:\n%s", out)
+	}
+	for _, want := range []string{"free on", "may be stale"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("refusal with ample free space lacks %q; output:\n%s", want, out)
+		}
+	}
+	if data, err := os.ReadFile(bdLog); err == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("restart invoked gc-beads-bd despite refusal; ops log:\n%s", data)
+	}
+}
+
+// TestRestartENOSPCRefusalStaysFirmWhenDiskIsLow pins the other side: when
+// current free space is below the managed-Dolt floor the ENOSPC evidence is
+// plausible, so the message must not call it stale.
+func TestRestartENOSPCRefusalStaysFirmWhenDiskIsLow(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	writeStaleENOSPCLog(t, cityPath)
+
+	// A floor no filesystem reaches makes the disk count as low.
+	out, err := runRestartWithEnv(t, cityPath, root, []string{
+		fmt.Sprintf("GC_DOLT_PORT=%d", port), "GC_DOLT_MIN_FREE_BYTES=999999999999999999",
+	})
+	if err == nil {
+		t.Fatalf("restart must refuse without --force:\n%s", out)
+	}
+	if !strings.Contains(string(out), "free on") {
+		t.Fatalf("refusal lacks the current free space; output:\n%s", out)
+	}
+	if strings.Contains(string(out), "may be stale") {
+		t.Fatalf("low-disk refusal must not call the evidence stale; output:\n%s", out)
+	}
+}
+
 // TestRestartTreatsLoopbackAndWildcardHostsAsLocalManaged pins the P0.5
 // host-classification contract: the managed-server bind default is
 // 127.0.0.1, and 0.0.0.0 remains the explicit wildcard opt-out — both must

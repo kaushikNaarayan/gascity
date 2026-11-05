@@ -61,10 +61,39 @@ if [ ! -f "$BD_SCRIPT_DIR/dolt-enospc.sh" ]; then
 fi
 . "$BD_SCRIPT_DIR/dolt-enospc.sh"
 
+# free_bytes_on prints the bytes available to this user on the filesystem
+# holding $1, or nothing when df cannot say.
+free_bytes_on() {
+  free_kib=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$free_kib" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  echo $((free_kib * 1024))
+}
+
 if recovery_should_skip_due_to_enospc; then
   if [ "$force_restart" != "true" ]; then
     echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2
-    echo "  free disk space, then run gc dolt restart --force only if a restart is still required" >&2
+    # The guard reads log history only. Report what the disk looks like now so
+    # the operator can tell real exhaustion from a wedged server that keeps
+    # failing writes after disk pressure has cleared (the case restart exists
+    # for; see the header and gastownhall/gascity#2158).
+    free_dir="$(dirname "$LOG_FILE")"
+    free_bytes="$(free_bytes_on "$free_dir")"
+    # Same floor the managed-Dolt disk preflight uses (cmd/gc/dolt_disk_preflight.go).
+    case "${GC_DOLT_MIN_FREE_BYTES:-}" in
+      ''|*[!0-9]*) floor_bytes=$((500 * 1024 * 1024)) ;;
+      *) floor_bytes="$GC_DOLT_MIN_FREE_BYTES" ;;
+    esac
+    if [ -z "$free_bytes" ]; then
+      echo "  free disk space, then run gc dolt restart --force only if a restart is still required" >&2
+    elif [ "$free_bytes" -ge "$floor_bytes" ]; then
+      echo "  $((free_bytes / 1048576)) MiB free on $free_dir now (managed-Dolt floor $((floor_bytes / 1048576)) MiB): the ENOSPC line may be stale server state" >&2
+      echo "  if Dolt is still failing writes, run gc dolt restart --force" >&2
+    else
+      echo "  only $((free_bytes / 1048576)) MiB free on $free_dir (managed-Dolt floor $((floor_bytes / 1048576)) MiB)" >&2
+      echo "  free disk space, then run gc dolt restart --force only if a restart is still required" >&2
+    fi
     exit 1
   fi
   echo "gc dolt restart: --force set; restarting despite recent ENOSPC evidence" >&2
