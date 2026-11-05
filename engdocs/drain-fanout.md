@@ -36,11 +36,11 @@ formulas.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `context` | string | Yes | — | `"separate"` creates one item convoy per member; `"shared"` materializes one single-lane item at a time with continuation affinity |
+| `context` | string | No | `"separate"` | `"separate"` creates one item convoy per member; `"shared"` materializes one single-lane item at a time with continuation affinity |
 | `formula` | string | Yes | — | Name of the `graph.v2` formula to run for each item convoy |
 | `member_access` | string | No | — | `"read"` for read-only access; `"exclusive"` records a per-member reservation before materializing item work |
-| `max_units` | int | No | unlimited | Safety cap. Caps one drain expansion to prevent accidental runaway materialization (1–100 in v0) |
-| `on_item_failure` | string | No | — | `"continue"` keeps running remaining items when one fails; `"skip_remaining"` stops |
+| `max_units` | int | No | 100 | Safety cap (1–100 in v0). A drain over the cap closes failed with `limit_exceeded` instead of expanding |
+| `on_item_failure` | string | No | `"continue"` for separate, `"skip_remaining"` for shared | `"continue"` keeps running remaining items when one fails; `"skip_remaining"` stops. Only shared drains read it (see below) |
 | `continuation_group` | string | No | — | Shared execution group suffix; valid only with `context = "shared"` |
 | `[steps.drain.item]` | table | No | — | Per-item execution controls |
 | `[steps.drain.item].single_lane` | bool | No | `false` | Required `true` for shared drains |
@@ -111,8 +111,13 @@ Not in v0. Nested drains are not supported. Item formulas are ordinary
 
 Depends on `on_item_failure`:
 - `"continue"` — remaining items keep running; the drain control step closes
-  with a partial-success outcome after all items finish.
+  with outcome `fail` after all items finish if any item failed. There is no
+  partial-success outcome.
 - `"skip_remaining"` — no new items start after the first failure.
+
+`on_item_failure` only takes effect for `context = "shared"`, where items run
+one at a time. With `context = "separate"` every item workflow is created up
+front, so nothing can be skipped; the setting is not consulted.
 
 **Q: Do drain items respect dependencies between convoy members?**
 
@@ -136,9 +141,10 @@ ordering existed:
 
 **Q: Is there a `max_units` limit?**
 
-In v0, `max_units` must be between 1 and 100. If unset, the drain expands
-to all convoy members. Always set `max_units` in production formulas to
-prevent accidental runaway materialization.
+In v0, `max_units` must be between 1 and 100. If unset it defaults to 100.
+A convoy with more members than the cap closes the drain failed with
+`limit_exceeded`; it does not expand a subset. Set `max_units` explicitly in
+production formulas so the cap is visible to readers.
 
 **Q: Where does the item formula find the work item?**
 
