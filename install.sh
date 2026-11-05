@@ -56,7 +56,13 @@ request. With none of those, the installer fails closed rather than
 guessing. Dolt (dolthub/dolt) and bd (gastownhall/beads) are public and
 always fetched unauthenticated.
 
-Optional environment: GC_INSTALL_REPO, GC_MANIFEST_URL (advanced/test-only
+GC_ONLY=1 installs gc only: bd and Dolt are neither fetched nor touched, no
+bd/Dolt pin or VERSIONS manifest is read, and the live bd/dolt stay
+byte-for-byte as they are. Use it to roll gc while bd is held back. Only
+GC_ONLY=1 enables it (unset or 0 is the normal full install); any other value
+is rejected.
+
+Optional environment: GC_ONLY, GC_INSTALL_REPO, GC_MANIFEST_URL (advanced/test-only
 override for where the VERSIONS manifest is fetched from; defaults to the
 raw VERSIONS file published at this tag in GC_INSTALL_REPO), GH_TOKEN /
 GITHUB_TOKEN (authenticate GC_INSTALL_REPO fetches without the gh CLI).
@@ -73,6 +79,13 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
   echo "Invalid release version: $version" >&2
   exit 2
 fi
+
+gc_only=false
+case "${GC_ONLY:-}" in
+  1) gc_only=true ;;
+  ""|0) ;;
+  *) echo "Invalid GC_ONLY=${GC_ONLY} (only 1 enables gc-only mode; unset or 0 is a full install)." >&2; exit 2 ;;
+esac
 
 # install_dir: never guess at a live toolchain. Defaulting to "wherever gc
 # already runs" is exactly the failure this installer must not repeat
@@ -147,9 +160,9 @@ auth_unavailable_msg="install/authenticate the gh CLI (gh auth login), or export
 # Only fetched when something is actually missing, so a caller who pins
 # every value by hand never touches the network for it.
 need_bd_manifest=false
-if [[ -z "$bd_version" || -z "$bd_sha" ]]; then need_bd_manifest=true; fi
+if ! "$gc_only" && [[ -z "$bd_version" || -z "$bd_sha" ]]; then need_bd_manifest=true; fi
 need_dolt_manifest=false
-if [[ "$os" == linux && ( -z "$dolt_version" || -z "$dolt_sha" ) ]]; then need_dolt_manifest=true; fi
+if ! "$gc_only" && [[ "$os" == linux && ( -z "$dolt_version" || -z "$dolt_sha" ) ]]; then need_dolt_manifest=true; fi
 
 if "$need_bd_manifest" || "$need_dolt_manifest"; then
   manifest_tmp="$(mktemp)"
@@ -235,8 +248,10 @@ fi
 # is recorded without the prefix, e.g. "1.3.0-rc.2") resolve the same asset.
 if [[ -n "$bd_version" && "$bd_version" != v* ]]; then bd_version="v${bd_version}"; fi
 
-[[ -n "$bd_version" ]] || { echo "GC_BD_VERSION is required (not set, and not resolvable from the release manifest)" >&2; exit 2; }
-require_sha "$bd_sha" "GC_BD_SHA256"
+if ! "$gc_only"; then
+  [[ -n "$bd_version" ]] || { echo "GC_BD_VERSION is required (not set, and not resolvable from the release manifest)" >&2; exit 2; }
+  require_sha "$bd_sha" "GC_BD_SHA256"
+fi
 
 # gcf-ocze ruling (option B, 2026-09-08): on darwin the Dolt pin is satisfied
 # by Homebrew, not by this installer. Refuse loudly and name the owner + the
@@ -244,7 +259,11 @@ require_sha "$bd_sha" "GC_BD_SHA256"
 # QA caught in the install-dir default) or silently installing a second dolt
 # that shadows Homebrew's on PATH.
 install_dolt=true
-if [[ "$os" == darwin ]]; then
+install_bd=true
+if "$gc_only"; then
+  install_dolt=false
+  install_bd=false
+elif [[ "$os" == darwin ]]; then
   install_dolt=false
   found="$(command -v dolt 2>/dev/null || true)"
   if [[ -n "$found" ]]; then
@@ -260,7 +279,8 @@ else
   require_sha "$dolt_sha" "GC_DOLT_SHA256"
 fi
 
-binaries=(gc bd)
+binaries=(gc)
+"$install_bd" && binaries+=(bd)
 "$install_dolt" && binaries+=(dolt)
 
 asset="gascity_${version}_${os}_${arch}.tar.gz"
@@ -341,14 +361,16 @@ if "$install_dolt"; then
   install -m 0755 "$dolt_source" "$stage/dolt"
 fi
 
-bd_tuple="${os}_${arch}"
-bd_asset="beads_${bd_version#v}_${bd_tuple}.tar.gz"
-download "https://github.com/gastownhall/beads/releases/download/${bd_version}/${bd_asset}" "$tmp/$bd_asset"
-[[ "$(sha256 "$tmp/$bd_asset")" == "$bd_sha" ]] || { echo "Checksum mismatch for $bd_asset" >&2; exit 1; }
-tar -xzf "$tmp/$bd_asset" -C "$tmp/bd"
-bd_source="$(find "$tmp/bd" -type f -name bd -perm -u+x -print -quit)"
-[[ -n "$bd_source" ]] || { echo "bd archive does not contain executable bd" >&2; exit 1; }
-install -m 0755 "$bd_source" "$stage/bd"
+if "$install_bd"; then
+  bd_tuple="${os}_${arch}"
+  bd_asset="beads_${bd_version#v}_${bd_tuple}.tar.gz"
+  download "https://github.com/gastownhall/beads/releases/download/${bd_version}/${bd_asset}" "$tmp/$bd_asset"
+  [[ "$(sha256 "$tmp/$bd_asset")" == "$bd_sha" ]] || { echo "Checksum mismatch for $bd_asset" >&2; exit 1; }
+  tar -xzf "$tmp/$bd_asset" -C "$tmp/bd"
+  bd_source="$(find "$tmp/bd" -type f -name bd -perm -u+x -print -quit)"
+  [[ -n "$bd_source" ]] || { echo "bd archive does not contain executable bd" >&2; exit 1; }
+  install -m 0755 "$bd_source" "$stage/bd"
+fi
 
 # gcf-vxqx (2026-09-08): the incident swapped in a binary that could not run
 # and still reported success. Prove every staged binary actually executes
@@ -370,7 +392,7 @@ smoke_test() {
 }
 smoke_test "$stage/gc" gc "$version" || { echo "Refusing to install: gc failed its smoke test after download and extraction." >&2; exit 1; }
 "$install_dolt" && { smoke_test "$stage/dolt" dolt "$dolt_version" || { echo "Refusing to install: dolt failed its smoke test after download and extraction." >&2; exit 1; }; }
-smoke_test "$stage/bd" bd "${bd_version#v}" || { echo "Refusing to install: bd failed its smoke test after download and extraction." >&2; exit 1; }
+"$install_bd" && { smoke_test "$stage/bd" bd "${bd_version#v}" || { echo "Refusing to install: bd failed its smoke test after download and extraction." >&2; exit 1; }; }
 
 mkdir -p "$install_dir"
 mkdir -p "$tmp/backups" "$tmp/created"
@@ -423,7 +445,9 @@ if [[ -d "$tmp/backups" ]]; then
   done
 fi
 
-if "$install_dolt"; then
+if "$gc_only"; then
+  echo "Installed gc v${version} to ${install_dir} (GC_ONLY=1: bd and Dolt left untouched)"
+elif "$install_dolt"; then
   echo "Installed gc v${version}, Dolt ${dolt_version}, and bd ${bd_version} to ${install_dir}"
 else
   echo "Installed gc v${version} and bd ${bd_version} to ${install_dir} (Dolt left to Homebrew on darwin)"

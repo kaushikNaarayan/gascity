@@ -1404,3 +1404,99 @@ func TestInstallScriptAuthenticatedFetchFailsClosedWithoutGHOrToken(t *testing.T
 		t.Fatalf("fail-closed message did not name both recovery options, output: %s", got)
 	}
 }
+
+// runInstallGCOnly runs install.sh with GC_ONLY=<gcOnly> against a sandbox
+// that serves ONLY the gc release assets: no bd/Dolt archives, no bd/Dolt
+// pins, and a manifest URL that cannot resolve. It returns the install dir
+// (pre-seeded with old-gc/old-bd/old-dolt) and the combined output.
+func runInstallGCOnly(t *testing.T, gcOnly string) (string, string, error) {
+	t.Helper()
+	root, tmp := repoRoot(t), t.TempDir()
+	fixtures, fake, dir := filepath.Join(tmp, "fixtures"), filepath.Join(tmp, "bin"), filepath.Join(tmp, "install")
+	for _, p := range []string{fixtures, fake, dir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"gc", "dolt", "bd"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("old-"+n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gc := "gascity_1.3.7_linux_amd64.tar.gz"
+	writeArchiveLabel(t, fixtures, gc, "gc", "gc version 1.3.7")
+	data, err := os.ReadFile(filepath.Join(fixtures, gc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtures, "gascity_1.3.7_checksums.txt"), []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(data), gc)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeShim(t, filepath.Join(fake, "uname"), "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Linux; else echo x86_64; fi\n")
+	writeNoGHShim(t, fake)
+	writeShim(t, filepath.Join(fake, "curl"), "#!/bin/sh\nout=\nurl=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then out=$2; shift 2; else url=$1; shift; fi; done\nname=${url##*/}\ncp \"$FIXTURES/$name\" \"$out\"\n")
+	cmd := newInstallCmd(root)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fake+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FIXTURES="+fixtures,
+		"HOME="+tmp,
+		"GC_INSTALL_DIR="+dir,
+		"GC_INSTALL_REPO=example/gascity",
+		"GC_ONLY="+gcOnly,
+		"GC_DOLT_VERSION=", "GC_DOLT_SHA256=", "GC_BD_VERSION=", "GC_BD_SHA256=",
+		"GC_MANIFEST_URL=file:///nonexistent/gcf-g2czv-no-such-manifest/VERSIONS",
+	)
+	out, runErr := runSandboxed(t, cmd, tmp)
+	return dir, string(out), runErr
+}
+
+// TestInstallScriptGCOnlyInstallsGCAndLeavesBDAndDoltAlone is the gcf-g2czv
+// gc-only mode: with GC_ONLY=1 a roll installs gc from its own checksummed
+// archive without any bd/Dolt pin, manifest fetch, or archive, and leaves
+// the live bd and dolt byte-for-byte untouched (bd may be held back).
+func TestInstallScriptGCOnlyInstallsGCAndLeavesBDAndDoltAlone(t *testing.T) {
+	dir, out, err := runInstallGCOnly(t, "1")
+	if err != nil {
+		t.Fatalf("GC_ONLY=1 install failed: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "gc")); !strings.Contains(string(got), "gc version 1.3.7") {
+		t.Fatalf("gc was not replaced, got %q", got)
+	}
+	for _, name := range []string{"bd", "dolt"} {
+		if got, _ := os.ReadFile(filepath.Join(dir, name)); string(got) != "old-"+name {
+			t.Fatalf("GC_ONLY=1 touched %s: %q", name, got)
+		}
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "bd.prev-*")); len(matches) != 0 {
+		t.Fatalf("GC_ONLY=1 wrote a bd backup: %v", matches)
+	}
+	if !strings.Contains(out, "Installed gc v1.3.7") || !strings.Contains(out, "GC_ONLY") {
+		t.Fatalf("output should report a gc-only install, got: %s", out)
+	}
+}
+
+// TestInstallScriptWithoutGCOnlyStillRequiresBDPin guards the default: GC_ONLY
+// unset must not silently relax the bd/Dolt pin requirement.
+func TestInstallScriptWithoutGCOnlyStillRequiresBDPin(t *testing.T) {
+	for _, v := range []string{"", "0"} {
+		dir, out, err := runInstallGCOnly(t, v)
+		if err == nil {
+			t.Fatalf("GC_ONLY=%q install succeeded without bd/Dolt pins: %s", v, out)
+		}
+		if got, _ := os.ReadFile(filepath.Join(dir, "gc")); string(got) != "old-gc" {
+			t.Fatalf("GC_ONLY=%q failed install still replaced gc: %q", v, got)
+		}
+	}
+}
+
+// TestInstallScriptGCOnlyRejectsUnknownValue keeps the switch strict so a typo
+// (GC_ONLY=yes) cannot be mistaken for either mode.
+func TestInstallScriptGCOnlyRejectsUnknownValue(t *testing.T) {
+	dir, out, err := runInstallGCOnly(t, "yes")
+	if err == nil || !strings.Contains(out, "GC_ONLY") {
+		t.Fatalf("GC_ONLY=yes should be rejected naming GC_ONLY, err=%v out=%s", err, out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "gc")); string(got) != "old-gc" {
+		t.Fatalf("rejected install replaced gc: %q", got)
+	}
+}

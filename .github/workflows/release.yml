@@ -68,6 +68,16 @@ jobs:
       - name: Verify release tag is stable
         run: make check-version-tag
 
+      - name: Verify VERSIONS GC_VERSION matches the tag (gcf-g2czv)
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          got="$(grep -E '^GC_VERSION=' VERSIONS | cut -d= -f2)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::VERSIONS GC_VERSION=${got:-<missing>} does not match tag ${GITHUB_REF_NAME}; install.sh reads VERSIONS at the tag and would refuse this release. Re-cut via scripts/bump-version.sh so the bump is in the tagged commit."
+            exit 1
+          fi
+
       - name: Verify release output is ignored
         run: make check-release-dist-ignore
 

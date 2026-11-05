@@ -19,7 +19,11 @@ The homebrew-core submission is [in progress](https://github.com/Homebrew/homebr
 ./scripts/bump-version.sh X.Y.Z --commit --tag --push
 ```
 
-This rewrites the `[Unreleased]` section of `CHANGELOG.md` into `[X.Y.Z] - YYYY-MM-DD`, commits, tags `vX.Y.Z`, and pushes. GitHub Actions takes it from there.
+This rewrites the `[Unreleased]` section of `CHANGELOG.md` into `[X.Y.Z] - YYYY-MM-DD`, sets `GC_VERSION=X.Y.Z` in `VERSIONS`, commits both in one commit, tags `vX.Y.Z` on that commit, and pushes. GitHub Actions takes it from there.
+
+`install.sh` reads `VERSIONS` **at the tag** and refuses a release whose `GC_VERSION` differs, so the bump must be inside the tagged commit, never a follow-up (v1.3.18 was tagged with `GC_VERSION=1.3.16` and could not be installed). `release.yml` fails the release if `VERSIONS` `GC_VERSION` does not match the tag. The script leaves `BD_*`/`DOLT_*` alone: if the town's live bd differs from `VERSIONS`, update `BD_VERSION` and `BD_SHA256_*` and commit that **before** running the script.
+
+To roll gc without touching bd or Dolt (for example while bd is held back), install with `GC_ONLY=1 GC_INSTALL_DIR=<dir> install.sh X.Y.Z`: no bd/Dolt pin or manifest is read and the live bd/dolt are left untouched.
 
 ### Release candidates
 
@@ -124,6 +128,7 @@ Manual `brew bump-formula-pr` is refused for autobump formulae. If the bot stall
 | File | What changes | Updated by |
 |------|-------------|------------|
 | `CHANGELOG.md` | `[Unreleased]` → `[X.Y.Z] - DATE` | `scripts/bump-version.sh` |
+| `VERSIONS` | `GC_VERSION=X.Y.Z` (in the tagged commit) | `scripts/bump-version.sh` |
 | Git tag `vX.Y.Z` | Created and pushed | `scripts/bump-version.sh` |
 | GitHub Release page | Created with binaries + grouped changelog | GoReleaser in `release.yml` |
 | Release SBOM + attestations | SPDX SBOM uploaded and release archives attested | `attest-release` in `release.yml` |
