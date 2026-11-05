@@ -2,7 +2,7 @@
 title: "Messaging"
 ---
 
-> Last verified against code: 2026-04-25
+> Last verified against code: 2026-11-05
 
 ## Summary
 
@@ -17,13 +17,23 @@ is a thin composition layer proving the primitives are sufficient.
 
 - **Mail**: A message bead — a bead with `Type="message"`. `From` is the
   sender, `Assignee` is the recipient, `Title` holds the subject line, and
-  `Description` holds the message body.
+  `Description` holds the message body. Message beads are created
+  `Ephemeral` (wisp tier), so they live in the store's wisp tier rather
+  than the durable issue tier.
   Open beads without a "read" label are unread; beads with the "read"
   label are read but still accessible; closed beads are archived.
 
 - **Inbox**: The set of open, unread message beads assigned to a
-  recipient. Queried by filtering for `Type="message"`, `Status="open"`,
-  `Assignee=recipient`, and absence of the "read" label.
+  recipient. Queried with a typed `beads.ListQuery` (`Type="message"`,
+  `Status="open"`, `Assignees=<routes>`, `TierMode=TierBoth`, `Live=true`),
+  then filtered for absence of the "read" label.
+
+- **Recipient routes**: A recipient name is expanded to every stable
+  mailbox address that might hold its mail: the literal name plus the
+  routes of the matching session. Live sessions are consulted first, then
+  closed ones, then alias history, so a retired session cannot shadow the
+  live one that replaced it. An address claimed by two sessions resolves
+  to neither and falls back to the literal recipient.
 
 - **Read vs Archive**: Reading a message adds the "read" label but
   keeps the bead open — the message remains accessible via `Get` or
@@ -78,7 +88,7 @@ is a thin composition layer proving the primitives are sufficient.
 **Checking inbox:**
 
 1. `gc mail inbox` invokes `Provider.Inbox("agent-1")`
-2. beadmail calls `store.List()` and filters for `Type="message"`, `Status="open"`, `Assignee="agent-1"`, no "read" label
+2. beadmail expands `agent-1` to its recipient routes (`recipientRoutes`), then `messageCandidatesAll` issues one typed `store.List(ListQuery{Type:"message", Status:"open", Assignees:routes, TierMode:TierBoth, Live:true})` and drops beads with a "read" label
 3. Returns matching messages as `[]Message` with Subject, Body, ThreadID, etc.
 
 **Reading a message:**
@@ -183,9 +193,18 @@ Send → [unread, open]
 
 ## Known Limitations
 
-- **beadmail.Inbox scans all beads.** Uses `store.List()` with
-  client-side filtering. No server-side query for type + status +
-  assignee. Acceptable for current scale.
+- **Empty route lists scan.** `messageCandidatesAll` with no routes
+  sets `AllowScan` and returns every open message bead; callers that
+  pass a recipient always get an assignee-scoped query. A multi-route
+  query on `BdStore` may return excess rows, so beadmail re-checks each
+  bead against the routes client-side.
+- **Hook injection is capped.** `gc mail check --inject` and the
+  auto-handoff inject path surface at most `mailInjectMaxMessages` (3)
+  messages, priority-sorted before the clamp; the rest stay in the inbox.
+- **Read mail is swept.** Read message wisps are closed once older than
+  the sweep TTL (`gc order sweep-nudge-mail --mail-ttl`, default 60
+  minutes). The optional `[mail] retention_ttl` setting (default `0`,
+  disabled) controls purging of retained read messages.
 - **No delivery confirmation.** Neither mail nor nudge provides
   read receipts or delivery guarantees.
 
