@@ -217,3 +217,42 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 		t.Fatalf("claimedBead = %q, want ready-behind (blocked-head must be skipped)", claimedBead)
 	}
 }
+
+// TestHookCandidateClaimableRejectsNonOpenStatus pins the fresh-claim tier's
+// gate to the same status discipline the assigned tier already enforces.
+//
+// Both tiers mint work, so both must agree on what "claimable" means, and until
+// now only claimFirstReadyHookAssignment checked status. The asymmetry mattered
+// because the status guarantee the fresh tier leaned on lives OUTSIDE this
+// package: it comes from `bd ready --unassigned` in the generated routed tier.
+// An agent that supplies its own work_query — explicitly supported, see
+// Agent.EffectiveWorkQuery — replaces that query wholesale, and with it the only
+// thing keeping an in_progress bead out of the candidate list.
+//
+// The gate is deliberately permissive on an ABSENT status: a projection that
+// omits the field says nothing, and bd's own CAS is still behind this. So the
+// check can only ever skip a candidate bd would have refused anyway — it never
+// withholds work that would have been claimable.
+func TestHookCandidateClaimableRejectsNonOpenStatus(t *testing.T) {
+	routes := []string{"pool/worker"}
+	routed := map[string]string{"gc.routed_to": "pool/worker"}
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "open is claimable", status: "open", want: true},
+		{name: "absent status stays claimable", status: "", want: true},
+		{name: "mixed case open is claimable", status: "OPEN", want: true},
+		{name: "in_progress is not claimable", status: "in_progress", want: false},
+		{name: "closed is not claimable", status: "closed", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := beads.Bead{ID: "bd-42", Status: tc.status, Metadata: routed}
+			if got := hookCandidateClaimable(candidate, routes); got != tc.want {
+				t.Fatalf("hookCandidateClaimable(status=%q) = %t, want %t", tc.status, got, tc.want)
+			}
+		})
+	}
+}

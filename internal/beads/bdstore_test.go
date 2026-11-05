@@ -4816,3 +4816,58 @@ func TestBdStoreReadyRetryBoundedReturnsErrorAfterExhaustion(t *testing.T) {
 		t.Fatalf("calls = %d, want >= 2 (retry must be attempted)", calls)
 	}
 }
+
+// TestBdStoreClaimRefusalsAreConflictsNotErrors pins every refusal phrasing bd
+// emits from `bd update <id> --claim` to a conflict (ok=false, err=nil) rather
+// than an error.
+//
+// The distinction is load-bearing, not cosmetic. `gc hook --claim` reads it as
+// the contract: a conflict routes to reportHookClaimRejected, which publishes
+// the bead.claim_rejected event (ADR-0009); an error instead sets claimsErrored,
+// which makes the shared drain report claims_errored — the signal reserved for
+// genuine write failures. Misclassifying a correct refusal therefore both hides
+// the rejection and raises a false write-failure alarm.
+//
+// The strings below are captured verbatim from bd 1.1.1 against a real store
+// (gcf-81b), not paraphrased: the store's only conflict detector is a substring
+// match on bd's prose, so a phrasing this corpus does not carry is a phrasing
+// gascity silently misreads.
+func TestBdStoreClaimRefusalsAreConflictsNotErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{
+			// A live holder still owns the bead.
+			name:   "already claimed by another actor",
+			stdout: `{"error":"1 of 1 issues failed to update","failed":[{"id":"bd-42","error":"claiming issue: issue already claimed by sessionA"}],"schema_version":1}`,
+		},
+		{
+			// The bead closed between the work-query read and the claim — an
+			// ordinary race, not a write failure.
+			name:   "not claimable because status is closed",
+			stdout: `{"error":"1 of 1 issues failed to update","failed":[{"id":"bd-42","error":"claiming issue: issue not claimable: status closed"}],"schema_version":1}`,
+		},
+		{
+			// The bead is in_progress with the assignee cleared — the state a
+			// forced drain or reclaim leaves behind. bd refuses on status alone,
+			// so the refusal names no claimant at all.
+			name:   "not claimable because status is in_progress",
+			stdout: `{"error":"1 of 1 issues failed to update","failed":[{"id":"bd-42","error":"claiming issue: issue not claimable: status in_progress"}],"schema_version":1}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := func(_, _ string, _ ...string) ([]byte, error) {
+				return []byte(tc.stdout), fmt.Errorf("exit status 1")
+			}
+			s := beads.NewBdStore("/city", runner)
+			claimed, ok, err := s.Claim("bd-42")
+			if err != nil {
+				t.Fatalf("Claim err = %v, want nil (a refusal is a conflict, not a write failure)", err)
+			}
+			if ok {
+				t.Fatalf("Claim ok = true, want false; claimed=%+v", claimed)
+			}
+		})
+	}
+}

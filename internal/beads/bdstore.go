@@ -1043,12 +1043,33 @@ func isBdNotFound(err error) bool {
 		strings.Contains(msg, "no issues found")
 }
 
+// isBdClaimConflictMessage reports whether a failed `bd update --claim` was bd
+// refusing the claim rather than failing to write it.
+//
+// The two outcomes are not interchangeable to the caller. `gc hook --claim`
+// reads a refusal (ok=false, err=nil) as a lost race: it publishes
+// bead.claim_rejected (ADR-0009) and moves to the next candidate. It reads an
+// error as a genuine write failure and sets claimsErrored, which makes the
+// shared drain report claims_errored instead of a healthy no_work. So a refusal
+// this predicate does not recognize is laundered into a false write-failure
+// alarm — and, because bd refuses on status with no claimant named, that alarm
+// repeats on every pool worker's every tick for as long as the bead sits there.
+//
+// bd states a refusal two ways, and both must be carried:
+//   - a live holder owns it: "issue already claimed by <actor>"
+//   - the status forbids it: "issue not claimable: status in_progress"
+//     (equally "status closed"), which names no claimant at all — the state a
+//     forced drain, a reclaim, or a close racing the work query leaves behind.
+//
+// A missing id is NOT a refusal; isBdNotFound classifies it as ErrNotFound so
+// the caller can skip a routed id whose bead is gone.
 func isBdClaimConflictMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "already assigned") ||
 		strings.Contains(msg, "already claimed") ||
 		strings.Contains(msg, "claimed by") ||
-		strings.Contains(msg, "claim conflict")
+		strings.Contains(msg, "claim conflict") ||
+		strings.Contains(msg, "not claimable")
 }
 
 // mapBdStatus maps bd's statuses to Gas City's 3. bd uses: open,

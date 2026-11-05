@@ -447,12 +447,33 @@ func mergeHookClaimCandidateMetadata(candidate, claimed beads.Bead) beads.Bead {
 }
 
 // hookCandidateClaimable reports whether a work-query candidate is eligible for a
-// fresh claim: it has an id, is currently unassigned, and matches one of this
-// session's route targets.
+// fresh claim: it has an id, is not already in flight, is currently unassigned,
+// and matches one of this session's route targets.
+//
+// The status gate mirrors the one claimFirstReadyHookAssignment already applies.
+// Both tiers mint work, so both have to agree on what claimable means; until
+// they did, the fresh tier's only status guarantee lived OUTSIDE this package,
+// in the `bd ready --unassigned` of the generated routed tier. An agent that
+// supplies its own work_query (Agent.EffectiveWorkQuery returns a custom query
+// unchanged) replaces that query wholesale, taking the guarantee with it.
 func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
+		hookCandidateStatusClaimable(candidate.Status) &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
+}
+
+// hookCandidateStatusClaimable reports whether a candidate's projected status
+// permits a fresh claim.
+//
+// An ABSENT status is permissive on purpose. A projection that omits the field
+// asserts nothing about the bead, and bd's own claim CAS still stands behind
+// this check — so treating "" as claimable keeps the gate purely additive: it
+// can only skip candidates bd would have refused anyway, and never withholds
+// work that a projection simply failed to describe.
+func hookCandidateStatusClaimable(status string) bool {
+	status = strings.TrimSpace(status)
+	return status == "" || strings.EqualFold(status, "open")
 }
 
 // reportHookClaimRejected publishes a bead.claim_rejected event (ADR-0009) when a
