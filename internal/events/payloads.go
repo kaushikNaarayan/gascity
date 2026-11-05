@@ -77,10 +77,25 @@ type BeadClaimRejectedPayload struct {
 // IsEventPayload marks BeadClaimRejectedPayload as an events.Payload variant.
 func (BeadClaimRejectedPayload) IsEventPayload() {}
 
+// BeadClaimedPayload is the typed payload for bead.claimed events. Emitted
+// once when Assignee's hook mints a claim on BeadID and delivers it. SessionID
+// is the claiming session bead (empty outside a managed session) and RootBeadID
+// the workflow root, when the bead belongs to one.
+type BeadClaimedPayload struct {
+	BeadID     string `json:"bead_id"`
+	Assignee   string `json:"assignee"`
+	SessionID  string `json:"session_id,omitempty"`
+	RootBeadID string `json:"root_bead_id,omitempty"`
+}
+
+// IsEventPayload marks BeadClaimedPayload as an events.Payload variant.
+func (BeadClaimedPayload) IsEventPayload() {}
+
 func init() {
 	RegisterPayload(BeadWorktreeReaped, BeadWorktreeReapedPayload{})
 	RegisterPayload(BeadWorktreeReapSkipped, BeadWorktreeReapSkippedPayload{})
 	RegisterPayload(BeadClaimRejected, BeadClaimRejectedPayload{})
+	RegisterPayload(BeadClaimed, BeadClaimedPayload{})
 }
 
 // StoreDiskWarnPayload is the typed payload for gc.store.disk_warn events.

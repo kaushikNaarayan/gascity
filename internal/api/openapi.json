@@ -1007,6 +1007,28 @@
         ],
         "type": "object"
       },
+      "BeadClaimedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "assignee": {
+            "type": "string"
+          },
+          "bead_id": {
+            "type": "string"
+          },
+          "root_bead_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bead_id",
+          "assignee"
+        ],
+        "type": "object"
+      },
       "BeadCreateInputBody": {
         "additionalProperties": false,
         "properties": {
@@ -2396,6 +2418,9 @@
           },
           {
             "$ref": "#/components/schemas/BeadClaimRejectedPayload"
+          },
+          {
+            "$ref": "#/components/schemas/BeadClaimedPayload"
           },
           {
             "$ref": "#/components/schemas/BeadDeadAssigneeReopenedPayload"
@@ -11922,6 +11947,7 @@
           "mapping": {
             "backend.credential_resolved": "#/components/schemas/TypedEventStreamEnvelopeBackendCredentialResolved",
             "bead.claim_rejected": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimRejected",
+            "bead.claimed": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimed",
             "bead.closed": "#/components/schemas/TypedEventStreamEnvelopeBeadClosed",
             "bead.created": "#/components/schemas/TypedEventStreamEnvelopeBeadCreated",
             "bead.dead_assignee_reopened": "#/components/schemas/TypedEventStreamEnvelopeBeadDeadAssigneeReopened",
@@ -12014,6 +12040,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimRejected"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimed"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClosed"
@@ -12382,6 +12411,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope bead.claim_rejected",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeBeadClaimed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claimed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope bead.claimed",
         "type": "object"
       },
       "TypedEventStreamEnvelopeBeadClosed": {
@@ -13359,6 +13445,7 @@
                 "bead.worktree.reaped",
                 "bead.worktree.reap_skipped",
                 "bead.claim_rejected",
+                "bead.claimed",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.step_defined",
@@ -17264,6 +17351,7 @@
           "mapping": {
             "backend.credential_resolved": "#/components/schemas/TypedTaggedEventStreamEnvelopeBackendCredentialResolved",
             "bead.claim_rejected": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimRejected",
+            "bead.claimed": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimed",
             "bead.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClosed",
             "bead.created": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadCreated",
             "bead.dead_assignee_reopened": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadDeadAssigneeReopened",
@@ -17356,6 +17444,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimRejected"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimed"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClosed"
@@ -17732,6 +17823,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope bead.claim_rejected",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeBeadClaimed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claimed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope bead.claimed",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeBeadClosed": {
@@ -18776,6 +18928,7 @@
                 "bead.worktree.reaped",
                 "bead.worktree.reap_skipped",
                 "bead.claim_rejected",
+                "bead.claimed",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.step_defined",

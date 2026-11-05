@@ -32,6 +32,12 @@ const (
 	// Turns the otherwise-silent lost-claim race (RCA gc-typpc: one bead, four
 	// concurrent polecat claims) into an observable signal. ADR-0009.
 	BeadClaimRejected = "bead.claim_rejected"
+	// BeadClaimed fires when gc hook --claim mints a claim on a work bead
+	// (open -> in_progress for this session) and delivers the result to its
+	// caller. Re-serving an already-held in_progress assignment does not
+	// re-emit, so there is one event per ownership transition. Together with
+	// bead.claim_rejected it makes claim activity observable for eval/audit.
+	BeadClaimed = "bead.claimed"
 	// ExecutionWorkAssociated records an authoritative association between a
 	// graph.v2 workflow run and one physical input work bead. Subject carries
 	// the work bead and RunID carries the workflow root.
@@ -290,7 +296,7 @@ var KnownEventTypes = []string{
 	SessionColdStartTimeout,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
-	BeadClaimRejected,
+	BeadClaimRejected, BeadClaimed,
 	BeadDeadAssigneeReopened,
 	ExecutionWorkAssociated, ExecutionStepDefined, ExecutionStepStarted, ExecutionStepCompleted,
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,

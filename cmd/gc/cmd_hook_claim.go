@@ -53,6 +53,9 @@ type hookClaimOps struct {
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
+	// EmitClaimed publishes a bead.claimed event once a claim this hook minted
+	// has been delivered to the caller. Best-effort.
+	EmitClaimed hookEmitClaimedFunc
 	// ResolveWorkBranch returns the git branch of the worker's worktree (dir),
 	// stamped onto the bead as gc.work_branch at claim time. Empty result (no
 	// repo / detached HEAD) omits the branch key — the session back-reference is
@@ -85,6 +88,7 @@ type (
 	hookAssignContinuationFunc func(context.Context, string, []string, string, string) error
 	hookDrainAckFunc           func(io.Writer) error
 	hookEmitClaimRejectedFunc  func(beadID, existingClaimant, attemptedClaimant string)
+	hookEmitClaimedFunc        func(events.BeadClaimedPayload)
 	hookResolveWorkBranchFunc  func(dir string) string
 	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
@@ -219,6 +223,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.EmitClaimRejected == nil {
 		ops.EmitClaimRejected = hookEmitClaimRejected
+	}
+	if ops.EmitClaimed == nil {
+		ops.EmitClaimed = hookEmitClaimed
 	}
 	if ops.ResolveWorkBranch == nil {
 		ops.ResolveWorkBranch = hookResolveWorkBranch
@@ -513,10 +520,28 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 			fmt.Fprintf(stderr, "gc hook --claim: writing JSON: %v\n", err) //nolint:errcheck
 			return 1
 		}
+		emitHookClaimedIfMinted(result, opts, ops)
 		return 0
 	}
-	fmt.Fprintln(stdout, result.BeadID) //nolint:errcheck
+	if _, err := fmt.Fprintln(stdout, result.BeadID); err == nil {
+		emitHookClaimedIfMinted(result, opts, ops)
+	}
 	return 0
+}
+
+// emitHookClaimedIfMinted publishes bead.claimed for a delivered result whose
+// claim this hook minted ("claimed" or "ready_assignment"). An
+// existing_assignment re-serve already had its transition recorded.
+func emitHookClaimedIfMinted(result hookClaimJSONResult, opts hookClaimOptions, ops hookClaimOps) {
+	if result.Reason != "claimed" && result.Reason != "ready_assignment" {
+		return
+	}
+	ops.EmitClaimed(events.BeadClaimedPayload{
+		BeadID:     result.BeadID,
+		Assignee:   result.Assignee,
+		SessionID:  hookClaimSessionID(opts.Env),
+		RootBeadID: result.RootBeadID,
+	})
 }
 
 // writeHookClaimNoWork writes the single drain result for a hook that claimed
@@ -1313,6 +1338,25 @@ func hookEmitClaimRejected(beadID, existingClaimant, attemptedClaimant string) {
 		Type:    events.BeadClaimRejected,
 		Actor:   attemptedClaimant,
 		Subject: beadID,
+		Payload: payload,
+	})
+	if closer, ok := rec.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+// hookEmitClaimed publishes a best-effort bead.claimed event to the city event
+// log so a delivered claim is observable for eval/audit.
+func hookEmitClaimed(p events.BeadClaimedPayload) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return
+	}
+	rec := openCityRecorder(io.Discard)
+	rec.Record(events.Event{
+		Type:    events.BeadClaimed,
+		Actor:   p.Assignee,
+		Subject: p.BeadID,
 		Payload: payload,
 	})
 	if closer, ok := rec.(io.Closer); ok {

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1502,10 +1503,13 @@ func openOrderTrackingIDs(store beads.Store, ids []string) ([]string, error) {
 func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars map[string]string) {
 	scoped := a.ScopedName()
 	outcome := orders.RunOutcomeExec
-	var headSeq uint64
+	var headSeq, afterSeq uint64
 	var hasEventCursor bool
 	if a.Trigger == "event" && m.ep != nil {
 		var err error
+		// The previous run's persisted cursor, read before this run overwrites
+		// it, opens the event window handed to the command.
+		afterSeq = uint64(front.Cursor(scoped))
 		headSeq, err = m.ep.LatestSeq()
 		if err != nil {
 			errMsg := fmt.Sprintf("reading event cursor: %v", err)
@@ -1542,6 +1546,9 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	}
 
 	env, err := orderExecEnvWithError(cityPath, m.cfg, target, a, vars)
+	if err == nil && hasEventCursor {
+		env = withOrderEventWindowEnv(env, afterSeq, headSeq)
+	}
 	var output []byte
 	var execErrMsg string
 	if err != nil {
@@ -1596,6 +1603,23 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		Actor:   "controller",
 		Subject: scoped,
 	})
+}
+
+// withOrderEventWindowEnv sets the event-window keys on an event-triggered exec
+// order's env, replacing any value an overlay supplied: the window is the
+// controller's cursor bookkeeping, not caller input.
+func withOrderEventWindowEnv(env []string, afterSeq, headSeq uint64) []string {
+	out := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == orders.EventAfterSeqEnv || key == orders.EventHeadSeqEnv {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out,
+		orders.EventAfterSeqEnv+"="+strconv.FormatUint(afterSeq, 10),
+		orders.EventHeadSeqEnv+"="+strconv.FormatUint(headSeq, 10))
 }
 
 func prepareOrderWispRecipe(ctx context.Context, store beads.Store, a orders.Order, searchPaths []string, vars map[string]string) (*formula.Recipe, error) {

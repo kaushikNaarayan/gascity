@@ -2,6 +2,16 @@ package orders
 
 import "fmt"
 
+// Event-window env keys exported to an event-triggered exec order. Together
+// they name the half-open event-seq range (EventAfterSeqEnv, EventHeadSeqEnv]
+// this run covers: the cursor the previous run persisted and the head seq this
+// run persisted before the command started. A script reads exactly that range
+// (e.g. `gc events --after`) instead of guessing which events fired it.
+const (
+	EventAfterSeqEnv = "GC_EVENT_AFTER_SEQ"
+	EventHeadSeqEnv  = "GC_EVENT_HEAD_SEQ"
+)
+
 // ValidateExecEnvOverrides rejects [order.env] keys owned by the controller.
 func ValidateExecEnvOverrides(a Order) error {
 	for key := range a.Env {
@@ -52,6 +62,8 @@ func IsReservedExecEnvKey(key string) bool {
 		"GC_DOLT_PORT",
 		"GC_DOLT_STATE_FILE",
 		"GC_DOLT_USER",
+		EventAfterSeqEnv,
+		EventHeadSeqEnv,
 		"GC_PACK_DIR",
 		"GC_PACK_NAME",
 		"GC_PACK_STATE_DIR",
