@@ -279,6 +279,105 @@ func TestSupervisorLaunchdPlistGCPathExtractsProgramArgument(t *testing.T) {
 	}
 }
 
+func TestSupervisorSameBinaryAcceptsWrapperScriptExecTarget(t *testing.T) {
+	dir := t.TempDir()
+	realBinary := filepath.Join(dir, "gc.real")
+	if err := os.WriteFile(realBinary, []byte("real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapper := filepath.Join(dir, "gc")
+	wrapperScript := "#!/bin/sh\n" +
+		"BD_IGNORE_SCHEMA_SKEW=1\n" +
+		"export BD_IGNORE_SCHEMA_SKEW\n" +
+		"exec " + realBinary + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if !supervisorSameBinary(wrapper, realBinary) {
+		t.Fatalf("supervisorSameBinary(wrapper, real) = false, want true for a wrapper that execs the real binary")
+	}
+	if !supervisorSameBinary(realBinary, wrapper) {
+		t.Fatalf("supervisorSameBinary(real, wrapper) = false, want true (symmetric)")
+	}
+
+	other := filepath.Join(dir, "other-gc")
+	if err := os.WriteFile(other, []byte("other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if supervisorSameBinary(wrapper, other) {
+		t.Fatalf("supervisorSameBinary(wrapper, other) = true, want false for a wrapper execing a different binary")
+	}
+
+	notWrapper := filepath.Join(dir, "not-a-wrapper")
+	if err := os.WriteFile(notWrapper, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if supervisorSameBinary(notWrapper, realBinary) {
+		t.Fatalf("supervisorSameBinary(notWrapper, real) = true, want false for a script with no exec line")
+	}
+}
+
+func TestInstallSupervisorSystemdAcceptsWrapperScriptExistingBinary(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("systemd path only applies on linux")
+	}
+
+	homeDir := t.TempDir()
+	gcHome := filepath.Join(homeDir, ".gc")
+	currentBinary := filepath.Join(homeDir, "bin", "gc.real")
+	if err := os.MkdirAll(filepath.Dir(currentBinary), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentBinary, []byte("real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(homeDir, "bin", "gc")
+	wrapperScript := "#!/bin/sh\nexec " + currentBinary + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", gcHome)
+	setSupervisorInstallForceForTest(t, false)
+
+	data := supervisorInstallGuardServiceData(gcHome, currentBinary)
+	unitPath := supervisorSystemdServicePath()
+	original := []byte("[Unit]\nDescription=test\n\n[Service]\nExecStart=" + wrapper + " supervisor run\n")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRun := supervisorSystemctlRun
+	oldActive := supervisorSystemctlActive
+	var calls []string
+	supervisorSystemctlRun = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	supervisorSystemctlActive = func(_ string) bool {
+		return false
+	}
+	t.Cleanup(func() {
+		supervisorSystemctlRun = oldRun
+		supervisorSystemctlActive = oldActive
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := installSupervisorSystemd(data, &stdout, &stderr); code != 0 {
+		t.Fatalf("installSupervisorSystemd code = %d, want 0 (wrapper resolves to current binary); stderr=%q", code, stderr.String())
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "--user start "+supervisorSystemdServiceName()) {
+		t.Fatalf("systemctl calls = %v, want service start", calls)
+	}
+}
+
 func TestSupervisorSameBinaryComparesCleanPathAndInode(t *testing.T) {
 	missingA := filepath.Join(t.TempDir(), "bin", "..", "bin", "gc")
 	missingB := filepath.Clean(missingA)

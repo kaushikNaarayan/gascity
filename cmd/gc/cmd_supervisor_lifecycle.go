@@ -718,17 +718,72 @@ func supervisorLaunchdPlistGCPath(plist string) string {
 // supervisorSameBinary reports whether path a and path b refer to the same
 // gc binary. It first compares cleaned string paths (handles both pointing
 // at the same location), then falls back to inode comparison (handles one
-// being a symlink to the other).
+// being a symlink to the other), then falls back to resolving either side
+// as a shell wrapper script that execs the other (handles a deployment
+// where the installed unit legitimately targets a wrapper that exports
+// process-local env vars before exec'ing the real binary).
 func supervisorSameBinary(a, b string) bool {
+	return supervisorSameBinaryDepth(a, b, supervisorWrapperResolveDepth)
+}
+
+// supervisorWrapperResolveDepth bounds wrapper-script resolution so a
+// misconfigured or malicious wrapper chain cannot recurse indefinitely.
+const supervisorWrapperResolveDepth = 4
+
+func supervisorSameBinaryDepth(a, b string, depth int) bool {
 	if filepath.Clean(a) == filepath.Clean(b) {
 		return true
 	}
 	infoA, errA := os.Stat(a)
 	infoB, errB := os.Stat(b)
-	if errA == nil && errB == nil {
-		return os.SameFile(infoA, infoB)
+	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
+		return true
+	}
+	if depth <= 0 {
+		return false
+	}
+	if target := supervisorWrapperExecTarget(a); target != "" {
+		return supervisorSameBinaryDepth(target, b, depth-1)
+	}
+	if target := supervisorWrapperExecTarget(b); target != "" {
+		return supervisorSameBinaryDepth(a, target, depth-1)
 	}
 	return false
+}
+
+// supervisorWrapperMaxScriptSize bounds how much of a candidate wrapper
+// script gc will read looking for an exec target. Real wrapper shims are a
+// few hundred bytes; this is generous headroom, not a real limit.
+const supervisorWrapperMaxScriptSize = 64 * 1024
+
+// supervisorWrapperExecTarget inspects path as a POSIX shell script and
+// returns the binary named by its last `exec <binary> ...` line, or "" if
+// path is not a shell script or has no such line. This lets a systemd
+// ExecStart (or launchd ProgramArguments) legitimately point at a small
+// wrapper script — e.g. one exporting environment gc needs in its own
+// process — without tripping the same-binary install guard.
+func supervisorWrapperExecTarget(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > supervisorWrapperMaxScriptSize {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.HasPrefix(string(data), "#!") {
+		return ""
+	}
+	target := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "exec ") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "exec "))
+		if len(fields) == 0 {
+			continue
+		}
+		target = strings.Trim(fields[0], `"'`)
+	}
+	return target
 }
 
 func waitForSupervisorPID() int {
