@@ -3,14 +3,15 @@ title: "Formulas & Molecules"
 ---
 
 
-> Last verified against code: 2026-03-17
+> Last verified against code: 2026-11-05
 
 ## Summary
 
 Formula files are reusable workflow definitions stored as
 `*.formula.toml`. Gas City resolves those files through ordered formula
-layers, stages the active winners into `.beads/formulas/`, and asks the
-configured beads backend to instantiate molecules from them.
+layers, stages the active winners into `.beads/formulas/`, and instantiates
+molecules from them in-process (`internal/formula` then `internal/molecule`),
+persisting the resulting beads through the configured beads store.
 
 Current merge-wave status:
 
@@ -24,8 +25,10 @@ Current merge-wave status:
 The important current-state boundary is this:
 
 - Gas City owns formula discovery and layer resolution.
-- The beads backend owns formula materialization.
-- `bd` is the full-featured backend for real formula execution today.
+- `internal/formula` compiles a formula into a recipe, and
+  `internal/molecule` materializes the recipe as beads.
+- The beads store only persists them; batch creation needs a store that
+  implements `beads.GraphApplyStore`.
 
 ## Key Concepts
 
@@ -38,7 +41,7 @@ The important current-state boundary is this:
 - **Wisp**: An ephemeral molecule created for dispatch or order
   execution.
 - **Attached molecule**: A formula instantiated onto an existing bead via
-  `Store.MolCookOn`.
+  `molecule.CookOn` (root bead's `ParentID` set to the target).
 - **Convergence formula subset**: The subset of formula metadata used by the
   convergence subsystem, validated in
   [`internal/convergence/formula.go`](https://github.com/gastownhall/gascity/blob/main/internal/convergence/formula.go).
@@ -57,11 +60,14 @@ cmd/gc/formula_resolve.go
 .beads/formulas/*.formula.toml
         |
         v
-Store.MolCook / Store.MolCookOn
+formula.Compile()        internal/formula/compile.go
+        |   (Recipe: steps + deps)
+        v
+molecule.Instantiate()   internal/molecule/molecule.go
         |
-        +--> BdStore     -> bd mol wisp / bd mol bond
-        +--> exec.Store  -> script mol-cook / mol-cook-on
-        \--> Mem/File    -> simplified molecule root for tests/tutorials
+        +--> graph apply -> one batched GraphApplyPlan
+        |                   (store implements beads.GraphApplyStore)
+        \--> per-bead    -> Create root, steps, then wire deps
 ```
 
 ### Review Quorum Formula
@@ -118,21 +124,25 @@ This keeps the active formula set visible to backend tools such as `bd`.
 
 ### Instantiation
 
-The store interface is the runtime seam:
+Instantiation is in-process, in `internal/molecule`:
 
-- `Store.MolCook(formula, title, vars)` creates a new molecule or wisp
-- `Store.MolCookOn(formula, beadID, title, vars)` attaches a molecule to an
-  existing bead
+- `formula.Compile()` resolves a formula by name and returns a
+  `*formula.Recipe` (steps plus dependency edges) with variable defaults
+  applied.
+- `molecule.Instantiate(ctx, store, recipe, opts)` creates the root bead and
+  one bead per step, then wires dependencies.
+- `molecule.Cook()` is Compile plus Instantiate. `molecule.CookOn()` is
+  `Cook` with `Options.ParentID` set, which attaches the molecule to an
+  existing bead.
+- `molecule.Attach()` and `molecule.InstantiateFragment()` expand a running
+  workflow (retry attempts, fan-out).
 
-Current implementations behave as follows:
-
-- **`BdStore`** in [`internal/beads/bdstore.go`](https://github.com/gastownhall/gascity/blob/main/internal/beads/bdstore.go)
-  delegates to `bd mol wisp` and `bd mol bond`, then parses the returned root
-  bead ID.
-- **`exec.Store`** in [`internal/beads/exec/exec.go`](https://github.com/gastownhall/gascity/blob/main/internal/beads/exec/exec.go)
-  forwards `mol-cook` and `mol-cook-on` to a user script.
-- **`MemStore`** and **`FileStore`** create a simplified molecule root bead.
-  They are suitable for tests and tutorials, not full formula execution.
+The store is only the persistence seam. When `[daemon] formula_v2` is on (the
+default) and the store implements `beads.GraphApplyStore`, the whole recipe is
+written as one batch (`internal/molecule/graph_apply.go`); otherwise beads are
+created one at a time and a partial failure is marked with `molecule_failed`
+metadata. Because the store has no formula knowledge, `MemStore` and
+`FileStore` run the same instantiation code as production.
 
 ### Dispatch and Orders
 
@@ -156,9 +166,8 @@ Closed wisps are purged by the controller's wisp GC in
 - Formula resolution is last-wins by filename across ordered layers.
 - `ResolveFormulas()` only mutates symlinks under `.beads/formulas/`; it never
   overwrites real files.
-- Molecule creation always goes through the configured `beads.Store`.
-- Full multi-step formula execution is backend-dependent today; `BdStore` is
-  the production path.
+- Molecule creation always writes through the configured `beads.Store`, via
+  `internal/molecule`.
 - Wisp garbage collection only targets closed molecules past the configured
   TTL.
 
@@ -167,7 +176,9 @@ Closed wisps are purged by the controller's wisp GC in
 | Depends on | How |
 |---|---|
 | `internal/config` | Computes formula layers from city, packs, and rigs |
-| `internal/beads` | Instantiates formulas via `MolCook` and `MolCookOn` |
+| `internal/formula` | Compiles a formula name into a `Recipe` |
+| `internal/molecule` | Instantiates a `Recipe` as beads (`Cook`, `CookOn`, `Instantiate`, `Attach`) |
+| `internal/beads` | Persists the instantiated beads; `GraphApplyStore` provides batch creation |
 | `internal/convergence` | Validates convergence-specific formula metadata |
 
 | Depended on by | How |
@@ -187,11 +198,9 @@ Closed wisps are purged by the controller's wisp GC in
 | `cmd/gc/wisp_gc.go` | TTL-based cleanup for closed molecules |
 | `internal/config/config.go` | `FormulaLayers` data shape |
 | `internal/config/pack.go` | `ComputeFormulaLayers()` |
-| `internal/beads/beads.go` | `MolCook` / `MolCookOn` store interface |
-| `internal/beads/bdstore.go` | Production formula instantiation via `bd` |
-| `internal/beads/exec/exec.go` | Script-backed formula instantiation |
-| `internal/beads/memstore.go` | Simplified in-memory molecule creation |
-| `internal/beads/filestore.go` | Persistent wrapper over `MemStore` |
+| `internal/formula/compile.go` | `Compile()`: formula name to `Recipe` |
+| `internal/molecule/molecule.go` | `Cook()`, `CookOn()`, `Instantiate()`, `Attach()`, `InstantiateFragment()` |
+| `internal/molecule/graph_apply.go` | Batched instantiation through `beads.GraphApplyStore` |
 | `internal/convergence/formula.go` | Convergence-specific formula validation |
 | `internal/bootstrap/packs/core/formulas/mol-review-quorum.toml` | Core two-lane review quorum formula scaffold |
 
@@ -243,25 +252,24 @@ See [the formula specs](../../docs/reference/specs/formula-spec-v2.md) for the f
 
 - `cmd/gc/formula_resolve_test.go` verifies winner selection, stale cleanup,
   and real-file preservation
-- `internal/beads/bdstore_test.go` verifies `bd mol wisp` / `bd mol bond`
-  wiring and root ID parsing
-- `internal/beads/memstore_test.go` and `internal/beads/filestore_test.go`
-  verify simplified molecule creation for test-oriented stores
+- `internal/molecule/` tests cover instantiation, graph apply, and attach
+- `internal/formula/` tests cover compilation
 - `cmd/gc/order_dispatch_test.go` and `cmd/gc/cmd_sling_test.go` cover the
   higher-level formula dispatch paths
 
 ## Known Limitations
 
-- Gas City does not currently own a general in-process formula parser for the
-  main runtime path.
-- Step-bead materialization is backend-dependent; production behavior comes
-  from `bd`.
-- Tutorial and in-memory stores intentionally implement a smaller molecule
-  model than the production backend.
+- Batch (graph-apply) creation needs a store that implements
+  `beads.GraphApplyStore`; other stores fall back to per-bead creation, which
+  is slower and can leave a partially created molecule (marked
+  `molecule_failed`) on error.
+- Gas City has no general in-process executor for v1 molecule steps; agents
+  work them. v2 control beads run in the control dispatcher
+  (`internal/dispatch`).
 
 ## See Also
 
 - [the formula specs](../../docs/reference/specs/formula-spec-v2.md) for the file layout
 - [Dispatch](dispatch.md) for sling-based formula routing
 - [Orders](orders.md) for formula-backed scheduled work
-- [Bead Store](beads.md) for the `MolCook` interface boundary
+- [Bead Store](beads.md) for the store that persists instantiated beads

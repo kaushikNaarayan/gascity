@@ -3,7 +3,7 @@ title: "Life of a Molecule"
 ---
 
 
-> Last verified against code: 2026-03-17
+> Last verified against code: 2026-11-05
 
 ## Summary
 
@@ -52,19 +52,36 @@ This makes the active formula set visible to backends like `bd`.
 
 ## Phase 3: Instantiation
 
-Molecule creation goes through the `beads.Store` interface:
+Molecule creation happens in-process in `internal/molecule`, not inside the
+store:
 
-- `Store.MolCook(formula, title, vars)`
-- `Store.MolCookOn(formula, beadID, title, vars)`
+1. `formula.Compile()` (`internal/formula/compile.go`) resolves the formula
+   by name across the search paths, applies variable defaults, and returns a
+   `*formula.Recipe`: a flat list of steps plus dependency edges.
+2. `molecule.Instantiate(ctx, store, recipe, opts)`
+   (`internal/molecule/molecule.go`) turns the recipe into beads: a root bead
+   and one bead per step, with dependencies wired.
 
-Backend behavior:
+`molecule.Cook()` is the convenience wrapper that does both steps.
+`molecule.CookOn()` is `Cook` with `Options.ParentID` set, which attaches the
+new root to an existing bead. `molecule.Attach()` expands a recipe in the
+middle of a running workflow (retry attempts, control-bead expansion), and
+`molecule.InstantiateFragment()` creates fan-out fragments.
 
-- `BdStore` uses `bd mol wisp` and `bd mol bond`
-- `exec.Store` delegates `mol-cook` and `mol-cook-on` to a script
-- `MemStore` and `FileStore` create simplified molecule roots for tests and
-  tutorials
+How the beads are written depends on the store:
 
-For a production city, `BdStore` is the normal path.
+- When graph apply is enabled (`[daemon] formula_v2`, on by default) and the
+  store implements `beads.GraphApplyStore`, `Instantiate` builds one
+  `beads.GraphApplyPlan` and applies it as a single batch
+  (`internal/molecule/graph_apply.go`). A transient graph-apply error is
+  retried once, then falls through to the per-bead path.
+- Otherwise `Instantiate` creates the root first and then the steps, wires
+  dependencies after all beads exist, and on partial failure marks the
+  created beads with `molecule_failed` metadata for cleanup.
+
+The store only persists beads; it has no knowledge of formulas. In-memory
+and file stores therefore take the same path as production, which is what
+tests and tutorials rely on.
 
 ## Phase 4: Routing
 
@@ -81,15 +98,18 @@ can discover it through its normal work query.
 ## Phase 5: Execution
 
 The agent picks up the molecule through the bead store and works through the
-resulting tasks. In production, `bd` owns the detailed step-bead materialization
-and dependency handling. Gas City does not currently provide a separate
-in-process formula executor for the main runtime path.
+resulting tasks. Step beads already exist after instantiation. Gas City does
+not run a general in-process formula executor for v1 molecules: the agent
+works the steps in order. For graph (v2) workflows, control beads such as
+check, retry, and fan-out are executed by the control dispatcher
+(`internal/dispatch`).
 
 At this layer, the important contributor rule is simple:
 
-- molecule creation is a store concern
+- molecule creation is `internal/molecule`'s job; the store only persists
 - routing is a `cmd/gc/` concern
-- step execution is an agent plus backend concern
+- step execution is an agent job, or the control dispatcher's for control
+  beads
 
 ## Phase 6: Completion
 
@@ -119,10 +139,12 @@ This cleanup is intentionally conservative:
 |---|---|---|
 | Layer computation | `ComputeFormulaLayers()` | `internal/config/pack.go` |
 | Symlink staging | `ResolveFormulas()` | `cmd/gc/formula_resolve.go` |
-| Wisp creation | `Store.MolCook()` | `internal/beads/beads.go` |
-| Attached molecule creation | `Store.MolCookOn()` | `internal/beads/beads.go` |
-| Production backend cook | `BdStore.MolCook()` / `BdStore.MolCookOn()` | `internal/beads/bdstore.go` |
-| Script backend cook | `exec.Store.MolCook()` / `exec.Store.MolCookOn()` | `internal/beads/exec/exec.go` |
+| Formula compile | `formula.Compile()` | `internal/formula/compile.go` |
+| Molecule creation (compile + instantiate) | `molecule.Cook()` | `internal/molecule/molecule.go` |
+| Attached molecule creation | `molecule.CookOn()` | `internal/molecule/molecule.go` |
+| Instantiate a compiled recipe | `molecule.Instantiate()` | `internal/molecule/molecule.go` |
+| Batch bead creation | `instantiateViaGraphApply()` | `internal/molecule/graph_apply.go` |
+| Mid-workflow expansion | `molecule.Attach()` | `internal/molecule/molecule.go` |
 | User dispatch | `doSling()` | `cmd/gc/cmd_sling.go` |
 | Order dispatch | `dispatchWisp()` | `cmd/gc/order_dispatch.go` |
 | GC creation | `newWispGC()` | `cmd/gc/wisp_gc.go` |
@@ -133,4 +155,4 @@ This cleanup is intentionally conservative:
 - [Formulas & Molecules](formulas.md) for the subsystem overview
 - [Dispatch](dispatch.md) for sling routing
 - [Orders](orders.md) for formula-backed automation
-- [Bead Store](beads.md) for the store boundary that owns instantiation
+- [Bead Store](beads.md) for the store that persists the instantiated beads
