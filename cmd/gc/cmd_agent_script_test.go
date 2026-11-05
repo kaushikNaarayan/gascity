@@ -14,8 +14,9 @@ import (
 	"time"
 )
 
-func TestAgentScriptBDClaimUsesSessionActor(t *testing.T) {
-	t.Setenv("GC_SESSION_NAME", "demo/worker-1")
+func TestAgentScriptBDClaimUsesCanonicalActor(t *testing.T) {
+	t.Setenv("GC_ALIAS", "demo/worker")
+	t.Setenv("GC_SESSION_NAME", "demo--worker")
 
 	var calls [][]string
 	exec := agentScriptExecutor{
@@ -37,9 +38,42 @@ func TestAgentScriptBDClaimUsesSessionActor(t *testing.T) {
 	if exitCode != nil {
 		t.Fatalf("exitCode = %v, want nil", *exitCode)
 	}
-	want := []string{"bd", "update", "ga-123", "--claim", "--actor", "demo/worker-1"}
+	want := []string{"bd", "update", "ga-123", "--claim", "--actor", "demo/worker"}
 	if len(calls) != 1 || !slices.Equal(calls[0], want) {
 		t.Fatalf("calls = %#v, want %#v", calls, [][]string{want})
+	}
+}
+
+func TestAgentScriptClaimActorFallsBackToSessionName(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_SESSION_NAME", "demo--worker")
+	t.Setenv("BEADS_ACTOR", "")
+
+	if got := agentScriptClaimActor(); got != "demo--worker" {
+		t.Fatalf("agentScriptClaimActor() = %q, want session name fallback", got)
+	}
+}
+
+func TestAgentScriptClaimActorPrefersProjectedActor(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("BEADS_ACTOR", "repair-id")
+	t.Setenv("GC_AGENT", "stale")
+	t.Setenv("GC_SESSION_NAME", "s-repair-id")
+
+	if got := agentScriptClaimActor(); got != "repair-id" {
+		t.Fatalf("agentScriptClaimActor() = %q, want projected actor", got)
+	}
+}
+
+func TestAgentScriptAliasPrefersDurableOwner(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("BEADS_ACTOR", "repair-id")
+	t.Setenv("GC_AGENT", "stale")
+	t.Setenv("GC_SESSION_NAME", "s-repair-id")
+
+	if got := agentScriptAlias(); got != "repair-id" {
+		t.Fatalf("agentScriptAlias() = %q, want durable owner", got)
 	}
 }
 
@@ -464,7 +498,7 @@ func TestAgentScriptRunActionBuildsBDUpdateArgs(t *testing.T) {
 		"bd", "update", "ga-123",
 		"--assignee", "demo/lifecycle.refinery",
 		"--status", "closed",
-		"--notes", "merged polecat/ga-123",
+		"--append-notes", "merged polecat/ga-123",
 		"--set-metadata", "alpha=first",
 		"--set-metadata", "zeta=last",
 	}
@@ -809,7 +843,7 @@ func TestAgentScriptRunsShippedLifecyclePolecatScript(t *testing.T) {
 	wantCommands := [][]string{
 		{"bd", "update", "ga-123", "--claim", "--actor", "demo/lifecycle.polecat"},
 		{"gc", "mail", "send", "--to", "demo/lifecycle.refinery", "-s", "CLAIMED: Demo work (ga-123)", "-m", "scripted polecat demo/lifecycle.polecat claimed ga-123; branch polecat/ga-123."},
-		{"bd", "update", "ga-123", "--assignee", "demo/lifecycle.refinery", "--notes", "scripted polecat: implemented ga-123, handed off to refinery"},
+		{"bd", "update", "ga-123", "--assignee", "demo/lifecycle.refinery", "--append-notes", "scripted polecat: implemented ga-123, handed off to refinery"},
 		{"gc", "mail", "send", "--to", "demo/lifecycle.refinery", "-s", "READY FOR MERGE: polecat/ga-123 (ga-123)", "-m", "scripted polecat demo/lifecycle.polecat pushed polecat/ga-123 for demo/lifecycle.refinery."},
 	}
 	if !reflect.DeepEqual(commands, wantCommands) {
@@ -862,7 +896,7 @@ func TestAgentScriptRunsShippedLifecycleRefineryScript(t *testing.T) {
 			switch {
 			case strings.Contains(command, "git merge --no-edit"):
 				actionOrder = append(actionOrder, "shell:merge")
-			case strings.Contains(command, "git push origin HEAD:main"):
+			case strings.Contains(command, `git push origin "HEAD:$BASE"`):
 				actionOrder = append(actionOrder, "shell:push")
 			case strings.Contains(command, "git push origin --delete"):
 				actionOrder = append(actionOrder, "shell:cleanup")
@@ -907,8 +941,8 @@ func TestAgentScriptRunsShippedLifecycleRefineryScript(t *testing.T) {
 
 	wantCommands := [][]string{
 		{"gc", "mail", "send", "--to", "demo/lifecycle.polecat", "-s", "MERGING: polecat/ga-123 (ga-123)", "-m", "scripted refinery demo/lifecycle.refinery is merging polecat/ga-123."},
-		{"bd", "update", "ga-123", "--status", "closed", "--notes", "scripted refinery: merged polecat/ga-123 into main", "--set-metadata", "merge_result=merged"},
-		{"gc", "mail", "send", "--to", "demo/lifecycle.polecat", "-s", "MERGED: polecat/ga-123 (ga-123)", "-m", "scripted refinery demo/lifecycle.refinery merged polecat/ga-123 into main."},
+		{"bd", "update", "ga-123", "--status", "closed", "--append-notes", "scripted refinery: merged polecat/ga-123 into the rig mainline", "--set-metadata", "merge_result=merged"},
+		{"gc", "mail", "send", "--to", "demo/lifecycle.polecat", "-s", "MERGED: polecat/ga-123 (ga-123)", "-m", "scripted refinery demo/lifecycle.refinery merged polecat/ga-123 into the rig mainline."},
 	}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("commands = %#v, want %#v", commands, wantCommands)
@@ -995,6 +1029,30 @@ func TestAgentScriptHookBeadReportsHookFailureWithEmptyOutput(t *testing.T) {
 	}
 	if got := stderr.String(); got != "gc hook: config failed\n" {
 		t.Fatalf("stderr = %q, want forwarded hook error", got)
+	}
+}
+
+// TestAgentScriptHookBeadReportsStoreUnavailableAsFailure pins that the no-work
+// heuristic does not swallow a store-unavailable hook. bd can fail with nothing
+// but a warning-shaped line; gc hook still classifies it, prints the token and
+// exits 2, and that is a failed read, not an empty queue.
+func TestAgentScriptHookBeadReportsStoreUnavailableAsFailure(t *testing.T) {
+	var stderr bytes.Buffer
+	_, hasWork, err := agentScriptHookBeadWithRunner(&stderr,
+		func(_ []string, _ bool, _ string, _ io.Writer, hookStderr io.Writer) int {
+			return reportWorkQueryFailure("gc hook", errors.New("running work query \"bd ready --json\": exit status 1: warning: auto-import from issues.jsonl failed: dial tcp 127.0.0.1:3307: connect: connection refused"), hookStderr)
+		})
+	if err == nil {
+		t.Fatal("agentScriptHookBeadWithRunner succeeded, want hook failure for an unavailable store")
+	}
+	if hasWork {
+		t.Fatal("agentScriptHookBeadWithRunner reported work on hook failure")
+	}
+	if !strings.Contains(err.Error(), "gc hook failed") {
+		t.Fatalf("error = %q, want hook failure", err.Error())
+	}
+	if got := stderr.String(); !strings.Contains(got, hookStoreUnavailableToken) {
+		t.Fatalf("stderr = %q, want forwarded %s line", got, hookStoreUnavailableToken)
 	}
 }
 

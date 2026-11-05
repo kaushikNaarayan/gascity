@@ -13,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/bootstrap"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func overrideBootstrapPacks(t *testing.T, names ...string) {
@@ -99,13 +100,15 @@ func TestVendorSink(t *testing.T) {
 		wantOK   bool
 	}{
 		{"claude", ".claude/skills", true},
-		{"codex", ".codex/skills", true},
+		{"codex", ".agents/skills", true},
 		{"gemini", ".gemini/skills", true},
 		{"opencode", ".opencode/skills", true},
 		{"mimocode", ".mimocode/skills", true},
+		// pi shares codex's .agents/skills sink: both scan it, and it is
+		// the location pi documents for cross-harness skill sharing.
+		{"pi", ".agents/skills", true},
 		{"copilot", "", false},
 		{"cursor", "", false},
-		{"pi", "", false},
 		{"omp", "", false},
 		{"unknown", "", false},
 		{"", "", false},
@@ -125,7 +128,7 @@ func TestVendorSink(t *testing.T) {
 func TestSupportedVendorsStable(t *testing.T) {
 	t.Parallel()
 	got := SupportedVendors()
-	want := []string{"claude", "codex", "gemini", "mimocode", "opencode"}
+	want := []string{"claude", "codex", "gemini", "mimocode", "opencode", "pi"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("SupportedVendors() = %v, want %v", got, want)
 	}
@@ -771,6 +774,162 @@ func TestMaterializeAgentSinkDirRequired(t *testing.T) {
 	}
 }
 
+// legacyRootTarget builds a symlink at sink/<name> pointing into a
+// retired root (e.g. the pre-#3344 .gc/system/packs projection) that no
+// longer exists on disk — the orphaned shape hq-38je root-caused.
+func mustDanglingLegacyLink(t *testing.T, sink, name, legacyRoot string) string {
+	t.Helper()
+	target := filepath.Join(legacyRoot, "core", "skills", name)
+	mustSymlink(t, target, filepath.Join(sink, name))
+	return target
+}
+
+func TestRunDeletesDanglingLegacyRootLink(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	mkSkill(t, src, "gc-work")
+	sink := t.TempDir()
+	legacyRoot := filepath.Join(t.TempDir(), ".gc", "system", "packs") // never created — retired
+	mustDanglingLegacyLink(t, sink, "qlandia-crew.prep-convoy", legacyRoot)
+
+	_, err := Run(Request{
+		SinkDir:          sink,
+		Desired:          []SkillEntry{{Name: "gc-work", Source: filepath.Join(src, "gc-work"), Origin: "core"}},
+		OwnedRoots:       []string{src},
+		LegacyOwnedRoots: []string{legacyRoot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "qlandia-crew.prep-convoy")); !os.IsNotExist(err) {
+		t.Errorf("dangling legacy link survived: lstat err=%v", err)
+	}
+	checkSymlink(t, filepath.Join(sink, "gc-work"), filepath.Join(src, "gc-work"))
+}
+
+func TestRunRepointsDesiredLegacyRootLink(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	mkSkill(t, src, "gc-mail")
+	sink := t.TempDir()
+	legacyRoot := filepath.Join(t.TempDir(), ".gc", "system", "packs")
+	mustDanglingLegacyLink(t, sink, "gc-mail", legacyRoot)
+
+	res, err := Run(Request{
+		SinkDir:          sink,
+		Desired:          []SkillEntry{{Name: "gc-mail", Source: filepath.Join(src, "gc-mail"), Origin: "core"}},
+		OwnedRoots:       []string{src},
+		LegacyOwnedRoots: []string{legacyRoot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Materialized, []string{"gc-mail"}) {
+		t.Fatalf("Materialized = %v", res.Materialized)
+	}
+	checkSymlink(t, filepath.Join(sink, "gc-mail"), filepath.Join(src, "gc-mail"))
+	if len(res.Skipped) != 0 {
+		t.Errorf("legacy-target link misreported as user-owned: %+v", res.Skipped)
+	}
+}
+
+func TestRunRepointsLiveDesiredLegacyRootLink(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	mkSkill(t, src, "gc-mail")
+	sink := t.TempDir()
+	// Legacy target still exists on disk (e.g. an old cache checkout not
+	// yet pruned): a desired name must still re-point at the current
+	// source — the pre-manifest #4130 case.
+	legacyRoot := t.TempDir()
+	legacyTarget := filepath.Join(legacyRoot, "oldsha", "skills", "gc-mail")
+	if err := os.MkdirAll(legacyTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, legacyTarget, filepath.Join(sink, "gc-mail"))
+
+	res, err := Run(Request{
+		SinkDir:          sink,
+		Desired:          []SkillEntry{{Name: "gc-mail", Source: filepath.Join(src, "gc-mail"), Origin: "core"}},
+		OwnedRoots:       []string{src},
+		LegacyOwnedRoots: []string{legacyRoot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Materialized, []string{"gc-mail"}) {
+		t.Fatalf("Materialized = %v", res.Materialized)
+	}
+	checkSymlink(t, filepath.Join(sink, "gc-mail"), filepath.Join(src, "gc-mail"))
+}
+
+func TestRunKeepsLiveUndesiredLegacyRootLink(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	sink := t.TempDir()
+	// Live legacy target + name not desired: leave alone. Deleting a
+	// still-resolving link could strand content the user relies on; the
+	// doctor check surfaces it instead.
+	legacyRoot := t.TempDir()
+	legacyTarget := filepath.Join(legacyRoot, "core", "skills", "old-skill")
+	if err := os.MkdirAll(legacyTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, legacyTarget, filepath.Join(sink, "old-skill"))
+
+	_, err := Run(Request{
+		SinkDir:          sink,
+		Desired:          nil,
+		OwnedRoots:       []string{src},
+		LegacyOwnedRoots: []string{legacyRoot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSymlink(t, filepath.Join(sink, "old-skill"), legacyTarget)
+}
+
+func TestRunKeepsDanglingLegacyRootLinkWithoutOptIn(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	sink := t.TempDir()
+	legacyRoot := filepath.Join(t.TempDir(), ".gc", "system", "packs")
+	target := mustDanglingLegacyLink(t, sink, "core.gc-mail", legacyRoot)
+
+	// No LegacyOwnedRoots: the historical behavior — orphaned pre-manifest
+	// links classify as user-owned and survive forever.
+	_, err := Run(Request{
+		SinkDir:    sink,
+		OwnedRoots: []string{src},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSymlink(t, filepath.Join(sink, "core.gc-mail"), target)
+}
+
+func TestRunDeletesDanglingCacheRepoLink(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	sink := t.TempDir()
+	// Cache checkout pruned out from under a pre-manifest link.
+	cacheRoot := filepath.Join(t.TempDir(), ".gc", "cache", "repos")
+	target := filepath.Join(cacheRoot, "be555e483c79", "internal", "bootstrap", "packs", "core", "skills", "gc-mail")
+	mustSymlink(t, target, filepath.Join(sink, "core.gc-mail"))
+
+	_, err := Run(Request{
+		SinkDir:          sink,
+		OwnedRoots:       []string{src},
+		LegacyOwnedRoots: []string{cacheRoot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "core.gc-mail")); !os.IsNotExist(err) {
+		t.Errorf("dangling cache-target link survived: lstat err=%v", err)
+	}
+}
+
 func TestMaterializeAgentRemovesAllOwnedWhenDesiredEmpty(t *testing.T) {
 	t.Parallel()
 	src := t.TempDir()
@@ -1034,7 +1193,12 @@ func TestCanonicalizePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, _ := filepath.EvalSymlinks(alias)
+	// Canonicalize the expectation the same way canonicalizePath does. Bare
+	// EvalSymlinks is a different canonical form on macOS, where it reports
+	// /private/var/... while the production normalizer collapses the
+	// equivalent /var alias. The comparison stays exact, so an unresolved
+	// alias still fails.
+	expected := testutil.CanonicalPath(alias)
 	if got != expected {
 		t.Errorf("alias dir: got %q, want %q", got, expected)
 	}
@@ -1045,7 +1209,7 @@ func TestCanonicalizePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPrefix, _ := filepath.EvalSymlinks(alias)
+	wantPrefix := testutil.CanonicalPath(alias)
 	wantMissing := filepath.Join(wantPrefix, "not-yet-created", "leaf")
 	if got != wantMissing {
 		t.Errorf("missing tail: got %q, want %q", got, wantMissing)
@@ -1230,4 +1394,155 @@ func setupBootstrapHome(t *testing.T, packs map[string][]string) string {
 // so the rest of the helpers don't need to know about that surface.
 func globalRepoCachePathHelper(gcHome, source, commit string) string {
 	return config.GlobalRepoCachePath(gcHome, source, commit)
+}
+
+// sinkSnapshot records every sink entry: a symlink's target, or "file"/"dir".
+func sinkSnapshot(t *testing.T, sink string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	entries, err := os.ReadDir(sink)
+	if os.IsNotExist(err) {
+		return out
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		path := filepath.Join(sink, e.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[e.Name()] = "-> " + target
+		case info.IsDir():
+			out[e.Name()] = "dir"
+		default:
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[e.Name()] = "file " + string(data)
+		}
+	}
+	return out
+}
+
+// A DryRun reports what a real pass does, and writes nothing.
+func TestRunDryRunReportsThePassWithoutWriting(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	for _, name := range []string{"keep", "drift-from", "drift-to", "fresh"} {
+		mkSkill(t, src, name)
+	}
+	sink := filepath.Join(t.TempDir(), "skills")
+	if err := os.MkdirAll(sink, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, filepath.Join(src, "keep"), filepath.Join(sink, "keep"))
+	mustSymlink(t, filepath.Join(src, "drift-from"), filepath.Join(sink, "drift"))
+	mustSymlink(t, filepath.Join(src, "drift-from"), filepath.Join(sink, "orphan"))
+	if err := os.WriteFile(filepath.Join(sink, "mine"), []byte("user content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		SinkDir: sink,
+		Desired: []SkillEntry{
+			{Name: "keep", Source: filepath.Join(src, "keep"), Origin: "city"},
+			{Name: "drift", Source: filepath.Join(src, "drift-to"), Origin: "city"},
+			{Name: "fresh", Source: filepath.Join(src, "fresh"), Origin: "city"},
+			{Name: "mine", Source: filepath.Join(src, "fresh"), Origin: "city"},
+		},
+		OwnedRoots: []string{src},
+	}
+	before := sinkSnapshot(t, sink)
+
+	dry := req
+	dry.DryRun = true
+	plan, err := Run(dry)
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if after := sinkSnapshot(t, sink); !reflect.DeepEqual(before, after) {
+		t.Fatalf("DryRun wrote to the sink:\nbefore: %v\nafter:  %v", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(sink, ownershipManifestFile)); !os.IsNotExist(err) {
+		t.Fatalf("DryRun wrote the ownership manifest, stat err = %v", err)
+	}
+
+	applied, err := Run(req)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for name, got := range map[string][2][]string{
+		"Created":      {plan.Created, applied.Created},
+		"Relinked":     {plan.Relinked, applied.Relinked},
+		"Removed":      {plan.Removed, applied.Removed},
+		"Materialized": {plan.Materialized, applied.Materialized},
+	} {
+		if !reflect.DeepEqual(got[0], got[1]) {
+			t.Errorf("%s: DryRun %v, real pass %v", name, got[0], got[1])
+		}
+	}
+	if !reflect.DeepEqual(plan.Created, []string{"fresh"}) || !reflect.DeepEqual(plan.Relinked, []string{"drift"}) || !reflect.DeepEqual(plan.Removed, []string{"orphan"}) {
+		t.Fatalf("plan = created %v, relinked %v, removed %v", plan.Created, plan.Relinked, plan.Removed)
+	}
+	if got := skippedToNames(plan.Skipped); !reflect.DeepEqual(got, []string{"mine"}) {
+		t.Fatalf("plan skipped = %v, want mine", got)
+	}
+}
+
+// A DryRun neither creates a missing sink nor migrates a legacy stub, but it
+// plans the links the real pass would create there.
+func TestRunDryRunPlansMissingSinkAndLegacyStub(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	mkSkill(t, src, "gc-work")
+	mkSkill(t, src, "alpha")
+	sink := filepath.Join(t.TempDir(), "claude", "skills")
+	missing := filepath.Join(t.TempDir(), "agents", "skills")
+	if err := os.MkdirAll(filepath.Join(sink, "gc-work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sink, "gc-work", "SKILL.md"), []byte(legacyStubBodies["gc-work"]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stub, err := Run(Request{
+		SinkDir:     sink,
+		Desired:     []SkillEntry{{Name: "gc-work", Source: filepath.Join(src, "gc-work"), Origin: "core"}},
+		OwnedRoots:  []string{src},
+		LegacyNames: LegacyStubNames(),
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("DryRun with legacy stub: %v", err)
+	}
+	if !reflect.DeepEqual(stub.LegacyMigrated, []string{"gc-work"}) || !reflect.DeepEqual(stub.Created, []string{"gc-work"}) {
+		t.Fatalf("plan = migrated %v, created %v; want gc-work in both", stub.LegacyMigrated, stub.Created)
+	}
+	if info, err := os.Lstat(filepath.Join(sink, "gc-work")); err != nil || !info.IsDir() {
+		t.Fatalf("DryRun touched the legacy stub: info=%v err=%v", info, err)
+	}
+
+	fresh, err := Run(Request{
+		SinkDir:    missing,
+		Desired:    []SkillEntry{{Name: "alpha", Source: filepath.Join(src, "alpha"), Origin: "city"}},
+		OwnedRoots: []string{src},
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("DryRun into a missing sink: %v", err)
+	}
+	if !reflect.DeepEqual(fresh.Created, []string{"alpha"}) {
+		t.Fatalf("plan created = %v, want alpha", fresh.Created)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("DryRun created the sink, stat err = %v", err)
+	}
 }

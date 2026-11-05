@@ -92,7 +92,7 @@ func TestPrepareStartCandidateStagesScaffoldInResolvedTaskWorkDirWhenCWDIsShared
 				MaxActiveSessions: intPtrScaffoldRegression(2),
 			},
 		},
-	}, nil, store, &clock.Fake{Time: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}, io.Discard, nil)
+	}, nil, store, &clock.Fake{Time: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}, io.Discard, nil, dispatchOptionSources{})
 	if err != nil {
 		t.Fatalf("prepareStartCandidateForCity: %v", err)
 	}
@@ -227,6 +227,45 @@ func TestRetargetPreStartWorkDirPreservesShellQuoting(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRetargetPreStartWorkDirPreservesUserAuthoredLiterals is the regression
+// for #4069: retargetPreStartWorkDir used to blindly ReplaceAll the
+// pre-override workdir across every PreStart entry, including user-authored
+// commands that reference the rig root as a deliberate hardcoded literal
+// (the canonical case: `git worktree add` must run against the main
+// checkout, not the not-yet-existing per-session directory). Only the
+// engine-generated materialize-skills / project-mcp entries should ever be
+// rewritten; {{.WorkDir}} already exists for users who want the session dir.
+func TestRetargetPreStartWorkDirPreservesUserAuthoredLiterals(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldWorkDir = "/Users/klashesselman/Claude/flow-city"
+		newWorkDir = "/Users/klashesselman/Claude/flow-city/fc-r1xz-load-context-and-verify-assignment"
+	)
+	userCmd := "worktree-setup.sh " + oldWorkDir + " \"$GC_DIR\" gc-worker --sync"
+
+	preStart := []string{userCmd}
+	preStart = appendMaterializeSkillsPreStart(preStart, "gascity/builder", oldWorkDir)
+
+	retargeted := retargetPreStartWorkDir(preStart, oldWorkDir, newWorkDir)
+	if len(retargeted) != 2 {
+		t.Fatalf("retarget produced %d entries, want 2: %v", len(retargeted), retargeted)
+	}
+
+	if retargeted[0] != userCmd {
+		t.Errorf("user-authored literal was rewritten:\n got:  %s\n want: %s", retargeted[0], userCmd)
+	}
+	// newWorkDir is old+suffix here (matching the real-world rig-scoped
+	// per-session worktree naming from the report), so a plain
+	// strings.Contains(retargeted[1], oldWorkDir) check would pass
+	// spuriously even on a correctly-retargeted value. Compare against
+	// what a fresh generation against newWorkDir produces instead.
+	want := appendMaterializeSkillsPreStart(nil, "gascity/builder", newWorkDir)[0]
+	if retargeted[1] != want {
+		t.Errorf("generated materialize-skills entry not retargeted:\n got:  %s\n want: %s", retargeted[1], want)
 	}
 }
 

@@ -110,6 +110,27 @@ func TestDurationRangeCheck_ProgressStallTimeoutNegativeDisables(t *testing.T) {
 	}
 }
 
+func TestDurationRangeCheck_ClaimHolderStallTimeout(t *testing.T) {
+	t.Run("too small warns", func(t *testing.T) {
+		cfg := &config.City{Session: config.SessionConfig{ClaimHolderStallTimeout: "1m"}}
+		r := NewDurationRangeCheck(cfg).Run(&CheckContext{})
+		if r.Status != StatusWarning {
+			t.Errorf("status = %d, want Warning", r.Status)
+		}
+		if !strings.Contains(strings.Join(r.Details, "\n"), "claim_holder_stall_timeout") {
+			t.Errorf("details = %v, want claim_holder_stall_timeout warning", r.Details)
+		}
+	})
+
+	t.Run("zero disables", func(t *testing.T) {
+		cfg := &config.City{Session: config.SessionConfig{ClaimHolderStallTimeout: "0s"}}
+		r := NewDurationRangeCheck(cfg).Run(&CheckContext{})
+		if r.Status != StatusOK {
+			t.Errorf("status = %d, want OK; details = %v", r.Status, r.Details)
+		}
+	})
+}
+
 func TestDurationRangeCheck_TooLarge(t *testing.T) {
 	cfg := &config.City{
 		Daemon: config.DaemonConfig{
@@ -387,6 +408,24 @@ func TestWorktreeDiskSizeCheck_NoWorktreesDir(t *testing.T) {
 	r := c.Run(&CheckContext{CityPath: dir})
 	if r.Status != StatusOK {
 		t.Errorf("status = %d, want OK; msg=%s", r.Status, r.Message)
+	}
+}
+
+func TestWorktreeDiskSizeCheckUsesConfiguredWorktreesRoot(t *testing.T) {
+	dir := t.TempDir()
+	configuredRoot := filepath.Join(t.TempDir(), "configured-worktrees")
+	t.Setenv("GC_WORKTREES_DIR", configuredRoot)
+	rig := filepath.Join(configuredRoot, "huge")
+	if err := os.MkdirAll(rig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := &WorktreeDiskSizeCheck{
+		cfg:        config.DoctorConfig{WorktreeRigWarnSize: "1GB", WorktreeRigErrorSize: "2GB"},
+		measureDir: fakeMeasure(map[string]int64{rig: 3 * 1024 * 1024 * 1024}, nil),
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d, want Error from configured root; msg=%s", r.Status, r.Message)
 	}
 }
 
@@ -692,6 +731,43 @@ func TestNestedWorktreePruneCheck_NoWorktreesDir(t *testing.T) {
 	r := c.Run(&CheckContext{CityPath: dir})
 	if r.Status != StatusOK {
 		t.Errorf("status = %d, want OK", r.Status)
+	}
+}
+
+func TestNestedWorktreePruneCheckUsesConfiguredWorktreesRoot(t *testing.T) {
+	dir := t.TempDir()
+	configuredRoot := filepath.Join(t.TempDir(), "configured-worktrees")
+	t.Setenv("GC_WORKTREES_DIR", configuredRoot)
+	homeDir := filepath.Join(configuredRoot, "rig-a", "polecat-1")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, ".git"), []byte("gitdir: /tmp/none/worktrees/polecat-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := pathutil.NormalizePathForCompare(homeDir)
+	nested := pathutil.NormalizePathForCompare(filepath.Join(home, "worktrees", "task-clean"))
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := &NestedWorktreePruneCheck{
+		cfg: config.DoctorConfig{},
+		newGit: func(path string) gitWorktree {
+			return &fakeGitWorktree{
+				listResp: []git.Worktree{
+					{Path: home, Branch: "home-branch"},
+					{Path: nested, Branch: "task-clean"},
+				},
+				currentPath: path,
+			}
+		},
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning from configured root; msg=%s", r.Status, r.Message)
+	}
+	if len(c.findings) != 1 || c.findings[0].path != nested || !c.findings[0].safeToRm {
+		t.Fatalf("findings = %+v, want one safe finding at %s", c.findings, nested)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // gcEnvVars lists the GC_* identity and session-routing variables that
@@ -101,7 +103,44 @@ func clearProcessLiveEnvForTests() {
 	}
 }
 
+// TestClearProcessLiveEnvForTestsUnsetsInheritedState runs the process-wide
+// scrub TestMain runs, so it must hand the process back every key the scrub
+// unset. It restored only the keys it had set: the scrub's os.Unsetenv of
+// GC_HOME outlived it, and a later test that resolves the supervisor home
+// panicked on a repeat run (-count>1) or a later shard order (ga-3sdi50).
 func TestClearProcessLiveEnvForTestsUnsetsInheritedState(t *testing.T) {
+	before := make(map[string]*string)
+	for _, key := range liveEnvKeysForTests() {
+		if value, ok := os.LookupEnv(key); ok {
+			before[key] = &value
+		} else {
+			before[key] = nil
+		}
+	}
+
+	t.Run("scrub", func(t *testing.T) {
+		testClearProcessLiveEnvForTestsScrub(t)
+	})
+
+	for key, want := range before {
+		got, ok := os.LookupEnv(key)
+		switch {
+		case want == nil && ok:
+			t.Errorf("%s = %q after the scrub test, want unset as before", key, got)
+		case want != nil && (!ok || got != *want):
+			t.Errorf("%s = %q (set=%v) after the scrub test, want %q as before", key, got, ok, *want)
+		}
+	}
+}
+
+func testClearProcessLiveEnvForTestsScrub(t *testing.T) {
+	t.Helper()
+	// The scrub is process-wide: register every key it touches with
+	// t.Setenv, which restores each one, set or unset, when the test ends.
+	// The scrub below unsets them all anyway.
+	for _, key := range liveEnvKeysForTests() {
+		t.Setenv(key, os.Getenv(key))
+	}
 	cleared := []string{
 		"BEADS_ACTOR",
 		"BEADS_DIR",
@@ -117,9 +156,12 @@ func TestClearProcessLiveEnvForTestsUnsetsInheritedState(t *testing.T) {
 		"GC_SUPERVISOR_SYSTEMD_UNIT",
 	}
 	preserved := []string{
+		"DOLT_DISABLE_EVENT_FLUSH",
 		"GC_FAST_UNIT",
+		"GC_HERDR_LIVE_TESTS",
 		"GC_REAL_PROCESS_SIGNAL_TESTS",
 		"GC_TEST_KEEP",
+		"GC_WORKER_REPORT_DIR",
 	}
 
 	for _, key := range append(cleared, preserved...) {
@@ -189,11 +231,22 @@ func liveEnvKeysForTests() []string {
 func preserveTestControlEnv(key string) bool {
 	return key == "GC_FAST_UNIT" ||
 		key == "GC_REAL_PROCESS_SIGNAL_TESTS" ||
+		key == "GC_WORKER_REPORT_DIR" ||
 		key == managedDoltTestModeEnv ||
 		key == managedDoltTestParentPIDEnv ||
 		key == "GC_DOLT_REAL_BINARY" ||
+		// internal/testenv sets this once per test binary so no dolt a test runs
+		// forks a detached `dolt send-metrics`. The DOLT_ prefix scrub below would
+		// otherwise strip it before sanitizedBaseEnv could hand it to a child.
+		key == "DOLT_DISABLE_EVENT_FLUSH" ||
+		// The live herdr tier's opt-in. Without it here the scrub below would
+		// strip the variable before any cmd/gc live journey could read it, so
+		// `make test-herdr-live` could never reach the journeys in this package.
+		key == "GC_HERDR_LIVE_TESTS" ||
 		strings.HasPrefix(key, "GC_LIVE_") ||
 		strings.HasPrefix(key, "GC_SESSION_CHAOS_") ||
+		// The v2 simulator's seed knobs (GC_V2_SIM_SEED, GC_V2_SIM_SEEDS).
+		strings.HasPrefix(key, "GC_V2_SIM_") ||
 		strings.HasPrefix(key, "GC_TEST_")
 }
 
@@ -241,6 +294,7 @@ var testProviderStubCommands = []string{
 	"amp",
 	"opencode",
 	"mimo",
+	"zcode-repl",
 	"auggie",
 	"pi",
 	"omp",
@@ -332,21 +386,30 @@ func gcBeadsBdTestHomeEnv(t *testing.T) []string {
 }
 
 func writeTestDoltIdentity(homeDir string) error {
-	doltDir := filepath.Join(homeDir, ".dolt")
-	if err := os.MkdirAll(doltDir, 0o755); err != nil {
-		return err
+	return testutil.SeedDoltGlobalConfig(homeDir)
+}
+
+// doltIdentityHomeDir returns a fresh directory for dolt/git identity files,
+// created outside every t.TempDir() tree rather than nested inside one.
+// t.TempDir()'s cleanup is a single-pass, non-retrying RemoveAll on its
+// shared parent (see ga-7dgcg6); a dolt/bd child process still writing
+// under DOLT_ROOT_PATH when that RemoveAll fires turns an otherwise-passing
+// test into an ENOTEMPTY failure. Cleanup here is best-effort so a lingering
+// writer fails only this directory's own removal, not the whole test tree.
+func doltIdentityHomeDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(os.TempDir(), "gc-dolt-identity-")
+	if err != nil {
+		t.Fatalf("MkdirTemp(dolt identity home): %v", err)
 	}
-	data := []byte(`{"user.name":"gc-test","user.email":"gc-test@test.local"}`)
-	return os.WriteFile(filepath.Join(doltDir, "config_global.json"), data, 0o644)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func configureTestDoltIdentityEnv(t *testing.T) {
 	t.Helper()
 
-	homeDir := filepath.Join(t.TempDir(), "home")
-	if err := os.MkdirAll(homeDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(test home): %v", err)
-	}
+	homeDir := doltIdentityHomeDir(t)
 	if err := writeTestGitIdentity(homeDir); err != nil {
 		t.Fatalf("write test git identity: %v", err)
 	}
@@ -356,4 +419,24 @@ func configureTestDoltIdentityEnv(t *testing.T) {
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(homeDir, ".gitconfig"))
 	t.Setenv("DOLT_ROOT_PATH", homeDir)
+}
+
+// TestConfigureTestDoltIdentityEnvHomeIsOutsideTestTempDir guards against
+// ga-7dgcg6: a live dolt/bd child process rooted under DOLT_ROOT_PATH can
+// still be writing when this test's t.TempDir() runs its single-pass
+// RemoveAll, turning an otherwise-passing test into an ENOTEMPTY failure.
+// DOLT_ROOT_PATH must live outside every t.TempDir() this test allocates.
+func TestConfigureTestDoltIdentityEnvHomeIsOutsideTestTempDir(t *testing.T) {
+	marker := t.TempDir()
+	tempRoot := filepath.Dir(marker)
+
+	configureTestDoltIdentityEnv(t)
+
+	doltRoot := os.Getenv("DOLT_ROOT_PATH")
+	if doltRoot == "" {
+		t.Fatal("DOLT_ROOT_PATH not set by configureTestDoltIdentityEnv")
+	}
+	if pathutil.PathWithin(tempRoot, doltRoot) {
+		t.Fatalf("DOLT_ROOT_PATH %q must not live under this test's t.TempDir() root %q — a live child process still writing there when t.TempDir()'s single-pass RemoveAll runs fails an otherwise-passing test (ga-7dgcg6)", doltRoot, tempRoot)
+	}
 }

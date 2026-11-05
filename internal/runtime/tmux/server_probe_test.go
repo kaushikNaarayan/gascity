@@ -4,7 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -27,6 +33,833 @@ func firstArgsContainHasSession(args []string) bool {
 		}
 	}
 	return false
+}
+
+func TestNewSessionErrNoServerRefusesObservedLiveNamedSocket(t *testing.T) {
+	variants := []struct {
+		name string
+		call func(*Tmux) error
+	}{
+		{name: "NewSession", call: func(tm *Tmux) error {
+			return tm.NewSession("gc-live-socket", "")
+		}},
+		{name: "NewSessionWithCommand", call: func(tm *Tmux) error {
+			return tm.NewSessionWithCommand("gc-live-socket", "", "true")
+		}},
+		{name: "NewSessionWithCommandAndEnv", call: func(tm *Tmux) error {
+			return tm.NewSessionWithCommandAndEnv("gc-live-socket", "", "true", map[string]string{"X": "1"})
+		}},
+	}
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			socketName := "gc-live-socket"
+			tmuxTmpDir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatalf("EvalSymlinks: %v", err)
+			}
+			t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+			socketPath := filepath.Join(tmuxTmpDir, fmt.Sprintf("tmux-%d", os.Getuid()), socketName)
+			observerCalls := 0
+			fe := &fakeExecutor{err: ErrNoServer}
+			tm := &Tmux{
+				cfg:  Config{SocketName: socketName},
+				exec: fe,
+				serverSocketObserver: func(ctx context.Context, gotPath string) error {
+					observerCalls++
+					if ctx.Err() != nil {
+						t.Fatalf("observer context unexpectedly canceled: %v", ctx.Err())
+					}
+					if gotPath != socketPath {
+						t.Fatalf("observer path = %q, want %q", gotPath, socketPath)
+					}
+					return fmt.Errorf("live socket path=%s inode=97 peer_pid=4242", gotPath)
+				},
+			}
+			err = variant.call(tm)
+			if !errors.Is(err, ErrServerDegraded) {
+				t.Fatalf("err = %v, want ErrServerDegraded", err)
+			}
+			if errors.Is(err, ErrNoServer) {
+				t.Fatalf("err = %v, must not wrap ErrNoServer", err)
+			}
+			for _, want := range []string{
+				"protocol=no-server",
+				"path=" + socketPath,
+				"inode=97",
+				"peer_pid=4242",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err = %q, want %q", err, want)
+				}
+			}
+			if observerCalls != 1 {
+				t.Fatalf("observer calls = %d, want 1", observerCalls)
+			}
+			if len(fe.calls) != 2 || !firstArgsContainHasSession(fe.calls[0]) || !reflect.DeepEqual(fe.calls[1], fe.calls[0]) {
+				t.Fatalf("calls = %#v, want exactly the preflight has-session probe and its re-probe", fe.calls)
+			}
+		})
+	}
+}
+
+func TestNewSessionErrNoServerObservedSafeAllowsCreation(t *testing.T) {
+	for _, observation := range []struct {
+		name string
+		err  error
+	}{
+		{name: "absent"},
+		{name: "stable-refused"},
+	} {
+		t.Run(observation.name, func(t *testing.T) {
+			fe := probeAssertSet([]string{"", "", ""}, []error{ErrNoServer, nil, nil})
+			observerCalls := 0
+			tm := &Tmux{
+				cfg:  Config{SocketName: "gc-test"},
+				exec: fe,
+				serverSocketObserver: func(context.Context, string) error {
+					observerCalls++
+					return observation.err
+				},
+			}
+
+			if err := tm.NewSession("gc-fresh", ""); err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			if observerCalls != 1 {
+				t.Fatalf("observer calls = %d, want 1", observerCalls)
+			}
+			if len(fe.calls) < 2 || fe.calls[1][3] != "new-session" {
+				t.Fatalf("calls = %#v, want probe followed by new-session", fe.calls)
+			}
+		})
+	}
+}
+
+func TestNewSessionErrNoServerUnknownObservationFailsClosed(t *testing.T) {
+	t.Run("unknown observer", func(t *testing.T) {
+		fe := &fakeExecutor{err: ErrNoServer}
+		tm := &Tmux{
+			cfg:  Config{SocketName: "gc-test"},
+			exec: fe,
+			serverSocketObserver: func(context.Context, string) error {
+				return errors.New("socket observation failed")
+			},
+		}
+
+		err := tm.NewSession("gc-unknown-observation", "")
+		if !errors.Is(err, ErrServerDegraded) {
+			t.Fatalf("err = %v, want ErrServerDegraded", err)
+		}
+		if errors.Is(err, ErrNoServer) {
+			t.Fatalf("err = %v, must not wrap ErrNoServer", err)
+		}
+		if len(fe.calls) != 2 || !firstArgsContainHasSession(fe.calls[0]) || !reflect.DeepEqual(fe.calls[1], fe.calls[0]) {
+			t.Fatalf("calls = %#v, want only the preflight probe and its re-probe", fe.calls)
+		}
+	})
+
+	socketInfo := func(t *testing.T) os.FileInfo {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "socket-fixture")
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatalf("write socket fixture: %v", err)
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("lstat socket fixture: %v", err)
+		}
+		return socketModeFileInfo{FileInfo: info}
+	}
+	dialUnexpected := func(context.Context, string) (net.Conn, error) {
+		return nil, errors.New("unexpected dial failure")
+	}
+
+	t.Run("non-socket", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "plain-file")
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatalf("write plain fixture: %v", err)
+		}
+		err := observeNamedSocketWith(context.Background(), path, os.Lstat, dialUnexpected)
+		if err == nil || !strings.Contains(err.Error(), "reason=not-unix-socket") {
+			t.Fatalf("observe non-socket error = %v, want non-socket refusal", err)
+		}
+	})
+
+	t.Run("initial permission failure", func(t *testing.T) {
+		err := observeNamedSocketWith(context.Background(), "permission-denied", func(string) (os.FileInfo, error) {
+			return nil, os.ErrPermission
+		}, dialUnexpected)
+		if err == nil || !strings.Contains(err.Error(), "lstat=") {
+			t.Fatalf("observe permission failure = %v, want lstat refusal", err)
+		}
+	})
+
+	t.Run("unexpected dial failure", func(t *testing.T) {
+		info := socketInfo(t)
+		err := observeNamedSocketWith(context.Background(), "unexpected-dial", func(string) (os.FileInfo, error) {
+			return info, nil
+		}, dialUnexpected)
+		if err == nil || !strings.Contains(err.Error(), "unexpected dial failure") {
+			t.Fatalf("observe unexpected dial failure = %v, want fail closed", err)
+		}
+	})
+
+	t.Run("dial cancellation fails closed", func(t *testing.T) {
+		info := socketInfo(t)
+		for _, dialErr := range []error{context.Canceled, context.DeadlineExceeded} {
+			err := observeNamedSocketWith(context.Background(), "dial-canceled", func(string) (os.FileInfo, error) {
+				return info, nil
+			}, func(context.Context, string) (net.Conn, error) {
+				return nil, dialErr
+			})
+			if err == nil || !strings.Contains(err.Error(), dialErr.Error()) {
+				t.Fatalf("observe dial %v = %v, want fail closed", dialErr, err)
+			}
+		}
+	})
+
+	t.Run("post-lstat identity replacement", func(t *testing.T) {
+		first := socketInfo(t)
+		second := socketInfo(t)
+		calls := 0
+		err := observeNamedSocketWith(context.Background(), "identity-replaced", func(string) (os.FileInfo, error) {
+			calls++
+			if calls == 1 {
+				return first, nil
+			}
+			return second, nil
+		}, func(context.Context, string) (net.Conn, error) {
+			return nil, syscall.ECONNREFUSED
+		})
+		if err == nil || !strings.Contains(err.Error(), "socket-identity-changed") {
+			t.Fatalf("observe identity replacement = %v, want fail closed", err)
+		}
+	})
+
+	t.Run("already canceled context skips lstat", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		called := false
+		err := observeNamedSocketWith(ctx, "canceled-before-lstat", func(string) (os.FileInfo, error) {
+			called = true
+			return nil, nil
+		}, dialUnexpected)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("observe canceled context = %v, want context canceled", err)
+		}
+		if called {
+			t.Fatal("lstat ran after context cancellation")
+		}
+	})
+
+	t.Run("blocking lstat returns on cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		finished := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			result <- observeNamedSocketWith(ctx, "blocking-lstat", func(string) (os.FileInfo, error) {
+				close(entered)
+				<-release
+				close(finished)
+				return nil, os.ErrNotExist
+			}, dialUnexpected)
+		}()
+		<-entered
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("observe canceled blocking lstat = %v, want context canceled", err)
+		}
+		close(release)
+		<-finished
+	})
+}
+
+// newSessionVariants covers every NewSession entry point that runs the
+// preflight probe before creating.
+var newSessionVariants = []struct {
+	name string
+	call func(*Tmux) error
+}{
+	{name: "NewSession", call: func(tm *Tmux) error {
+		return tm.NewSession("gc-reprobe", "")
+	}},
+	{name: "NewSessionWithCommand", call: func(tm *Tmux) error {
+		return tm.NewSessionWithCommand("gc-reprobe", "", "true")
+	}},
+	{name: "NewSessionWithCommandAndEnv", call: func(tm *Tmux) error {
+		return tm.NewSessionWithCommandAndEnv("gc-reprobe", "", "true", map[string]string{"X": "1"})
+	}},
+}
+
+// isCreateCall reports whether args create a session: a direct new-session,
+// or the start-server + source-file script NewSessionWithCommandAndEnv runs.
+func isCreateCall(args []string) bool {
+	return slices.Contains(args, "new-session") || slices.Contains(args, "source-file")
+}
+
+// TestNewSessionErrNoServerReprobeAnsweredAllowsCreation forces the
+// concurrent first-start interleaving: the preflight reports no-server, a
+// sibling's server binds the named socket before the observation, and the
+// single re-probe gets a server answer, so creation proceeds.
+func TestNewSessionErrNoServerReprobeAnsweredAllowsCreation(t *testing.T) {
+	observations := []struct {
+		name string
+		err  error
+	}{
+		{name: "live-unix-socket", err: errors.New("path=/s inode=97 peer_pid=4242 reason=live-unix-socket")},
+		{name: "socket-identity-changed", err: errors.New("path=/s reason=socket-identity-changed")},
+	}
+	answers := []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "session-not-found", err: ErrSessionNotFound},
+		{name: "no-current-target", err: ErrNoCurrentTarget},
+	}
+	probe := []string{"-u", "-L", "gc-race", "has-session", "-t", "=" + probeSessionName}
+	for _, variant := range newSessionVariants {
+		for _, answer := range answers {
+			for _, observation := range observations {
+				t.Run(variant.name+"/"+answer.name+"/"+observation.name, func(t *testing.T) {
+					fe := probeAssertSet(
+						[]string{"", "", "%1", ""},
+						[]error{ErrNoServer, answer.err, nil, nil},
+					)
+					observerCalls := 0
+					tm := &Tmux{
+						cfg:  Config{SocketName: "gc-race"},
+						exec: fe,
+						serverSocketObserver: func(context.Context, string) error {
+							observerCalls++
+							return observation.err
+						},
+					}
+					if err := variant.call(tm); err != nil {
+						t.Fatalf("%s on a server that answered the re-probe: %v (calls=%#v)", variant.name, err, fe.calls)
+					}
+					if observerCalls != 1 {
+						t.Fatalf("observer calls = %d, want 1", observerCalls)
+					}
+					if len(fe.calls) < 3 {
+						t.Fatalf("calls = %#v, want two preflight probes then new-session", fe.calls)
+					}
+					for i := range 2 {
+						if !reflect.DeepEqual(fe.calls[i], probe) {
+							t.Fatalf("preflight call %d = %#v, want %#v", i, fe.calls[i], probe)
+						}
+					}
+					if !isCreateCall(fe.calls[2]) {
+						t.Fatalf("call after preflight = %#v, want session creation", fe.calls[2])
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestNewSessionErrNoServerReprobeWithoutAnswerFailsClosed pins the
+// socket-clobber guard: when the re-probe after a contradicting socket
+// observation gets no server answer, creation is refused with both the
+// observation and the re-probe result in the diagnostic.
+func TestNewSessionErrNoServerReprobeWithoutAnswerFailsClosed(t *testing.T) {
+	reprobes := []struct {
+		name string
+		err  error
+	}{
+		{name: "persistent-no-server", err: ErrNoServer},
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline-exceeded", err: context.DeadlineExceeded},
+		{name: "executor-failure", err: errors.New("tmux has-session: lost server")},
+	}
+	for _, variant := range newSessionVariants {
+		for _, reprobe := range reprobes {
+			t.Run(variant.name+"/"+reprobe.name, func(t *testing.T) {
+				fe := probeAssertSet(
+					[]string{"", "", "%1", ""},
+					[]error{ErrNoServer, reprobe.err, nil, nil},
+				)
+				observerCalls := 0
+				tm := &Tmux{
+					cfg:  Config{SocketName: "gc-race"},
+					exec: fe,
+					serverSocketObserver: func(context.Context, string) error {
+						observerCalls++
+						return errors.New("inode=97 peer_pid=4242 reason=live-unix-socket")
+					},
+				}
+				err := variant.call(tm)
+				if !errors.Is(err, ErrServerDegraded) {
+					t.Fatalf("err = %v, want ErrServerDegraded", err)
+				}
+				if errors.Is(err, ErrNoServer) {
+					t.Fatalf("err = %v, must not wrap ErrNoServer", err)
+				}
+				for _, want := range []string{
+					"protocol=no-server",
+					"observation=inode=97 peer_pid=4242 reason=live-unix-socket",
+					"reprobe=" + reprobe.err.Error(),
+				} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("err = %q, want %q", err, want)
+					}
+				}
+				if observerCalls != 1 {
+					t.Fatalf("observer calls = %d, want 1", observerCalls)
+				}
+				if len(fe.calls) != 2 || !firstArgsContainHasSession(fe.calls[0]) || !reflect.DeepEqual(fe.calls[1], fe.calls[0]) {
+					t.Fatalf("calls = %#v, want the preflight probe and its re-probe only", fe.calls)
+				}
+			})
+		}
+	}
+}
+
+// deadlineScriptExecutor answers each executeCtx call with the next scripted
+// step, recording the args and the context deadline of every call. Unlike
+// fakeExecutor, its steps see the caller's context.
+type deadlineScriptExecutor struct {
+	steps     []func(context.Context) (string, error)
+	calls     [][]string
+	deadlines []time.Time
+}
+
+func (e *deadlineScriptExecutor) execute(args []string) (string, error) {
+	return e.executeCtx(context.Background(), args)
+}
+
+func (e *deadlineScriptExecutor) executeCtx(ctx context.Context, args []string) (string, error) {
+	e.calls = append(e.calls, slices.Clone(args))
+	deadline, _ := ctx.Deadline()
+	e.deadlines = append(e.deadlines, deadline)
+	if len(e.calls) > len(e.steps) {
+		return "", fmt.Errorf("unscripted tmux call %v", args)
+	}
+	return e.steps[len(e.calls)-1](ctx)
+}
+
+// TestProbeServerAliveReprobeSharesPreflightDeadline pins the re-probe to the
+// preflight's single bounded budget: the observation and the re-probe run
+// under the first probe's deadline, an exhausted budget refuses without a
+// second request, and an in-flight re-probe is canceled by that deadline.
+func TestProbeServerAliveReprobeSharesPreflightDeadline(t *testing.T) {
+	prev := newSessionProbeTimeout
+	newSessionProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { newSessionProbeTimeout = prev })
+
+	noServer := func(context.Context) (string, error) { return "", ErrNoServer }
+	blockUntilDone := func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	live := errors.New("inode=97 peer_pid=4242 reason=live-unix-socket")
+
+	t.Run("answered re-probe", func(t *testing.T) {
+		se := &deadlineScriptExecutor{steps: []func(context.Context) (string, error){
+			noServer,
+			func(context.Context) (string, error) { return "", ErrSessionNotFound },
+		}}
+		var observed time.Time
+		tm := &Tmux{
+			cfg:  Config{SocketName: "gc-race"},
+			exec: se,
+			serverSocketObserver: func(ctx context.Context, _ string) error {
+				observed, _ = ctx.Deadline()
+				return live
+			},
+		}
+		if err := tm.probeServerAlive(); err != nil {
+			t.Fatalf("probeServerAlive: %v", err)
+		}
+		if len(se.deadlines) != 2 {
+			t.Fatalf("calls = %#v, want the probe and its re-probe", se.calls)
+		}
+		if se.deadlines[0].IsZero() || !observed.Equal(se.deadlines[0]) || !se.deadlines[1].Equal(se.deadlines[0]) {
+			t.Fatalf("deadlines probe=%v observe=%v reprobe=%v, want one shared preflight deadline", se.deadlines[0], observed, se.deadlines[1])
+		}
+	})
+
+	t.Run("exhausted budget refuses without re-probe", func(t *testing.T) {
+		se := &deadlineScriptExecutor{steps: []func(context.Context) (string, error){
+			noServer,
+			func(context.Context) (string, error) { return "", ErrSessionNotFound },
+		}}
+		tm := &Tmux{
+			cfg:  Config{SocketName: "gc-race"},
+			exec: se,
+			serverSocketObserver: func(ctx context.Context, _ string) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		err := tm.probeServerAlive()
+		if !errors.Is(err, ErrServerDegraded) {
+			t.Fatalf("probeServerAlive = %v, want ErrServerDegraded", err)
+		}
+		if errors.Is(err, ErrNoServer) {
+			t.Fatalf("probeServerAlive = %v, must not wrap ErrNoServer", err)
+		}
+		if !strings.Contains(err.Error(), "reprobe="+context.DeadlineExceeded.Error()) {
+			t.Fatalf("probeServerAlive = %q, want the exhausted budget as the re-probe result", err)
+		}
+		if len(se.calls) != 1 {
+			t.Fatalf("calls = %#v, want only the preflight probe", se.calls)
+		}
+	})
+
+	t.Run("in-flight re-probe canceled by the deadline", func(t *testing.T) {
+		se := &deadlineScriptExecutor{steps: []func(context.Context) (string, error){
+			noServer,
+			blockUntilDone,
+		}}
+		tm := &Tmux{
+			cfg:                  Config{SocketName: "gc-race"},
+			exec:                 se,
+			serverSocketObserver: func(context.Context, string) error { return live },
+		}
+		err := tm.probeServerAlive()
+		if !errors.Is(err, ErrServerDegraded) {
+			t.Fatalf("probeServerAlive = %v, want ErrServerDegraded", err)
+		}
+		if errors.Is(err, ErrNoServer) {
+			t.Fatalf("probeServerAlive = %v, must not wrap ErrNoServer", err)
+		}
+		if !strings.Contains(err.Error(), "reprobe="+context.DeadlineExceeded.Error()) {
+			t.Fatalf("probeServerAlive = %q, want the re-probe canceled by the deadline", err)
+		}
+		if len(se.deadlines) != 2 || !se.deadlines[1].Equal(se.deadlines[0]) {
+			t.Fatalf("deadlines = %v, want the re-probe under the preflight deadline", se.deadlines)
+		}
+	})
+}
+
+type socketModeFileInfo struct{ os.FileInfo }
+
+func (info socketModeFileInfo) Mode() os.FileMode { return info.FileInfo.Mode() | os.ModeSocket }
+
+func TestProbeServerAliveHealthyProtocolDoesNotObserveSocket(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "session-not-found", err: ErrSessionNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observerCalls := 0
+			tm := &Tmux{
+				cfg:  Config{SocketName: "gc-test"},
+				exec: &fakeExecutor{err: tc.err},
+				serverSocketObserver: func(context.Context, string) error {
+					observerCalls++
+					return errors.New("observer must not run")
+				},
+			}
+
+			if err := tm.probeServerAlive(); err != nil {
+				t.Fatalf("probeServerAlive: %v", err)
+			}
+			if observerCalls != 0 {
+				t.Fatalf("observer calls = %d, want 0", observerCalls)
+			}
+		})
+	}
+}
+
+func TestProbeServerAliveUnknownProtocolDoesNotObserveSocket(t *testing.T) {
+	observerCalls := 0
+	tm := &Tmux{
+		cfg:  Config{SocketName: "gc-test"},
+		exec: &fakeExecutor{err: errors.New("tmux protocol failure")},
+		serverSocketObserver: func(context.Context, string) error {
+			observerCalls++
+			return nil
+		},
+	}
+
+	err := tm.probeServerAlive()
+	if !errors.Is(err, ErrServerDegraded) {
+		t.Fatalf("probeServerAlive error = %v, want ErrServerDegraded", err)
+	}
+	if observerCalls != 0 {
+		t.Fatalf("observer calls = %d, want 0", observerCalls)
+	}
+}
+
+// TestProbeServerAliveAcceptsEmptyLiveServer pins the drained-server case:
+// tmux answers "no current target" when the server is alive but holds zero
+// sessions (gc's normal state, because ConfigureServer sets exit-empty off).
+// The server answered, so new-session attaches rather than unlink+rebind —
+// the preflight must proceed without observing the socket at all.
+func TestProbeServerAliveAcceptsEmptyLiveServer(t *testing.T) {
+	observerCalls := 0
+	tm := &Tmux{
+		cfg:  Config{SocketName: "gc-test"},
+		exec: &fakeExecutor{err: ErrNoCurrentTarget},
+		serverSocketObserver: func(context.Context, string) error {
+			observerCalls++
+			return errors.New("observer must not run")
+		},
+	}
+
+	if err := tm.probeServerAlive(); err != nil {
+		t.Fatalf("probeServerAlive: %v", err)
+	}
+	if observerCalls != 0 {
+		t.Fatalf("observer calls = %d, want 0", observerCalls)
+	}
+}
+
+func TestNamedSocketPathUsesTMUXTMPDIRAndIgnoresTMPDIR(t *testing.T) {
+	tmuxTmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+	t.Setenv("TMPDIR", "/must-not-be-used")
+	if got, want := namedSocketPath("gc-test"), filepath.Join(tmuxTmpDir, fmt.Sprintf("tmux-%d", os.Getuid()), "gc-test"); got != want {
+		t.Fatalf("namedSocketPath() = %q, want %q", got, want)
+	}
+}
+
+func TestSocketPathAbsoluteRef(t *testing.T) {
+	if got, want := SocketPath("/var/run//gc/../gc/city.sock"), "/var/run/gc/city.sock"; got != want {
+		t.Fatalf("SocketPath(abs) = %q, want %q", got, want)
+	}
+}
+
+func TestNamedSocketPathFallsBackToTmpWhenTMUXTMPDIREmpty(t *testing.T) {
+	t.Setenv("TMUX_TMPDIR", "")
+	t.Setenv("TMPDIR", "/must-not-be-used")
+	// tmux resolves /tmp as it resolves TMUX_TMPDIR: /private/tmp on macOS.
+	tmp, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		t.Fatalf("EvalSymlinks(/tmp): %v", err)
+	}
+	if got, want := namedSocketPath("gc-test"), filepath.Join(tmp, fmt.Sprintf("tmux-%d", os.Getuid()), "gc-test"); got != want {
+		t.Fatalf("namedSocketPath() = %q, want %q", got, want)
+	}
+}
+
+// tmux keeps a TMUX_TMPDIR that resolves to a file and fails there, so the
+// socket path stays below the resolved file and never moves to /tmp, where
+// a stale socket could read as a dead server.
+func TestSocketPathKeepsTMUXTMPDIRNamingAFile(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(file, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	want := filepath.Join(file, fmt.Sprintf("tmux-%d", os.Getuid()), "gc-test")
+	for _, value := range []string{file, link} {
+		t.Setenv("TMUX_TMPDIR", value)
+		if got := SocketPath("gc-test"); got != want {
+			t.Fatalf("TMUX_TMPDIR=%s: SocketPath() = %q, want %q", value, got, want)
+		}
+	}
+}
+
+// tmux resolves a relative TMUX_TMPDIR with realpath(3) from its client's
+// working directory: SocketPath from this process's, SocketDirIn from the one
+// it is given, either way to an absolute path. A relative value with no
+// working directory to resolve it from falls back to /tmp, as one that does
+// not resolve does. A symlink in the value is followed before the ".." after
+// it, as realpath follows it.
+func TestSocketDirResolvesARelativeTMUXTMPDIRFromItsWorkingDirectory(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	far, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	tmp, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		t.Fatalf("EvalSymlinks(/tmp): %v", err)
+	}
+	for _, dir := range []string{filepath.Join(root, "sockets"), filepath.Join(far, "inner"), filepath.Join(far, "beside")} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(far, "inner"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	uid := fmt.Sprintf("tmux-%d", os.Getuid())
+
+	t.Chdir(root)
+	t.Setenv("TMUX_TMPDIR", "sockets")
+	if got, want := SocketPath("gc-test"), filepath.Join(root, "sockets", uid, "gc-test"); got != want {
+		t.Fatalf("SocketPath() = %q, want %q", got, want)
+	}
+	for _, tc := range []struct {
+		name, dir, value, want string
+	}{
+		{name: "relative, from dir", dir: root, value: "sockets", want: filepath.Join(root, "sockets")},
+		{name: "relative, missing from dir", dir: far, value: "sockets", want: tmp},
+		{name: "relative, no working directory", value: "sockets", want: tmp},
+		{name: "absolute, dir unused", dir: far, value: filepath.Join(root, "sockets"), want: filepath.Join(root, "sockets")},
+		{name: "symlink before ..", dir: root, value: "link/../beside", want: filepath.Join(far, "beside")},
+	} {
+		if got, want := SocketDirIn(tc.dir, tc.value), filepath.Join(tc.want, uid); got != want {
+			t.Errorf("%s: SocketDirIn(%q, %q) = %q, want %q", tc.name, tc.dir, tc.value, got, want)
+		}
+	}
+}
+
+func TestCaptureNamedSocketWitnessFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMUX_TMPDIR", root)
+	socketName := "attach-witness"
+	path := namedSocketPath(socketName)
+
+	newTmux := func(out string) *Tmux {
+		return &Tmux{cfg: Config{SocketName: socketName}, exec: &fakeExecutor{out: out}}
+	}
+	capture := func(tm *Tmux, lstat func(context.Context, string) (namedSocketObservation, error)) (namedSocketWitness, error) {
+		tm.namedSocketLstat = lstat
+		return tm.captureNamedSocketWitness(context.Background())
+	}
+	socketFixture := func(t *testing.T, name string) os.FileInfo {
+		t.Helper()
+		fixture := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(fixture, []byte("fixture"), 0o600); err != nil {
+			t.Fatalf("write socket fixture: %v", err)
+		}
+		info, err := os.Lstat(fixture)
+		if err != nil {
+			t.Fatalf("lstat socket fixture: %v", err)
+		}
+		return info
+	}
+
+	t.Run("stable", func(t *testing.T) {
+		tm := newTmux("41")
+		node := socketFixture(t, "stable")
+		witness, err := capture(tm, func(context.Context, string) (namedSocketObservation, error) {
+			return namedSocketObservation{node: node, isSocket: true}, nil
+		})
+		if err != nil {
+			t.Fatalf("captureNamedSocketWitness: %v", err)
+		}
+		if witness.canonicalPath != path || !filepath.IsAbs(witness.canonicalPath) {
+			t.Fatalf("canonical path = %q, want absolute clean %q", witness.canonicalPath, path)
+		}
+		if witness.node == nil || witness.serverPID != 41 {
+			t.Fatalf("witness = %#v, want socket node and server PID", witness)
+		}
+		if got, want := tm.exec.(*fakeExecutor).calls, [][]string{{"-u", "-N", "-S", path, "display-message", "-p", "#{pid}"}}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("witness command = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		_, err := capture(newTmux("41"), func(context.Context, string) (namedSocketObservation, error) {
+			return namedSocketObservation{}, os.ErrNotExist
+		})
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "reason=socket-missing") {
+			t.Fatalf("capture missing socket = %v, want degraded socket-missing", err)
+		}
+		if strings.Contains(err.Error(), root) {
+			t.Fatalf("capture missing socket exposed absolute path: %v", err)
+		}
+	})
+
+	t.Run("non socket", func(t *testing.T) {
+		fixture := filepath.Join(t.TempDir(), "plain-file")
+		if err := os.WriteFile(fixture, []byte("not a socket"), 0o600); err != nil {
+			t.Fatalf("write non-socket: %v", err)
+		}
+		info, err := os.Lstat(fixture)
+		if err != nil {
+			t.Fatalf("lstat non-socket: %v", err)
+		}
+		_, err = capture(newTmux("41"), func(context.Context, string) (namedSocketObservation, error) {
+			return namedSocketObservation{node: info}, nil
+		})
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "reason=not-unix-socket") {
+			t.Fatalf("capture non-socket = %v, want degraded non-socket", err)
+		}
+	})
+
+	t.Run("stat error", func(t *testing.T) {
+		_, err := capture(newTmux("41"), func(context.Context, string) (namedSocketObservation, error) {
+			return namedSocketObservation{}, os.ErrPermission
+		})
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "reason=socket-lstat") {
+			t.Fatalf("capture stat error = %v, want degraded socket-lstat", err)
+		}
+	})
+
+	t.Run("malformed server pid", func(t *testing.T) {
+		node := socketFixture(t, "malformed-pid")
+		_, err := capture(newTmux("not-a-pid"), func(context.Context, string) (namedSocketObservation, error) {
+			return namedSocketObservation{node: node, isSocket: true}, nil
+		})
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "reason=malformed-server-pid") {
+			t.Fatalf("capture malformed PID = %v, want degraded malformed-server-pid", err)
+		}
+	})
+
+	t.Run("replacement during capture", func(t *testing.T) {
+		original := socketFixture(t, "original")
+		replacement := socketFixture(t, "replacement")
+		calls := 0
+		tm := newTmux("42")
+		_, err := capture(tm, func(context.Context, string) (namedSocketObservation, error) {
+			calls++
+			if calls == 1 {
+				return namedSocketObservation{node: original, isSocket: true}, nil
+			}
+			return namedSocketObservation{node: replacement, isSocket: true}, nil
+		})
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "reason=socket-replaced-during-capture") {
+			t.Fatalf("capture replacement = %v, want degraded replacement refusal", err)
+		}
+	})
+}
+
+func TestAttachSessionWitnessDoesNotRequireTargetToExist(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMUX_TMPDIR", root)
+	socketName := "server-scoped-witness"
+	path := namedSocketPath(socketName)
+	fixture := filepath.Join(t.TempDir(), "socket-node")
+	if err := os.WriteFile(fixture, []byte("fixture"), 0o600); err != nil {
+		t.Fatalf("write socket fixture: %v", err)
+	}
+	info, err := os.Lstat(fixture)
+	if err != nil {
+		t.Fatalf("lstat socket fixture: %v", err)
+	}
+	node := info
+	fe := &fakeExecutor{outs: []string{"41", "41", ""}, errs: []error{nil, nil, ErrSessionNotFound}}
+	tm := &Tmux{cfg: Config{SocketName: socketName}, exec: fe}
+	tm.namedSocketLstat = func(context.Context, string) (namedSocketObservation, error) {
+		return namedSocketObservation{node: node, isSocket: true}, nil
+	}
+	err = tm.AttachSession("missing")
+	if !errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrServerDegraded) {
+		t.Fatalf("AttachSession missing target = %v, want ErrSessionNotFound without degraded witness", err)
+	}
+	if got, want := fe.calls, [][]string{
+		{"-u", "-N", "-S", path, "display-message", "-p", "#{pid}"},
+		{"-u", "-N", "-S", path, "display-message", "-p", "#{pid}"},
+		{"-u", "-N", "-S", path, "attach-session", "-t", "missing"},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AttachSession argv = %#v, want %#v", got, want)
+	}
 }
 
 func TestNewSessionSkipsProbeWhenSocketEmpty(t *testing.T) {
@@ -79,7 +912,13 @@ func TestNewSessionProceedsWhenProbeReportsNoServer(t *testing.T) {
 		[]string{"", "", ""},
 		[]error{ErrNoServer, nil, nil},
 	)
-	tm := &Tmux{cfg: Config{SocketName: "gc-test"}, exec: fe}
+	tm := &Tmux{
+		cfg:  Config{SocketName: "gc-test"},
+		exec: fe,
+		serverSocketObserver: func(context.Context, string) error {
+			return nil
+		},
+	}
 
 	if err := tm.NewSession("gc-fresh", ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -153,7 +992,6 @@ func TestProbeServerAliveAcceptsHealthyServer(t *testing.T) {
 		err  error
 	}{
 		{name: "ErrSessionNotFound", err: ErrSessionNotFound},
-		{name: "ErrNoServer", err: ErrNoServer},
 		{name: "nil", err: nil},
 	}
 	for _, tc := range cases {
@@ -207,5 +1045,94 @@ func TestProbeServerAliveBailsFastOnHang(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("probe took %s, want < 2s (timeout should be ~100ms)", elapsed)
+	}
+}
+
+// When $TMUX pins this provider's named socket, every observation of the
+// server socket must use the pinned path, never the path tmux would resolve
+// from the caller's TMUX_TMPDIR (issue #8116).
+func pinnedSocketTestEnv(t *testing.T) (pinned string) {
+	t.Helper()
+	uid := os.Getuid()
+	pinned = fmt.Sprintf("/run/user/%d/tmux-%d/bright-lights", uid, uid)
+	t.Setenv("TMUX", pinned+",4242,0")
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	return pinned
+}
+
+func TestServerSocketPathFollowsPinnedServer(t *testing.T) {
+	pinned := pinnedSocketTestEnv(t)
+	tm := &Tmux{cfg: Config{SocketName: "bright-lights"}}
+	if got := tm.serverSocketPath(); got != pinned {
+		t.Fatalf("serverSocketPath() = %q, want %q", got, pinned)
+	}
+}
+
+func TestProbeServerAliveObservesPinnedSocket(t *testing.T) {
+	pinned := pinnedSocketTestEnv(t)
+	fe := &fakeExecutor{err: ErrNoServer}
+	tm := &Tmux{
+		cfg:  Config{SocketName: "bright-lights"},
+		exec: fe,
+		serverSocketObserver: func(_ context.Context, gotPath string) error {
+			if gotPath != pinned {
+				t.Errorf("observer path = %q, want %q", gotPath, pinned)
+			}
+			return fmt.Errorf("live socket path=%s inode=97 peer_pid=4242", gotPath)
+		},
+	}
+	err := tm.probeServerAlive()
+	if !errors.Is(err, ErrServerDegraded) {
+		t.Fatalf("probeServerAlive: err = %v, want ErrServerDegraded", err)
+	}
+	if !strings.Contains(err.Error(), "path="+pinned) {
+		t.Fatalf("err = %q, want it to name the pinned path", err)
+	}
+}
+
+func TestCaptureNamedSocketWitnessUsesPinnedSocket(t *testing.T) {
+	pinned := pinnedSocketTestEnv(t)
+	fixture := filepath.Join(t.TempDir(), "socket-fixture")
+	if err := os.WriteFile(fixture, []byte("fixture"), 0o600); err != nil {
+		t.Fatalf("write socket fixture: %v", err)
+	}
+	node, err := os.Lstat(fixture)
+	if err != nil {
+		t.Fatalf("lstat socket fixture: %v", err)
+	}
+	fe := &fakeExecutor{out: "4242"}
+	tm := &Tmux{cfg: Config{SocketName: "bright-lights"}, exec: fe}
+	var observed []string
+	tm.namedSocketLstat = func(_ context.Context, gotPath string) (namedSocketObservation, error) {
+		observed = append(observed, gotPath)
+		return namedSocketObservation{node: node, isSocket: true}, nil
+	}
+	witness, err := tm.captureNamedSocketWitness(context.Background())
+	if err != nil {
+		t.Fatalf("captureNamedSocketWitness: %v", err)
+	}
+	if witness.canonicalPath != pinned {
+		t.Errorf("witness path = %q, want %q", witness.canonicalPath, pinned)
+	}
+	for i, got := range observed {
+		if got != pinned {
+			t.Errorf("lstat path %d = %q, want %q", i, got, pinned)
+		}
+	}
+	want := []string{"-u", "-N", "-S", pinned, "display-message", "-p", "#{pid}"}
+	if len(fe.calls) != 1 || !reflect.DeepEqual(fe.calls[0], want) {
+		t.Errorf("display-message args = %v, want %v", fe.calls, want)
+	}
+}
+
+func TestAttachArgsFallBackToPinnedSocket(t *testing.T) {
+	pinned := pinnedSocketTestEnv(t)
+	tm := &Tmux{cfg: Config{SocketName: "bright-lights"}}
+	want := []string{"-u", "-N", "-S", pinned, "attach-session", "-t", "gc-target"}
+	if got := tm.attachCommandArgs("gc-target", namedSocketWitness{}); !reflect.DeepEqual(got, want) {
+		t.Errorf("attachCommandArgs() = %v, want %v", got, want)
+	}
+	if got := tm.hiddenAttachCommandArgsForWitness("gc-target", namedSocketWitness{}); !reflect.DeepEqual(got, want) {
+		t.Errorf("hiddenAttachCommandArgsForWitness() = %v, want %v", got, want)
 	}
 }

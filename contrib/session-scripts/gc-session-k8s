@@ -11,7 +11,7 @@
 # to the local tmux provider — real terminal scrollback, keystroke
 # nudge, interactive attach.
 #
-# See docs/exec-session-protocol.md for the full protocol specification.
+# See docs/reference/exec-session-provider.md for the full protocol specification.
 #
 # Dependencies: kubectl, jq, bash
 # Container requirements: tmux, bash
@@ -41,6 +41,12 @@ name="${2:-}"
 # Tmux session name inside each pod (constant — one session per pod).
 TMUX_SESSION="main"
 
+# Pod-side projection of the city root. This is the only directory guaranteed
+# to exist when the container starts — the "ws" emptyDir mount point for staged
+# pods, the image WORKDIR for prebaked ones — so it is what a pod manifest's
+# workingDir may safely name.
+POD_WORKSPACE_ROOT="/workspace"
+
 # --- Configuration ---
 
 NS="${GC_K8S_NAMESPACE:-gc}"
@@ -67,6 +73,29 @@ KUBECTL+=(-n "$NS")
 # sanitize_name converts a session name to a valid K8s resource name.
 # K8s names: lowercase, alphanumeric, '-', max 63 chars, must start/end
 # with alphanumeric.
+# remote_stage_city_name prints the controller city's name: its city.toml's
+# [workspace] name when readable, else the directory's base name.
+remote_stage_city_name() {
+  local dir="$1" name=""
+  if [ -f "$dir/city.toml" ]; then
+    name=$(awk '
+      /^\[/ { in_ws = ($0 ~ /^\[workspace\][[:space:]]*$/) ; next }
+      in_ws && /^[[:space:]]*name[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^"|"[[:space:]]*$/, ""); print; exit
+      }' "$dir/city.toml")
+  fi
+  if [ -z "$name" ]; then
+    name=$(basename "$dir")
+  fi
+  printf '%s' "$name"
+}
+
+# remote_stage_record prints the TOML record cmd/gc/remote_stage.go reads.
+remote_stage_record() {
+  jq -rn --arg city "$1" --arg path "$2" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '"controller_city = \($city | tojson)\ncontroller_path = \($path | tojson)\nstaged_at = \($at | tojson)"'
+}
+
 sanitize_name() {
   echo "$1" \
     | tr '[:upper:]' '[:lower:]' \
@@ -123,14 +152,18 @@ case "$op" in
     env_json=$(echo "$config" | jq -c '.env // {}')
     payload_dolt_host=$(echo "$env_json" | jq -r ".GC_DOLT_HOST // empty")
     payload_dolt_port=$(echo "$env_json" | jq -r ".GC_DOLT_PORT // empty")
+    payload_dolt_managed_local=$(echo "$env_json" | jq -r ".GC_DOLT_MANAGED_LOCAL // empty")
     emit_dolt_env=false
     dolt_host=""
     dolt_port=""
     # The session payload is the only authority for pod Dolt targeting.
     # A port-only payload means "managed-local on the controller" and must be
-    # adapted to the in-cluster managed service alias. Missing payload host/port
-    # means omit pod Dolt env entirely; do not synthesize from ambient process
-    # env or deprecated GC_K8S_DOLT_* compatibility inputs.
+    # adapted to the in-cluster managed service alias. So must a payload with
+    # GC_DOLT_MANAGED_LOCAL=1 and no port: the controller withheld the port so
+    # host-local bd follows the scope's .beads/dolt-server.port mirror, which a
+    # pod cannot read. Otherwise a missing payload host/port means omit pod
+    # Dolt env entirely; do not synthesize from ambient process env or
+    # deprecated GC_K8S_DOLT_* compatibility inputs.
     if [ -n "$payload_dolt_host" ] && [ -z "$payload_dolt_port" ]; then
       echo "start: session payload requires GC_DOLT_PORT when GC_DOLT_HOST is set" >&2
       exit 1
@@ -139,7 +172,7 @@ case "$op" in
       emit_dolt_env=true
       dolt_host="$payload_dolt_host"
       dolt_port="$payload_dolt_port"
-    elif [ -z "$payload_dolt_host" ] && [ -n "$payload_dolt_port" ]; then
+    elif [ -z "$payload_dolt_host" ] && { [ -n "$payload_dolt_port" ] || [ "$payload_dolt_managed_local" = "1" ]; }; then
       emit_dolt_env=true
       dolt_host="$DEFAULT_DOLT_HOST"
       dolt_port="$DEFAULT_DOLT_PORT"
@@ -215,15 +248,6 @@ case "$op" in
     cred_copy="mkdir -p \$HOME/.claude && cp -rL /tmp/claude-secret/. \$HOME/.claude/ 2>/dev/null; "
     ws_wait="while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; "
 
-    cmd_b64=$(printf '%s' "${command:-/bin/bash}" | base64 -w0)
-    tmux_cmd="${cred_copy}${ws_wait}${pre_cmds}CMD=\$(echo '${cmd_b64}' | base64 -d) && tmux new-session -d -s ${TMUX_SESSION} \"\$CMD\" && sleep infinity"
-
-    # Build the pod manifest as JSON using jq.
-    # All values are properly JSON-escaped by jq — no injection risk.
-    # Tell the agent which tmux session to target for metadata (drain,
-    # restart). The controller uses TMUX_SESSION ("main") when proxying
-    # set-meta/get-meta; this env var makes the agent's Go tmux provider
-    # resolve to the same session name.
     # Map controller-side work_dir to pod-side /workspace path.
     # Controller resolves agent dirs relative to its cityPath (e.g., /city),
     # but agent pods use /workspace as the city root. Rig agents need their
@@ -239,6 +263,30 @@ case "$op" in
           ;;
       esac
     fi
+
+    # The kubelet chdirs into the container's workingDir before the entrypoint
+    # runs, so the manifest can only name a directory that already exists (see
+    # $POD_WORKSPACE_ROOT). A pool or workflow worker's work_dir is a per-bead
+    # directory (<rig>/<beadID>-<slug>) that nothing has created yet, so the
+    # entrypoint creates and enters it itself.
+    #
+    # Placement matters twice over. It must come after $ws_wait, because until
+    # staging signals ready the workspace content is still being written and a
+    # shell sitting in a subdirectory of it is standing on shifting ground. And
+    # it must come before $pre_cmds, because pre_start previously ran in the
+    # work dir (the container's workingDir) and must keep doing so.
+    quoted_pod_work_dir="'$(printf '%s' "$pod_work_dir" | sed "s/'/'\\\\''/g")'"
+    enter_work_dir="mkdir -p ${quoted_pod_work_dir} && cd ${quoted_pod_work_dir} && "
+
+    cmd_b64=$(printf '%s' "${command:-/bin/bash}" | base64 -w0)
+    tmux_cmd="${cred_copy}${ws_wait}${enter_work_dir}${pre_cmds}CMD=\$(echo '${cmd_b64}' | base64 -d) && tmux new-session -d -s ${TMUX_SESSION} \"\$CMD\" && sleep infinity"
+
+    # Build the pod manifest as JSON using jq.
+    # All values are properly JSON-escaped by jq — no injection risk.
+    # Tell the agent which tmux session to target for metadata (drain,
+    # restart). The controller uses TMUX_SESSION ("main") when proxying
+    # set-meta/get-meta; this env var makes the agent's Go tmux provider
+    # resolve to the same session name.
 
     # Build env array for the pod. Remove controller-only exec providers
     # (GC_BEADS, GC_SESSION, GC_EVENTS) — agents use native bd against dolt.
@@ -258,10 +306,22 @@ case "$op" in
       end
     ')
 
-    env_array=$(echo "$env_json" | jq       --argjson dolt_env "$dolt_env_json"       --arg mcp_mail_url "http://${MCP_MAIL_HOST}:${MCP_MAIL_PORT}"       --arg mcp_mail_project "$mail_project"       --arg tmux_session "$TMUX_SESSION"       --arg pod_dir "$pod_work_dir" '
+    # Remote stage (S5-A): processes started from the pod's environment (the
+    # entrypoint, the agent and its tmux server, kubectl exec'd commands) are
+    # a remote stage of the controller's city from the container's first
+    # instruction, so none of them can create a pod-local storage binding
+    # before the on-disk record below exists. This script never switches
+    # users, so the agent inherits the environment. Names match
+    # cmd/gc/remote_stage.go.
+    stage_city_name=""
+    if [ -n "$ctrl_city" ]; then
+      stage_city_name=$(remote_stage_city_name "$ctrl_city")
+    fi
+
+    env_array=$(echo "$env_json" | jq       --arg stage_ctrl "$ctrl_city"       --arg stage_city "$stage_city_name"       --argjson dolt_env "$dolt_env_json"       --arg mcp_mail_url "http://${MCP_MAIL_HOST}:${MCP_MAIL_PORT}"       --arg mcp_mail_project "$mail_project"       --arg tmux_session "$TMUX_SESSION"       --arg pod_dir "$pod_work_dir" '
       del(.BEADS_DOLT_SERVER_HOST, .BEADS_DOLT_SERVER_PORT,
           .GC_BEADS, .GC_SESSION, .GC_EVENTS,
-          .GC_DOLT_HOST, .GC_DOLT_PORT,
+          .GC_DOLT_HOST, .GC_DOLT_PORT, .GC_DOLT_MANAGED_LOCAL,
           .GC_K8S_DOLT_HOST, .GC_K8S_DOLT_PORT,
           .GC_MAIL, .GC_MCP_MAIL_URL, .GC_MCP_MAIL_PROJECT)
       | .GC_CITY = "/workspace" | .GC_DIR = $pod_dir
@@ -273,6 +333,10 @@ case "$op" in
          {name: "GC_MAIL", value: "exec:gc-mail-mcp-agent-mail"},
          {name: "GC_TMUX_SESSION", value: $tmux_session},
          {name: "CLAUDE_CONFIG_DIR", value: "/home/gcagent/.claude"}]
+      + (if $stage_ctrl != "" then
+           [{name: "GC_REMOTE_STAGE_CONTROLLER", value: $stage_ctrl},
+            {name: "GC_REMOTE_STAGE_CITY", value: $stage_city}]
+         else [] end)
     ')
     # Determine the working directory for the main container.
     # Use the work_dir from config (host path) so that $GC_CITY and $GC_DIR
@@ -329,7 +393,7 @@ case "$op" in
         --arg mem_req "$MEM_REQ" \
         --arg cpu_lim "$CPU_LIM" \
         --arg mem_lim "$MEM_LIM" \
-        --arg work_dir "$pod_work_dir" \
+        --arg pod_root "$POD_WORKSPACE_ROOT" \
         --arg sa "$SERVICE_ACCOUNT" \
         --argjson env "$env_array" \
         --arg city "$gc_city" \
@@ -363,7 +427,7 @@ case "$op" in
               name: "agent",
               image: $image,
               imagePullPolicy: "IfNotPresent",
-              workingDir: $work_dir,
+              workingDir: $pod_root,
               command: ["/bin/sh", "-c"],
               args: [$cmd],
               env: $env,
@@ -397,7 +461,7 @@ case "$op" in
         --arg mem_req "$MEM_REQ" \
         --arg cpu_lim "$CPU_LIM" \
         --arg mem_lim "$MEM_LIM" \
-        --arg work_dir "$pod_work_dir" \
+        --arg pod_root "$POD_WORKSPACE_ROOT" \
         --arg sa "$SERVICE_ACCOUNT" \
         --argjson env "$env_array" \
         --arg city "$gc_city" \
@@ -423,7 +487,7 @@ case "$op" in
               name: "agent",
               image: $image,
               imagePullPolicy: "IfNotPresent",
-              workingDir: $work_dir,
+              workingDir: $pod_root,
               command: ["/bin/sh", "-c"],
               args: [$cmd],
               env: $env,
@@ -533,6 +597,19 @@ case "$op" in
       "${KUBECTL[@]}" exec "$pod" -- gc init --from /tmp/city-src /workspace || \
         echo "start: warning: gc init failed" >&2
       "${KUBECTL[@]}" exec "$pod" -- rm -rf /tmp/city-src 2>/dev/null || true
+    fi
+
+    # Record the pod as a remote stage of the controller's city (S5-A), as
+    # the native k8s provider does: a plain shell write (temp file, rename),
+    # whatever gc the image carries. Before the ready sentinel, and fatal on
+    # failure: a pod that cannot be marked is removed, not run unmarked.
+    if [ -n "$ctrl_city" ]; then
+      if ! remote_stage_record "$stage_city_name" "$ctrl_city" | \
+          "${KUBECTL[@]}" exec -i "$pod" -- sh -c 'mkdir -p /workspace/.gc && cat > /workspace/.gc/remote-stage.toml.tmp && mv -f /workspace/.gc/remote-stage.toml.tmp /workspace/.gc/remote-stage.toml'; then
+        echo "start: recording pod $pod as a remote stage of city $stage_city_name ($ctrl_city) failed; removing the pod rather than running it unmarked" >&2
+        "${KUBECTL[@]}" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+        exit 1
+      fi
     fi
 
     # Signal the entrypoint to proceed with tmux creation. The entrypoint

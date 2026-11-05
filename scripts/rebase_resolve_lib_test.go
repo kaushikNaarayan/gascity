@@ -4,8 +4,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
+
+func TestRebaseResolveLibUsesBash3Syntax(t *testing.T) {
+	root := repoRoot(t)
+	path := filepath.Join(root, "scripts", "rebase-resolve-lib.sh")
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rebase-resolve-lib.sh: %v", err)
+	}
+
+	bash4LowercaseExpansion := regexp.MustCompile(`\$\{[^}\n]*,,[^}\n]*\}`)
+	if match := bash4LowercaseExpansion.Find(contents); match != nil {
+		t.Fatalf("rebase-resolve-lib.sh must run under macOS Bash 3; found Bash 4 lowercase expansion %q", match)
+	}
+}
 
 // TestRebaseResolveLib runs the shell self-test for
 // scripts/rebase-resolve-lib.sh, the deployer's bounded self-rebase
@@ -23,6 +38,9 @@ func TestRebaseResolveLib(t *testing.T) {
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
 		"TMPDIR=" + t.TempDir(),
+		// internal/testenv's hermetic git template, so the temp repos the script
+		// makes have git auto-maintenance off (ga-zoe1wr).
+		"GIT_TEMPLATE_DIR=" + os.Getenv("GIT_TEMPLATE_DIR"),
 	}
 
 	out, err := cmd.CombinedOutput()

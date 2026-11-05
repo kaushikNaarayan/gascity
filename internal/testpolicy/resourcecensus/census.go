@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +25,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
+
+	"github.com/gastownhall/gascity/internal/testpolicy/waiverclock"
 )
 
 // Resource is a syntax-observable test resource.
@@ -42,27 +46,41 @@ const (
 	ResourceSlowProcessGate Resource = "slow_process_gate"
 	// ResourceHTTPTestServer counts loopback servers opened by net/http/httptest.
 	ResourceHTTPTestServer Resource = "http_test_server"
-	// ResourceNetListen counts direct listeners opened by net.Listen.
+	// ResourceListenerHelper counts calls to the explicit catalog of helpers
+	// whose implementation owns a network listener.
+	ResourceListenerHelper Resource = "listener_helper"
+	// ResourceNetListen counts direct stream listeners opened by package-level
+	// net constructors.
 	ResourceNetListen Resource = "net_listen"
-	// ResourceNetListenUnixgram counts direct Unix datagram listeners opened by net.ListenUnixgram.
-	ResourceNetListenUnixgram Resource = "net_listen_unixgram"
-	// ResourceNetListenConfig counts direct listeners opened through net.ListenConfig.Listen.
+	// ResourceNetListenPacket counts direct packet listeners opened by
+	// package-level net constructors.
+	ResourceNetListenPacket Resource = "net_listen_packet"
+	// ResourceNetListenConfig counts direct listeners opened through
+	// net.ListenConfig methods.
 	ResourceNetListenConfig Resource = "net_listen_config"
 	// ResourceSyscallListen counts direct calls that put sockets into listening state through syscall.Listen.
 	ResourceSyscallListen Resource = "syscall_listen"
+	// ResourceTmux counts typed tmux test helpers, production constructors, and literal tmux process calls.
+	ResourceTmux Resource = "tmux"
+	// ResourceTestTarget counts declared go test invocation lines in tracked
+	// build-orchestration files (Makefile, GitHub Actions workflow YAML).
+	ResourceTestTarget Resource = "test_target"
 )
 
 var knownResources = map[Resource]struct{}{
-	ResourceSubprocess:        {},
-	ResourceFixedSleep:        {},
-	ResourceEnvironment:       {},
-	ResourceCWD:               {},
-	ResourceSlowProcessGate:   {},
-	ResourceHTTPTestServer:    {},
-	ResourceNetListen:         {},
-	ResourceNetListenConfig:   {},
-	ResourceNetListenUnixgram: {},
-	ResourceSyscallListen:     {},
+	ResourceSubprocess:      {},
+	ResourceFixedSleep:      {},
+	ResourceEnvironment:     {},
+	ResourceCWD:             {},
+	ResourceSlowProcessGate: {},
+	ResourceHTTPTestServer:  {},
+	ResourceListenerHelper:  {},
+	ResourceNetListen:       {},
+	ResourceNetListenConfig: {},
+	ResourceNetListenPacket: {},
+	ResourceSyscallListen:   {},
+	ResourceTmux:            {},
+	ResourceTestTarget:      {},
 }
 
 // Scope selects the source population counted by a ledger row.
@@ -75,6 +93,9 @@ const (
 	ScopeUntagged Scope = "untagged"
 	// ScopeCmdGCUntagged selects untagged test files beneath cmd/gc.
 	ScopeCmdGCUntagged Scope = "cmd/gc+untagged"
+	// ScopeBuildTargets selects declared go test invocation lines in tracked
+	// build-orchestration files rather than Go test source.
+	ScopeBuildTargets Scope = "build_targets"
 )
 
 type baselineKey struct {
@@ -96,8 +117,6 @@ type Ledger struct {
 type Baseline struct {
 	Scope           Scope    `toml:"scope"`
 	Resource        Resource `toml:"resource"`
-	BaselineCalls   int      `toml:"baseline_calls"`
-	BaselineFiles   int      `toml:"baseline_files"`
 	ReportedCalls   int      `toml:"reported_calls"`
 	ReportedFiles   int      `toml:"reported_files"`
 	OwnerBead       string   `toml:"owner_bead"`
@@ -105,378 +124,6 @@ type Baseline struct {
 	ResourceOwner   string   `toml:"resource_owner"`
 	MigrationTarget string   `toml:"migration_target"`
 	Expires         string   `toml:"expires"`
-}
-
-var bootstrapPolicy = Ledger{
-	Version: 2,
-	AuditBaseline: []Baseline{
-		{
-			Scope:           ScopeAll,
-			Resource:        ResourceSubprocess,
-			BaselineCalls:   528,
-			BaselineFiles:   161,
-			ReportedCalls:   495,
-			ReportedFiles:   135,
-			OwnerBead:       "ga-80po0c.2",
-			Invariant:       "tracked test source totals remain visible as audit evidence",
-			ResourceOwner:   "ga-80po0c.2 owns this point-in-time source census",
-			MigrationTarget: "P0.4a",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeAll,
-			Resource:        ResourceFixedSleep,
-			BaselineCalls:   429,
-			BaselineFiles:   158,
-			ReportedCalls:   447,
-			ReportedFiles:   157,
-			OwnerBead:       "ga-80po0c.2",
-			Invariant:       "tracked test source totals remain visible as audit evidence",
-			ResourceOwner:   "ga-80po0c.2 owns this point-in-time source census",
-			MigrationTarget: "P0.4a",
-			Expires:         "2026-10-01",
-		},
-	},
-	Debt: []Baseline{
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceSubprocess,
-			BaselineCalls:   393,
-			BaselineFiles:   111,
-			ReportedCalls:   380,
-			ReportedFiles:   98,
-			OwnerBead:       "ga-80po0c.2",
-			Invariant:       "untagged subprocess call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each process-owning test removes or replaces its source call site",
-			MigrationTarget: "D1/D2/D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceFixedSleep,
-			BaselineCalls:   290,
-			BaselineFiles:   113,
-			ReportedCalls:   295,
-			ReportedFiles:   114,
-			OwnerBead:       "ga-80po0c.2",
-			Invariant:       "untagged fixed-sleep call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test replaces elapsed wall time with its lifecycle signal",
-			MigrationTarget: "W1-W5",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceEnvironment,
-			BaselineCalls:   4336,
-			BaselineFiles:   204,
-			ReportedCalls:   3960,
-			ReportedFiles:   184,
-			OwnerBead:       "ga-80po0c.2.3",
-			Invariant:       "untagged cmd/gc environment call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "cmd/gc callers restore or eliminate every recognized process-environment mutation",
-			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceCWD,
-			BaselineCalls:   285,
-			BaselineFiles:   43,
-			ReportedCalls:   98,
-			ReportedFiles:   13,
-			OwnerBead:       "ga-80po0c.2.3",
-			Invariant:       "untagged cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "cmd/gc callers restore or eliminate every recognized cwd mutation",
-			MigrationTarget: "D5/D6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceSlowProcessGate,
-			BaselineCalls:   68,
-			BaselineFiles:   24,
-			ReportedCalls:   78,
-			ReportedFiles:   27,
-			OwnerBead:       "ga-80po0c.2.3",
-			Invariant:       "untagged cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "the helper definition and every marked caller retain an explicit process-suite migration owner",
-			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceHTTPTestServer,
-			BaselineCalls:   317,
-			BaselineFiles:   66,
-			ReportedCalls:   255,
-			ReportedFiles:   56,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged HTTP test server call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test closes its loopback server and removes duplicate server-backed coverage",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListen,
-			BaselineCalls:   92,
-			BaselineFiles:   34,
-			ReportedCalls:   92,
-			ReportedFiles:   34,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged net.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test closes its listener and removes duplicate listener-backed coverage",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListenConfig,
-			BaselineCalls:   1,
-			BaselineFiles:   1,
-			ReportedCalls:   1,
-			ReportedFiles:   1,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged net.ListenConfig.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test closes its configured listener and removes duplicate listener-backed coverage",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListenUnixgram,
-			BaselineCalls:   3,
-			BaselineFiles:   2,
-			ReportedCalls:   3,
-			ReportedFiles:   2,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged net.ListenUnixgram call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test closes its Unix datagram listener and removes duplicate listener-backed coverage",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceSyscallListen,
-			BaselineCalls:   1,
-			BaselineFiles:   1,
-			ReportedCalls:   1,
-			ReportedFiles:   1,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged syscall.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each owning test closes its listening file descriptor and removes duplicate listener-backed coverage",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-	},
-	Medium: []MediumOwner{
-		{
-			PackageDir:      "internal/api",
-			PackageName:     "api",
-			Owner:           "TestEveryEmittedErrorCodeIsRegistered",
-			Resources:       []Resource{ResourceSubprocess},
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "internal/api tracked-source error URN guard is a checked Medium owner",
-			ResourceOwner:   "only the git ls-files call lexically inside TestEveryEmittedErrorCodeIsRegistered leaves Small debt",
-			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
-		},
-		{
-			PackageDir:      "cmd/gc",
-			PackageName:     "main",
-			Owner:           "TestMain",
-			Resources:       []Resource{ResourceEnvironment},
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "cmd/gc TestMain is the checked package-level Medium owner",
-			ResourceOwner:   "only environment calls lexically inside TestMain leave Small debt",
-			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
-		},
-		{
-			PackageDir:      "scripts",
-			PackageName:     "scripts_test",
-			Owner:           "TestDockerSessionProtocol",
-			Resources:       []Resource{ResourceSubprocess},
-			OwnerBead:       "ga-80po0c.23.1",
-			Invariant:       "Docker session adapter protocol proof is a checked Medium owner",
-			ResourceOwner:   "the one adapter subprocess is confined to TestDockerSessionProtocol and Docker itself is a strict PATH-injected fake",
-			MigrationTarget: "W6",
-			Expires:         "2026-10-01",
-		},
-		{
-			PackageDir:      "scripts",
-			PackageName:     "scripts_test",
-			Owner:           "TestProviderOverridesAndSuiteContractsCrossMakeIsolation",
-			Resources:       []Resource{ResourceSubprocess},
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "Make/provider and suite-contract proof is a checked Medium owner",
-			ResourceOwner:   "the six isolated Make invocations are confined to TestProviderOverridesAndSuiteContractsCrossMakeIsolation",
-			MigrationTarget: "P0.1",
-			Expires:         "2026-10-01",
-		},
-	},
-	ReviewedHermeticBody: []ReviewedHermeticBody{
-		{
-			PackageDir:    "cmd/gc",
-			PackageName:   "main",
-			Owner:         "TestDoSessionWait_RegistersReadyWaitForRigDependency",
-			EffectiveSize: "medium",
-			MediumReason:  "package TestMain mutates process state",
-		},
-		{
-			PackageDir:    "cmd/gc",
-			PackageName:   "main",
-			Owner:         "TestDoSessionWake_PokesManagedControllerAfterStateChange",
-			EffectiveSize: "medium",
-			MediumReason:  "package TestMain mutates process state",
-		},
-		{
-			PackageDir:    "cmd/gc",
-			PackageName:   "main",
-			Owner:         "TestPrepareWaitWakeState_ResolvesRigDependencyBeads",
-			EffectiveSize: "medium",
-			MediumReason:  "package TestMain mutates process state",
-		},
-		{
-			PackageDir:    "cmd/gc",
-			PackageName:   "main",
-			Owner:         "TestDoMailInbox_RendersMessagesFromReader",
-			EffectiveSize: "medium",
-			MediumReason:  "package TestMain mutates process state",
-		},
-	},
-	SmallDebt: []Baseline{
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceSubprocess,
-			BaselineCalls:   390,
-			BaselineFiles:   109,
-			ReportedCalls:   394,
-			ReportedFiles:   105,
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "untagged Small subprocess call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners remove or replace each process call site",
-			MigrationTarget: "D1/D2/D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceFixedSleep,
-			BaselineCalls:   290,
-			BaselineFiles:   113,
-			ReportedCalls:   287,
-			ReportedFiles:   113,
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "untagged Small fixed-sleep call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners replace elapsed wall time with lifecycle signals",
-			MigrationTarget: "W1-W5",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceEnvironment,
-			BaselineCalls:   4330,
-			BaselineFiles:   204,
-			ReportedCalls:   4348,
-			ReportedFiles:   200,
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "untagged Small cmd/gc environment call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners restore or eliminate every process-environment mutation",
-			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceCWD,
-			BaselineCalls:   285,
-			BaselineFiles:   43,
-			ReportedCalls:   284,
-			ReportedFiles:   43,
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "untagged Small cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners restore or eliminate every cwd mutation",
-			MigrationTarget: "D5/D6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeCmdGCUntagged,
-			Resource:        ResourceSlowProcessGate,
-			BaselineCalls:   68,
-			BaselineFiles:   24,
-			ReportedCalls:   75,
-			ReportedFiles:   25,
-			OwnerBead:       "ga-80po0c.2.1",
-			Invariant:       "untagged Small cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "each non-Medium marked caller retains an explicit process-suite migration owner",
-			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceHTTPTestServer,
-			BaselineCalls:   317,
-			BaselineFiles:   66,
-			ReportedCalls:   300,
-			ReportedFiles:   66,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged Small HTTP test server call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners move server-backed tests to exact Medium ownership or replace the listener",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListen,
-			BaselineCalls:   92,
-			BaselineFiles:   34,
-			ReportedCalls:   92,
-			ReportedFiles:   34,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged Small net.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners move listener-backed tests to exact Medium ownership or replace the listener",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListenConfig,
-			BaselineCalls:   1,
-			BaselineFiles:   1,
-			ReportedCalls:   1,
-			ReportedFiles:   1,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged Small net.ListenConfig.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners move ListenConfig-backed tests to exact Medium ownership or replace the listener",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceNetListenUnixgram,
-			BaselineCalls:   3,
-			BaselineFiles:   2,
-			ReportedCalls:   3,
-			ReportedFiles:   2,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged Small net.ListenUnixgram call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners move Unix datagram listener-backed tests to exact Medium ownership or replace the listener",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-		{
-			Scope:           ScopeUntagged,
-			Resource:        ResourceSyscallListen,
-			BaselineCalls:   1,
-			BaselineFiles:   1,
-			ReportedCalls:   1,
-			ReportedFiles:   1,
-			OwnerBead:       "ga-80po0c.2.2",
-			Invariant:       "untagged Small syscall.Listen call/file totals cannot grow; reductions must lower this baseline",
-			ResourceOwner:   "non-Medium lexical owners move syscall-backed listener tests to exact Medium ownership or replace the listener",
-			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-01",
-		},
-	},
 }
 
 // Occurrence is one syntax-owned resource use.
@@ -526,18 +173,24 @@ func scopeContains(scope Scope, occurrence Occurrence) bool {
 		return !occurrence.Tagged
 	case ScopeCmdGCUntagged:
 		return !occurrence.Tagged && strings.HasPrefix(occurrence.Path, "cmd/gc/")
+	case ScopeBuildTargets:
+		return occurrence.Resource == ResourceTestTarget
 	default:
 		return false
 	}
 }
 
-// ScanRepository scans the repository's tracked Go test files. Tracked sibling
-// Go source supplies package-level declaration context but is never counted.
-func ScanRepository(root string) (Census, error) {
-	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
-	out, err := cmd.Output()
+// gitLsFiles lists git-tracked files under root matching pathspecs,
+// repository-relative with forward slashes. Listing tracked files rather than
+// walking the filesystem means an untracked nested git worktree checked out
+// under root — the common gitignored worktrees/<bead> pool-slot pattern —
+// contributes nothing: its files live in that worktree's own index, never
+// this one's.
+func gitLsFiles(root string, pathspecs ...string) ([]string, error) {
+	args := append([]string{"-C", root, "ls-files", "-z", "--"}, pathspecs...)
+	out, err := exec.Command("git", args...).Output()
 	if err != nil {
-		return Census{}, fmt.Errorf("listing tracked Go source: %w", err)
+		return nil, fmt.Errorf("listing tracked files: %w", err)
 	}
 	parts := strings.Split(string(out), "\x00")
 	files := make([]string, 0, len(parts))
@@ -546,28 +199,219 @@ func ScanRepository(root string) (Census, error) {
 			files = append(files, filepath.ToSlash(name))
 		}
 	}
-	return scanFiles(os.DirFS(root), files, reviewedHermeticPackages(bootstrapPolicy.ReviewedHermeticBody))
+	return files, nil
 }
 
-// ScanFS scans every *_test.go file in sourceFS. Sibling Go source supplies
-// package-level declaration context but is never counted. ScanFS is intended
-// for hermetic policy fixtures; repository checks use ScanRepository so
-// untracked files do not perturb the checked baseline.
+// TrackedGoFiles lists every git-tracked *.go file under root, repository-
+// relative with forward slashes.
+func TrackedGoFiles(root string) ([]string, error) {
+	files, err := gitLsFiles(root, "*.go")
+	if err != nil {
+		// Bazel runfiles trees carry no .git; walk the declared source tree
+		// so census consumers stay effective under `bazel test`.
+		return walkedTrackedGoFiles(root), nil
+	}
+	return files, nil
+}
+
+// trackedBuildTargetFiles lists every git-tracked Makefile and GitHub Actions
+// workflow YAML file under root, repository-relative with forward slashes.
+func trackedBuildTargetFiles(root string) ([]string, error) {
+	files, err := gitLsFiles(root, "Makefile", ".github/workflows/*.yml", ".github/workflows/*.yaml")
+	if err != nil {
+		// Bazel runfiles trees carry no .git; read the declared files directly
+		// so the build-target dimension stays effective under `bazel test`.
+		return walkedBuildTargetFiles(root)
+	}
+	return files, nil
+}
+
+// walkedBuildTargetFiles lists the Makefile and workflow YAML files present
+// under root without consulting git.
+func walkedBuildTargetFiles(root string) ([]string, error) {
+	var files []string
+	if _, err := os.Stat(filepath.Join(root, "Makefile")); err == nil {
+		files = append(files, "Makefile")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("listing build-orchestration files: %w", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".github", "workflows"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return files, nil
+		}
+		return nil, fmt.Errorf("listing build-orchestration files: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext == ".yml" || ext == ".yaml" {
+			files = append(files, ".github/workflows/"+entry.Name())
+		}
+	}
+	return files, nil
+}
+
+// ScanRepository scans the repository's tracked Go test files, plus its
+// tracked build-orchestration files (Makefile, GitHub Actions workflow YAML)
+// for declared go test invocation lines. Tracked sibling Go source supplies
+// package-level declaration context but is never counted.
+func ScanRepository(root string) (Census, error) {
+	files, err := TrackedGoFiles(root)
+	if err != nil {
+		return Census{}, err
+	}
+	census, err := scanFiles(os.DirFS(root), files, reviewedHermeticPackages(bootstrapPolicy.ReviewedHermeticBody))
+	if err != nil {
+		return Census{}, err
+	}
+	buildTargetFiles, err := trackedBuildTargetFiles(root)
+	if err != nil {
+		return Census{}, err
+	}
+	buildTargetOccurrences, err := scanBuildTargetFiles(os.DirFS(root), buildTargetFiles)
+	if err != nil {
+		return Census{}, err
+	}
+	census.Occurrences = append(census.Occurrences, buildTargetOccurrences...)
+	sortOccurrences(census.Occurrences)
+	return census, nil
+}
+
+// ScanFS scans every *_test.go file in sourceFS, plus every Makefile and
+// GitHub Actions workflow YAML file for declared go test invocation lines.
+// Sibling Go source supplies package-level declaration context but is never
+// counted. ScanFS is intended for hermetic policy fixtures; repository checks
+// use ScanRepository so untracked files do not perturb the checked baseline.
 func ScanFS(sourceFS fs.FS) (Census, error) {
 	var files []string
+	var buildTargetFiles []string
 	err := fs.WalkDir(sourceFS, ".", func(name string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !entry.IsDir() && strings.HasSuffix(name, ".go") {
+		if entry.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(name, ".go") {
 			files = append(files, filepath.ToSlash(name))
+		}
+		if isBuildTargetFile(name) {
+			buildTargetFiles = append(buildTargetFiles, filepath.ToSlash(name))
 		}
 		return nil
 	})
 	if err != nil {
 		return Census{}, fmt.Errorf("walking test source: %w", err)
 	}
-	return scanFiles(sourceFS, files, nil)
+	census, err := scanFiles(sourceFS, files, nil)
+	if err != nil {
+		return Census{}, err
+	}
+	buildTargetOccurrences, err := scanBuildTargetFiles(sourceFS, buildTargetFiles)
+	if err != nil {
+		return Census{}, err
+	}
+	census.Occurrences = append(census.Occurrences, buildTargetOccurrences...)
+	sortOccurrences(census.Occurrences)
+	return census, nil
+}
+
+// isBuildTargetFile reports whether name is a tracked build-orchestration
+// file the build-target census scans: the repository-root Makefile, or a
+// GitHub Actions workflow YAML file.
+func isBuildTargetFile(name string) bool {
+	if name == "Makefile" {
+		return true
+	}
+	if path.Dir(name) != ".github/workflows" {
+		return false
+	}
+	return strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")
+}
+
+// goTestInvocationPattern matches a `go test` invocation as adjacent,
+// whitespace-separated words. This is literal-text matching, the same
+// fidelity as the pre-AST audit census: it does not parse Makefile recipes or
+// shell, so it cannot distinguish a real invocation from one that merely
+// appears inside a string. It is deliberately scoped to declared recipe/run
+// lines (comments and non-run YAML text are excluded before this pattern
+// ever sees them) to keep that imprecision bounded.
+var goTestInvocationPattern = regexp.MustCompile(`\bgo\s+test\b`)
+
+// workflowFile is the minimal shape of a GitHub Actions workflow needed to
+// find declared step run text. Unrecognized fields are ignored.
+type workflowFile struct {
+	Jobs map[string]workflowJob `yaml:"jobs"`
+}
+
+type workflowJob struct {
+	Steps []workflowStep `yaml:"steps"`
+}
+
+type workflowStep struct {
+	Run string `yaml:"run"`
+}
+
+// lineOccurrences returns one Occurrence per line in text that invokes go
+// test, skipping blank lines and lines whose first non-whitespace content is
+// a comment. requireTabIndent restricts matches to Makefile recipe lines
+// (leading tab, the syntax that marks a line as a recipe rather than a
+// target/variable declaration); workflow run text has no such prefix
+// requirement.
+func lineOccurrences(path, text string, requireTabIndent bool) []Occurrence {
+	var occurrences []Occurrence
+	for _, line := range strings.Split(text, "\n") {
+		if requireTabIndent && !strings.HasPrefix(line, "\t") {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if goTestInvocationPattern.MatchString(trimmed) {
+			occurrences = append(occurrences, Occurrence{Path: path, Resource: ResourceTestTarget})
+		}
+	}
+	return occurrences
+}
+
+// scanBuildTargetFiles scans Makefile and GitHub Actions workflow YAML files
+// for declared go test invocation lines. Unlike scanFiles, these are not Go
+// source: no AST parsing applies, and every Occurrence is a bare
+// Path/Resource pair — build-orchestration text has no Go package identity,
+// tagging, or runnable ownership to attach.
+func scanBuildTargetFiles(sourceFS fs.FS, names []string) ([]Occurrence, error) {
+	var occurrences []Occurrence
+	for _, name := range names {
+		content, err := fs.ReadFile(sourceFS, name)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", name, err)
+		}
+		if path.Base(name) == "Makefile" {
+			occurrences = append(occurrences, lineOccurrences(name, string(content), true)...)
+			continue
+		}
+		var workflow workflowFile
+		if err := yaml.Unmarshal(content, &workflow); err != nil {
+			return nil, fmt.Errorf("parsing workflow %s: %w", name, err)
+		}
+		jobNames := make([]string, 0, len(workflow.Jobs))
+		for jobName := range workflow.Jobs {
+			jobNames = append(jobNames, jobName)
+		}
+		sort.Strings(jobNames)
+		for _, jobName := range jobNames {
+			for _, step := range workflow.Jobs[jobName].Steps {
+				if step.Run == "" {
+					continue
+				}
+				occurrences = append(occurrences, lineOccurrences(name, step.Run, false)...)
+			}
+		}
+	}
+	return occurrences, nil
 }
 
 func reviewedHermeticPackages(rows []ReviewedHermeticBody) map[packageKey]struct{} {
@@ -593,12 +437,61 @@ type bindingInfo struct {
 	uses                       map[*ast.Ident]types.Object
 	expressionTypes            map[ast.Expr]types.TypeAndValue
 	packageDeclarations        map[string]struct{}
+	packageFunctions           map[string]struct{}
 	unresolvedImportQualifiers map[string]struct{}
 }
 
 type packageKey struct {
 	directory   string
 	packageName string
+}
+
+type listenerHelperPackageIdentity struct {
+	importPath string
+	key        packageKey
+	names      []string
+}
+
+var listenerHelperPackageIdentities = []listenerHelperPackageIdentity{
+	{
+		key: packageKey{directory: "cmd/gc", packageName: "main"},
+		names: []string{
+			"managedDoltPortAvailableForHost",
+			"registryBrowserLogin",
+			"runController",
+			"runSupervisor",
+			"startControllerSocket",
+			"startNudgeWakeListener",
+		},
+	},
+	{
+		importPath: "github.com/gastownhall/gascity/internal/runtime/runtimecapability",
+		key:        packageKey{directory: "internal/runtime/runtimecapability", packageName: "runtimecapability"},
+		names:      []string{"Run"},
+	},
+	{
+		importPath: "github.com/gastownhall/gascity/test/acceptance/helpers",
+		key:        packageKey{directory: "test/acceptance/helpers", packageName: "acceptancehelpers"},
+		names:      []string{"WriteSupervisorConfig"},
+	},
+	{
+		key:   packageKey{directory: "test/dashport", packageName: "dashport_test"},
+		names: []string{"newHarness"},
+	},
+}
+
+var targetedDotImportPaths = map[string]struct{}{
+	"github.com/gastownhall/gascity/internal/runtime/runtimecapability": {},
+	"github.com/gastownhall/gascity/internal/runtime/tmux":              {},
+	"github.com/gastownhall/gascity/test/acceptance/helpers":            {},
+	"github.com/gastownhall/gascity/test/tmuxtest":                      {},
+	"net":               {},
+	"net/http/httptest": {},
+	"os":                {},
+	"os/exec":           {},
+	"syscall":           {},
+	"testing":           {},
+	"time":              {},
 }
 
 type resourceCall struct {
@@ -619,7 +512,14 @@ func (importer *emptyPackageImporter) Import(importPath string) (*types.Package,
 	if imported, ok := importer.packages[importPath]; ok {
 		return imported, nil
 	}
-	imported := types.NewPackage(importPath, path.Base(importPath))
+	packageName := path.Base(importPath)
+	for _, identity := range listenerHelperPackageIdentities {
+		if importPath == identity.importPath {
+			packageName = identity.key.packageName
+			break
+		}
+	}
+	imported := types.NewPackage(importPath, packageName)
 	if importPath == "net" {
 		// Seed only the receiver type the census needs so go/types can carry
 		// ListenConfig identity through pointers and aliases without loading
@@ -666,6 +566,7 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 	var hermeticSources []parsedFile
 	var runnables []RunnableOwner
 	packageDeclarations := make(map[packageKey]map[string]struct{})
+	packageFunctions := make(map[packageKey]map[string]struct{})
 	for _, name := range names {
 		data, err := fs.ReadFile(sourceFS, name)
 		if err != nil {
@@ -683,6 +584,15 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 			packageDeclarations[key] = declarations
 		}
 		recordPackageDeclarations(file, declarations)
+		listenerHelperNames := listenerHelperPackageNames(key)
+		if len(listenerHelperNames) > 0 {
+			functions := packageFunctions[key]
+			if functions == nil {
+				functions = make(map[string]struct{})
+				packageFunctions[key] = functions
+			}
+			recordPackageFunctionDeclarations(file, functions, listenerHelperNames)
+		}
 		source := parsedFile{
 			name:        normalized,
 			directory:   key.directory,
@@ -705,7 +615,7 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 			return Census{}, fmt.Errorf("scanning imports in %s: %w", name, err)
 		}
 		runnables = append(runnables, runnableOwners(file, key.directory, key.packageName)...)
-		candidates := resourceCandidateCalls(file)
+		candidates := resourceCandidateCalls(file, key)
 		source.tagged = tagged || hasImplicitPlatformConstraint(name)
 		source.calls = candidates
 		if retainHermeticSource {
@@ -722,6 +632,7 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 		source := &sources[index]
 		bindings := resolveBindings(fileSet, source.file, importer, fmt.Sprintf("resourcecensus.local/file%d", index))
 		bindings.packageDeclarations = packageDeclarations[source.groupKey()]
+		bindings.packageFunctions = packageFunctions[source.groupKey()]
 		bindings.unresolvedImportQualifiers = unresolvedDefaultImportQualifiers(source.file)
 		source.bindings = bindings
 	}
@@ -758,11 +669,11 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 			fileSet:             fileSet,
 			files:               hermeticSources,
 			packageDeclarations: packageDeclarations,
+			packageFunctions:    packageFunctions,
 		},
 	}
 	for _, source := range sources {
-		testingObjects, err := testingParameterObjects(source.file, source.bindings)
-		if err != nil {
+		if _, err := testingParameterObjects(source.file, source.bindings); err != nil {
 			return Census{}, fmt.Errorf("scanning testing parameters in %s: %w", source.name, err)
 		}
 		for _, declaration := range source.file.Decls {
@@ -780,7 +691,7 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 		}
 
 		for _, candidate := range source.calls {
-			resources, err := matchedResourcesForCall(candidate.call, source.bindings, testingObjects, slowHelpers[source.groupKey()])
+			resources, err := matchedResourcesForCall(candidate.call, source.groupKey(), source.bindings, slowHelpers[source.groupKey()])
 			if err != nil {
 				return Census{}, fmt.Errorf("scanning resource calls in %s: %w", source.name, err)
 			}
@@ -790,8 +701,15 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 		}
 	}
 
-	sort.Slice(census.Occurrences, func(i, j int) bool {
-		left, right := census.Occurrences[i], census.Occurrences[j]
+	sortOccurrences(census.Occurrences)
+	return census, nil
+}
+
+// sortOccurrences sorts occurrences into the deterministic order every
+// census caller relies on: path, then owner, then resource.
+func sortOccurrences(occurrences []Occurrence) {
+	sort.Slice(occurrences, func(i, j int) bool {
+		left, right := occurrences[i], occurrences[j]
 		if left.Path != right.Path {
 			return left.Path < right.Path
 		}
@@ -800,7 +718,6 @@ func scanFiles(sourceFS fs.FS, names []string, hermeticPackages map[packageKey]s
 		}
 		return left.Resource < right.Resource
 	})
-	return census, nil
 }
 
 func (p parsedFile) groupKey() packageKey {
@@ -933,7 +850,7 @@ func validateImports(file *ast.File) error {
 			continue
 		}
 		if spec.Name != nil && spec.Name.Name == "." {
-			if importPath == "net" || importPath == "os/exec" || importPath == "time" || importPath == "os" || importPath == "syscall" || importPath == "testing" || importPath == "net/http/httptest" {
+			if _, targeted := targetedDotImportPaths[importPath]; targeted {
 				return fmt.Errorf("targeted dot import %q cannot be counted safely", importPath)
 			}
 		}
@@ -941,21 +858,23 @@ func validateImports(file *ast.File) error {
 	return nil
 }
 
-func resourceCandidateCalls(file *ast.File) []resourceCall {
+func resourceCandidateCalls(file *ast.File, key packageKey) []resourceCall {
 	aliases := testingImportAliases(file)
+	listenerHelperSelectors := listenerHelperSelectorCandidates(file)
+	samePackageHelperNames := listenerHelperPackageNames(key)
 	var calls []resourceCall
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if ok {
-			calls = appendResourceCandidateCalls(calls, function.Body, function.Name.Name, isRunnableOwner(function, aliases))
+			calls = appendResourceCandidateCalls(calls, function.Body, function.Name.Name, isRunnableOwner(function, aliases), listenerHelperSelectors, samePackageHelperNames)
 			continue
 		}
-		calls = appendResourceCandidateCalls(calls, declaration, "", false)
+		calls = appendResourceCandidateCalls(calls, declaration, "", false, listenerHelperSelectors, samePackageHelperNames)
 	}
 	return calls
 }
 
-func appendResourceCandidateCalls(calls []resourceCall, node ast.Node, owner string, runnable bool) []resourceCall {
+func appendResourceCandidateCalls(calls []resourceCall, node ast.Node, owner string, runnable bool, listenerHelperSelectors map[string]struct{}, listenerHelperPackageNames []string) []resourceCall {
 	ast.Inspect(node, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
@@ -964,17 +883,59 @@ func appendResourceCandidateCalls(calls []resourceCall, node ast.Node, owner str
 		switch function := unparen(call.Fun).(type) {
 		case *ast.SelectorExpr:
 			switch function.Sel.Name {
-			case "Command", "CommandContext", "Sleep", "Setenv", "Unsetenv", "Clearenv", "Chdir", "Listen", "ListenUnixgram", "NewServer", "NewTLSServer", "NewUnstartedServer":
+			case "Command", "CommandContext", "ConfigureProcessEnv", "KillAllTestSessions", "LookPath", "NewGuard", "NewGuardWithSocket", "NewProvider", "NewProviderWithConfig", "NewSeamBackedWithConfig", "NewServer", "NewTLSServer", "NewTmux", "NewTmuxWithConfig", "NewUnstartedServer", "RequireTmux", "Sleep", "Setenv", "Unsetenv", "Clearenv", "Chdir", "Listen", "ListenIP", "ListenMulticastUDP", "ListenPacket", "ListenTCP", "ListenUDP", "ListenUnix", "ListenUnixgram":
+				calls = append(calls, resourceCall{call: call, owner: owner, runnable: runnable})
+			}
+			if _, candidate := listenerHelperSelectors[function.Sel.Name]; candidate {
 				calls = append(calls, resourceCall{call: call, owner: owner, runnable: runnable})
 			}
 		case *ast.Ident:
-			if function.Name == "skipSlowCmdGCTest" {
+			if function.Name == "skipSlowCmdGCTest" || containsString(listenerHelperPackageNames, function.Name) {
 				calls = append(calls, resourceCall{call: call, owner: owner, runnable: runnable})
 			}
 		}
 		return true
 	})
 	return calls
+}
+
+func listenerHelperSelectorCandidates(file *ast.File) map[string]struct{} {
+	candidates := make(map[string]struct{})
+	for _, spec := range file.Imports {
+		if spec.Name != nil && spec.Name.Name == "_" {
+			continue
+		}
+		importPath, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		for _, identity := range listenerHelperPackageIdentities {
+			if importPath == identity.importPath {
+				for _, name := range identity.names {
+					candidates[name] = struct{}{}
+				}
+			}
+		}
+	}
+	return candidates
+}
+
+func listenerHelperPackageNames(key packageKey) []string {
+	for _, identity := range listenerHelperPackageIdentities {
+		if key == identity.key {
+			return identity.names
+		}
+	}
+	return nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func runnableOwners(file *ast.File, packageDir, packageName string) []RunnableOwner {
@@ -1123,7 +1084,7 @@ func netListenReceiverExpressions(file *ast.File) []ast.Expr {
 			return true
 		}
 		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-		if ok && selector.Sel.Name == "Listen" {
+		if ok && (selector.Sel.Name == "Listen" || selector.Sel.Name == "ListenPacket") {
 			receivers = append(receivers, unparen(selector.X))
 		}
 		return true
@@ -1149,6 +1110,15 @@ func recordPackageDeclarations(file *ast.File, declarations map[string]struct{})
 					}
 				}
 			}
+		}
+	}
+}
+
+func recordPackageFunctionDeclarations(file *ast.File, functions map[string]struct{}, catalogNames []string) {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Recv == nil && containsString(catalogNames, function.Name.Name) {
+			functions[function.Name.Name] = struct{}{}
 		}
 	}
 }
@@ -1205,6 +1175,10 @@ func hasSlowHelperDeclarationCandidate(file *ast.File) bool {
 	return false
 }
 
+// testingParameterObjects is retained for its fail-closed error: both call
+// sites discard the returned set and keep the call only so an unresolvable
+// `*testing.T`/`testing.TB` parameter aborts the scan. Do not delete it as an
+// unused value.
 func testingParameterObjects(file *ast.File, bindings bindingInfo) (map[types.Object]bool, error) {
 	objects := make(map[types.Object]bool)
 	var inspectErr error
@@ -1272,7 +1246,7 @@ func isNetListenConfigValue(expression ast.Expr, bindings bindingInfo) (bool, er
 
 func isNetListenConfigCall(call *ast.CallExpr, bindings bindingInfo) (bool, error) {
 	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "Listen" {
+	if !ok || (selector.Sel.Name != "Listen" && selector.Sel.Name != "ListenPacket") {
 		return false, nil
 	}
 	receiver := unparen(selector.X)
@@ -1332,26 +1306,28 @@ func isImportedType(expression ast.Expr, bindings bindingInfo, importPath, typeN
 	return isImportedQualifier(identifier, bindings, importPath)
 }
 
-func isTestingCall(call *ast.CallExpr, bindings bindingInfo, testingObjects map[types.Object]bool, method string) (bool, error) {
+// checkTestingReceiverBinding fails closed when a Setenv/Chdir call's receiver
+// identifier cannot be resolved lexically, so an ambiguous call is never
+// silently miscounted (or silently ignored) by matchedResourcesForCall.
+func checkTestingReceiverBinding(call *ast.CallExpr, bindings bindingInfo, method string) error {
 	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != method {
-		return false, nil
+		return nil
 	}
 	identifier, ok := unparen(selector.X).(*ast.Ident)
 	if !ok {
-		return false, nil
+		return nil
 	}
-	object := bindings.uses[identifier]
-	if object == nil {
-		if _, declared := bindings.packageDeclarations[identifier.Name]; declared {
-			return false, nil
-		}
-		if _, imported := bindings.unresolvedImportQualifiers[identifier.Name]; imported {
-			return false, nil
-		}
-		return false, fmt.Errorf("testing resource receiver %q has no lexical binding", identifier.Name)
+	if object := bindings.uses[identifier]; object != nil {
+		return nil
 	}
-	return testingObjects[object], nil
+	if _, declared := bindings.packageDeclarations[identifier.Name]; declared {
+		return nil
+	}
+	if _, imported := bindings.unresolvedImportQualifiers[identifier.Name]; imported {
+		return nil
+	}
+	return fmt.Errorf("testing resource receiver %q has no lexical binding", identifier.Name)
 }
 
 func isSlowHelperDeclaration(function *ast.FuncDecl, bindings bindingInfo) (bool, error) {
@@ -1390,6 +1366,33 @@ func functionParameterCount(fields *ast.FieldList) int {
 		}
 	}
 	return count
+}
+
+func isListenerHelperPackageCall(call *ast.CallExpr, key packageKey, bindings bindingInfo) bool {
+	identifier, ok := unparen(call.Fun).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	for _, identity := range listenerHelperPackageIdentities {
+		if key != identity.key {
+			continue
+		}
+		for _, helperName := range identity.names {
+			if identifier.Name != helperName {
+				continue
+			}
+			if _, declared := bindings.packageFunctions[helperName]; !declared {
+				return false
+			}
+			object := bindings.uses[identifier]
+			if object == nil {
+				return true
+			}
+			function, ok := object.(*types.Func)
+			return ok && function.Pkg() != nil && function.Pkg().Name() == key.packageName && function.Parent() == function.Pkg().Scope()
+		}
+	}
+	return false
 }
 
 func isSlowHelperCall(call *ast.CallExpr, bindings bindingInfo, ownership types.Object) bool {
@@ -1471,6 +1474,9 @@ func ParseLedger(data []byte) (Ledger, error) {
 			fields = append(fields, key.String())
 		}
 		sort.Strings(fields)
+		if removed := removedLedgerFields(fields); len(removed) > 0 {
+			return Ledger{}, countsFailure(fmt.Sprintf("ledger field %s was removed in policy version 3: per-row counts now live in %s", strings.Join(removed, ", "), CountsPath))
+		}
 		return Ledger{}, fmt.Errorf("unknown ledger field: %s", strings.Join(fields, ", "))
 	}
 	return ledger, nil
@@ -1485,59 +1491,68 @@ func LoadLedger(name string) (Ledger, error) {
 	return ParseLedger(data)
 }
 
-// Validate checks schema ownership, expiration, and exact census baselines.
-func Validate(ledger Ledger, census Census, now time.Time) error {
-	return validateAgainstPolicy(bootstrapPolicy, ledger, census, now)
+// Validate checks schema ownership and exact census baselines. It never reads
+// or takes a clock: whether a row's date is acceptable today is answered by
+// handing PolicyExpiries to internal/testpolicy/waiverclock from the one
+// never-cached date check (internal/testpolicy/waiverexpiry). Keeping the two
+// apart is what lets this check's result be cached without going stale on the
+// calendar.
+func Validate(ledger Ledger, census Census) error {
+	return validateAgainstPolicy(bootstrapPolicy, ledger, census)
 }
 
-func validateAgainstPolicy(policy, ledger Ledger, census Census, now time.Time) error {
-	if problems := validateManifestAgainstPolicy(policy, ledger, now); len(problems) > 0 {
+// PolicyExpiries returns one dated expiry per bootstrap policy row, for the
+// waiver clock to judge against today. Validate forces every row of the checked
+// ledger to equal its policy row, expires included, so these are the checked
+// ledger's dates.
+func PolicyExpiries() []waiverclock.Expiry {
+	return collectExpiries(bootstrapPolicy)
+}
+
+// validateAgainstPolicy checks the ledger's structure: its rows equal the
+// bootstrap policy, the Medium and reviewed hermetic rows exist in the scan,
+// and the rows are sorted. The counts live in the counts file and are judged by
+// ValidateCounts.
+func validateAgainstPolicy(policy, ledger Ledger, census Census) error {
+	fail := func(problems ...string) error {
+		if len(problems) == 0 {
+			return nil
+		}
 		sort.Strings(problems)
-		return errors.New(strings.Join(problems, "\n"))
+		return countsFailure(problems...)
 	}
-	if err := validateMediumOwners(ledger.Medium, census, now); err != nil {
-		return err
+
+	if problems := validateManifestAgainstPolicy(policy, ledger); len(problems) > 0 {
+		return fail(problems...)
+	}
+	if err := validateMediumOwners(ledger.Medium, census); err != nil {
+		return fail(err.Error())
 	}
 	if err := validateReviewedHermeticBodies(ledger.ReviewedHermeticBody, census); err != nil {
-		return err
+		return fail(err.Error())
 	}
-
-	var problems []string
-	for _, baseline := range ledger.AuditBaseline {
-		prefix := fmt.Sprintf("audit baseline scope=%s resource=%s", baseline.Scope, baseline.Resource)
-		problems = append(problems, validateBaseline(prefix, baseline, census)...)
-	}
-	for _, debt := range ledger.Debt {
-		prefix := fmt.Sprintf("debt baseline scope=%s resource=%s", debt.Scope, debt.Resource)
-		problems = append(problems, validateBaseline(prefix, debt, census)...)
-	}
-	for _, debt := range ledger.SmallDebt {
-		problems = append(problems, validateSmallBaseline(debt, census, ledger.Medium)...)
-	}
-	if len(problems) == 0 {
-		return nil
-	}
-	sort.Strings(problems)
-	return errors.New(strings.Join(problems, "\n"))
+	return nil
 }
 
-func validateManifestAgainstPolicy(policy, ledger Ledger, now time.Time) []string {
+func validateManifestAgainstPolicy(policy, ledger Ledger) []string {
 	var problems []string
-	if policy.Version != 2 {
-		problems = append(problems, fmt.Sprintf("bootstrap policy version = %d, want 2", policy.Version))
+	if policy.Version != 3 {
+		problems = append(problems, fmt.Sprintf("bootstrap policy version = %d, want 3", policy.Version))
 	}
 	if ledger.Version != policy.Version {
 		problems = append(problems, fmt.Sprintf("ledger version = %d, bootstrap policy requires %d", ledger.Version, policy.Version))
 	}
-	problems = append(problems, validateRowsAgainstPolicy("audit", policy.AuditBaseline, ledger.AuditBaseline, now)...)
-	problems = append(problems, validateRowsAgainstPolicy("debt", policy.Debt, ledger.Debt, now)...)
-	problems = append(problems, validateMediumRowsAgainstPolicy(policy.Medium, ledger.Medium, now)...)
+	problems = append(problems, validateRowsAgainstPolicy("audit", policy.AuditBaseline, ledger.AuditBaseline)...)
+	problems = append(problems, validateRowsAgainstPolicy("debt", policy.Debt, ledger.Debt)...)
+	problems = append(problems, validateMediumRowsAgainstPolicy(policy.Medium, ledger.Medium)...)
+	problems = append(problems, validateMediumRowOrder(ledger.Medium)...)
+	problems = append(problems, validateReviewedHermeticRowOrder(ledger.ReviewedHermeticBody)...)
 	problems = append(problems, validateReviewedHermeticRowsAgainstPolicy(policy.ReviewedHermeticBody, ledger.ReviewedHermeticBody)...)
-	problems = append(problems, validateRowsAgainstPolicy("small debt", policy.SmallDebt, ledger.SmallDebt, now)...)
+	problems = append(problems, validateRowsAgainstPolicy("small debt", policy.SmallDebt, ledger.SmallDebt)...)
 	return problems
 }
 
-func validateRowsAgainstPolicy(kind string, policyRows, ledgerRows []Baseline, now time.Time) []string {
+func validateRowsAgainstPolicy(kind string, policyRows, ledgerRows []Baseline) []string {
 	var problems []string
 	policyByKey := map[baselineKey]Baseline{}
 	for _, row := range policyRows {
@@ -1547,7 +1562,7 @@ func validateRowsAgainstPolicy(kind string, policyRows, ledgerRows []Baseline, n
 			problems = append(problems, fmt.Sprintf("duplicate bootstrap %s baseline: scope=%s resource=%s", kind, row.Scope, row.Resource))
 		}
 		policyByKey[key] = row
-		problems = append(problems, validateBaselineDefinition(prefix, row, now)...)
+		problems = append(problems, validateBaselineDefinition(prefix, row)...)
 	}
 
 	seen := map[baselineKey]bool{}
@@ -1558,7 +1573,7 @@ func validateRowsAgainstPolicy(kind string, policyRows, ledgerRows []Baseline, n
 			problems = append(problems, fmt.Sprintf("duplicate %s baseline: scope=%s resource=%s", kind, row.Scope, row.Resource))
 		}
 		seen[key] = true
-		problems = append(problems, validateBaselineDefinition(prefix, row, now)...)
+		problems = append(problems, validateBaselineDefinition(prefix, row)...)
 		want, exists := policyByKey[key]
 		if !exists {
 			problems = append(problems, fmt.Sprintf("unexpected %s baseline: scope=%s resource=%s", kind, row.Scope, row.Resource))
@@ -1580,8 +1595,6 @@ func comparePolicyFields(prefix string, got, want Baseline) []string {
 		name      string
 		got, want int
 	}{
-		{"baseline_calls", got.BaselineCalls, want.BaselineCalls},
-		{"baseline_files", got.BaselineFiles, want.BaselineFiles},
 		{"reported_calls", got.ReportedCalls, want.ReportedCalls},
 		{"reported_files", got.ReportedFiles, want.ReportedFiles},
 	} {
@@ -1606,7 +1619,7 @@ func comparePolicyFields(prefix string, got, want Baseline) []string {
 	return problems
 }
 
-func validateBaselineDefinition(prefix string, row Baseline, now time.Time) []string {
+func validateBaselineDefinition(prefix string, row Baseline) []string {
 	var problems []string
 	if !knownScope(row.Scope) {
 		problems = append(problems, fmt.Sprintf("%s: unknown scope %q", prefix, row.Scope))
@@ -1614,40 +1627,27 @@ func validateBaselineDefinition(prefix string, row Baseline, now time.Time) []st
 	if _, ok := knownResources[row.Resource]; !ok {
 		problems = append(problems, fmt.Sprintf("%s: unknown resource %q", prefix, row.Resource))
 	}
-	if row.BaselineCalls < 0 || row.BaselineFiles < 0 {
-		problems = append(problems, prefix+": baselines must be non-negative")
-	}
 	if row.ReportedCalls < 0 || row.ReportedFiles < 0 {
 		problems = append(problems, prefix+": historical census must be non-negative")
 	}
-	problems = append(problems, validateOwnership(prefix, row, now)...)
+	problems = append(problems, validateOwnership(prefix, row)...)
 	return problems
 }
 
-func validateBaseline(prefix string, row Baseline, census Census) []string {
-	if row.BaselineCalls < 0 || row.BaselineFiles < 0 {
-		return []string{prefix + ": baselines must be non-negative"}
-	}
-	actual := census.Count(row.Scope, row.Resource)
-	switch {
-	case actual.Calls > row.BaselineCalls || actual.Files > row.BaselineFiles:
-		return []string{fmt.Sprintf("source resource census grew: scope=%s resource=%s calls=%d (baseline %d), files=%d (baseline %d)", row.Scope, row.Resource, actual.Calls, row.BaselineCalls, actual.Files, row.BaselineFiles)}
-	case actual.Calls < row.BaselineCalls || actual.Files < row.BaselineFiles:
-		return []string{fmt.Sprintf("source resource census baseline is stale: scope=%s resource=%s calls=%d (baseline %d), files=%d (baseline %d); lower the checked baseline to bank the improvement", row.Scope, row.Resource, actual.Calls, row.BaselineCalls, actual.Files, row.BaselineFiles)}
-	default:
-		return nil
-	}
-}
-
 func knownScope(scope Scope) bool {
-	return scope == ScopeAll || scope == ScopeUntagged || scope == ScopeCmdGCUntagged
+	return scope == ScopeAll || scope == ScopeUntagged || scope == ScopeCmdGCUntagged || scope == ScopeBuildTargets
 }
 
-func validateOwnership(prefix string, row Baseline, now time.Time) []string {
-	return validateOwnershipFields(prefix, row.OwnerBead, row.Invariant, row.ResourceOwner, row.MigrationTarget, row.Expires, now)
+func validateOwnership(prefix string, row Baseline) []string {
+	return validateOwnershipFields(prefix, row.OwnerBead, row.Invariant, row.ResourceOwner, row.MigrationTarget, row.Expires)
 }
 
-func validateOwnershipFields(prefix, owner, invariant, resourceOwner, migration, expiryText string, now time.Time) []string {
+// validateOwnershipFields checks that a row declares who owns it and when it is
+// meant to be gone. It checks that the date is well formed but deliberately does
+// not check whether it has passed: that verdict depends on today, which this
+// cached check must never read. collectExpiries hands each row to the waiver
+// clock once instead. See internal/testpolicy/waiverexpiry.
+func validateOwnershipFields(prefix, owner, invariant, resourceOwner, migration, expiryText string) []string {
 	var problems []string
 	for name, value := range map[string]string{
 		"owner_bead":       owner,
@@ -1659,18 +1659,37 @@ func validateOwnershipFields(prefix, owner, invariant, resourceOwner, migration,
 			problems = append(problems, fmt.Sprintf("%s: %s is required", prefix, name))
 		}
 	}
-	expiry, err := time.Parse("2006-01-02", expiryText)
-	if err != nil {
+	if _, err := time.Parse("2006-01-02", expiryText); err != nil {
 		problems = append(problems, fmt.Sprintf("%s: expiry %q must use YYYY-MM-DD", prefix, expiryText))
-	} else if expiry.Before(day(now)) {
-		problems = append(problems, fmt.Sprintf("%s: expired %s", prefix, expiryText))
 	}
 	return problems
 }
 
-func day(value time.Time) time.Time {
-	value = value.UTC()
-	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
+// collectExpiries gathers every dated row in the ledger exactly once, so a
+// passing date produces one finding per row rather than one per place the row is
+// reached. A malformed date is skipped: validateOwnershipFields already reports
+// it, and faulting it twice turns one authoring mistake into two findings.
+func collectExpiries(ledger Ledger) []waiverclock.Expiry {
+	var expiries []waiverclock.Expiry
+	add := func(prefix, owner, expiryText string) {
+		expires, err := time.Parse("2006-01-02", expiryText)
+		if err != nil || strings.TrimSpace(owner) == "" {
+			return
+		}
+		expiries = append(expiries, waiverclock.Expiry{Label: prefix, Owner: owner, Expires: expires})
+	}
+	addBaselines := func(kind string, rows []Baseline) {
+		for _, row := range rows {
+			add(fmt.Sprintf("%s baseline scope=%s resource=%s", kind, row.Scope, row.Resource), row.OwnerBead, row.Expires)
+		}
+	}
+	addBaselines("audit", ledger.AuditBaseline)
+	addBaselines("debt", ledger.Debt)
+	addBaselines("small debt", ledger.SmallDebt)
+	for _, row := range ledger.Medium {
+		add(fmt.Sprintf("medium owner package_dir=%s package_name=%s owner=%s", row.PackageDir, row.PackageName, row.Owner), row.OwnerBead, row.Expires)
+	}
+	return expiries
 }
 
 // RenderMarkdown renders the exact checked TESTING.md inventory block.
@@ -1766,11 +1785,7 @@ func renderedSourceScope(scope Scope) string {
 }
 
 func renderedBaseline(row Baseline) string {
-	result := fmt.Sprintf("%s: %d calls / %d files", row.Resource, row.BaselineCalls, row.BaselineFiles)
-	if row.ReportedCalls != 0 && (row.ReportedCalls != row.BaselineCalls || row.ReportedFiles != row.BaselineFiles) {
-		result += fmt.Sprintf(" (historical regex census: %d / %d)", row.ReportedCalls, row.ReportedFiles)
-	}
-	return result
+	return string(row.Resource)
 }
 
 const (
@@ -1780,14 +1795,68 @@ const (
 
 // CheckedMarkdownBlock returns the single generated inventory block.
 func CheckedMarkdownBlock(document string) (string, error) {
-	if strings.Count(document, markdownBegin) != 1 || strings.Count(document, markdownEnd) != 1 {
-		return "", errors.New("TESTING.md must contain exactly one checked test resource ledger marker pair")
+	start, end, err := markdownBlockSpan(document)
+	if err != nil {
+		return "", err
 	}
-	start := strings.Index(document, markdownBegin)
-	end := strings.Index(document, markdownEnd)
+	return document[start:end], nil
+}
+
+// ReplaceMarkdownBlock returns document with its single checked test resource
+// ledger block replaced by replacement. Content outside the marker pair is
+// preserved byte-for-byte. Pass RenderMarkdown's output as replacement to
+// regenerate the block from a Ledger.
+func ReplaceMarkdownBlock(document, replacement string) (string, error) {
+	start, end, err := markdownBlockSpan(document)
+	if err != nil {
+		return "", err
+	}
+	return document[:start] + replacement + document[end:], nil
+}
+
+func markdownBlockSpan(document string) (start, end int, err error) {
+	if strings.Count(document, markdownBegin) != 1 || strings.Count(document, markdownEnd) != 1 {
+		return 0, 0, errors.New("TESTING.md must contain exactly one checked test resource ledger marker pair")
+	}
+	start = strings.Index(document, markdownBegin)
+	end = strings.Index(document, markdownEnd)
 	if end < start {
-		return "", errors.New("TESTING.md resource ledger end marker precedes begin marker")
+		return 0, 0, errors.New("TESTING.md resource ledger end marker precedes begin marker")
 	}
 	end += len(markdownEnd)
-	return document[start:end], nil
+	return start, end, nil
+}
+
+// walkedTops are the top-level directories walkedTrackedGoFiles walks.
+var walkedTops = []string{"internal", "cmd", "pkg", "examples", "test", "scripts", "tools"}
+
+// walkedTrackedGoFiles enumerates non-test .go files across the module when
+// the git index is unavailable (bazel runfiles trees). Best effort: hidden
+// directories and walk errors are skipped rather than fatal. walkedTops names
+// every top-level directory that holds a tracked Go test, so a census under
+// Bazel counts what the git index counts.
+func walkedTrackedGoFiles(root string) []string {
+	var files []string
+	for _, top := range walkedTops {
+		_ = filepath.WalkDir(filepath.Join(root, top), func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if name := d.Name(); name != "." && strings.HasPrefix(name, ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			rel, rerr := filepath.Rel(root, path)
+			if rerr != nil {
+				return nil
+			}
+			if strings.HasSuffix(path, ".go") {
+				files = append(files, filepath.ToSlash(rel))
+			}
+			return nil
+		})
+	}
+	return files
 }
