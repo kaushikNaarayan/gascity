@@ -214,4 +214,47 @@ else fail "malformed freeze mid-pass: merges=$(merges "$TMP/midbad")"; fi
 ) | tee "$TMP/gate.out"
 ! grep -q '^FAIL' "$TMP/gate.out" || FAILED=1
 
+# --- gcf-czn5n.1: UNKNOWN merge state is re-queried; bead comments run from the city dir ---------------
+# unk_env DIR STATES: one PR (#1); successive `pr view` calls return the listed mergeStateStatus values
+# (the last one repeats). Calls are recorded in $DIR/calls; the gc stub records its cwd.
+unk_env() {
+    local d="$1"; shift
+    mkdir -p "$d/bin" "$d/home" "$d/city"
+    printf '%s\n' "$@" >"$d/states"
+    cat >"$d/bin/gh" <<G
+#!/bin/bash
+echo "gh \$*" >>"$d/calls"
+case "\$1 \$2" in
+ "pr list") echo 1;;
+ "pr view")
+   if [[ "\$*" == *mergeCommit* ]]; then echo deadbeef; exit 0; fi
+   n=\$(cat "$d/n" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n >"$d/n"
+   st=\$(sed -n "\${n}p" "$d/states"); [ -n "\$st" ] || st=\$(tail -1 "$d/states")
+   jq -c --arg st "\$st" '.number=1 | .mergeStateStatus=\$st' "$TMP/ok.json";;
+ "pr merge") exit 0;;
+ "pr comment") exit 0;;
+esac
+G
+    printf '#!/bin/bash\necho "gc cwd=$(pwd) $*" >>"%s/calls"\n' "$d" >"$d/bin/gc"
+    chmod +x "$d/bin/gh" "$d/bin/gc"
+}
+run_unk() { PATH="$1/bin:$PATH" MERGE_BOT_HOME="$1/home" MERGE_BOT_REPOS="o/r" MERGE_BOT_CITY="$1/city" MERGE_BOT_UNKNOWN_SLEEP=0 "$BOT"; }
+
+unk_env "$TMP/unk1" UNKNOWN CLEAN; run_unk "$TMP/unk1"
+if [ "$(merges "$TMP/unk1")" = 1 ]; then pass "UNKNOWN then CLEAN -> merged after re-query"
+else fail "UNKNOWN then CLEAN: merges=$(merges "$TMP/unk1")"; fi
+
+unk_env "$TMP/unk3" UNKNOWN UNKNOWN UNKNOWN UNKNOWN CLEAN; run_unk "$TMP/unk3"
+views=$(grep -c '^gh pr view 1 .*--json number' "$TMP/unk3/calls" || true)
+if [ "$(merges "$TMP/unk3")" = 0 ] && [ "$views" = 4 ]; then pass "UNKNOWN x4 -> skipped after 1 read + 3 re-queries"
+else fail "UNKNOWN persistent: merges=$(merges "$TMP/unk3") views=$views"; fi
+
+unk_env "$TMP/blk" BLOCKED CLEAN; run_unk "$TMP/blk"
+if [ "$(merges "$TMP/blk")" = 0 ] && [ "$(grep -c '^gh pr view 1 .*--json number' "$TMP/blk/calls")" = 1 ]; then
+    pass "non-UNKNOWN state (BLOCKED) is skipped without re-query"
+else fail "BLOCKED must not be retried"; fi
+
+if grep -q "^gc cwd=$TMP/unk1/city bd comments add" "$TMP/unk1/calls"; then pass "bead comment runs from MERGE_BOT_CITY"
+else fail "bead comment cwd: $(grep '^gc ' "$TMP/unk1/calls" | head -1)"; fi
+
 exit "$FAILED"

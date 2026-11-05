@@ -34,6 +34,13 @@
 #   MERGE_BOT_PM_PAUSE second pause file (default ~/.pm-scratch/MERGE-PAUSE)
 #   MERGE_BOT_DRY_RUN  non-empty: decide and log, never merge or comment
 #   MERGE_BOT_METHOD   gh merge flag (default --squash)
+#   MERGE_BOT_CITY     city dir that bead comments (gc bd) run from (default ~/gascity-pilot/city);
+#                      cron's cwd is $HOME, where gc bd finds no city
+#   MERGE_BOT_UNKNOWN_RETRIES / MERGE_BOT_UNKNOWN_SLEEP
+#                      GitHub reports mergeStateStatus UNKNOWN for every other PR in a repo right
+#                      after a merge while it recomputes; re-read such a PR up to RETRIES (default 3)
+#                      times, SLEEP seconds apart (default 5), before skipping it. Any other
+#                      non-CLEAN state is skipped at once.
 #
 # Cron (GT2; install only after review, not installed by this change):
 #   */5 * * * * /path/to/gascity/scripts/merge-bot.sh
@@ -48,6 +55,9 @@ MERGE_BOT_REPOS="${MERGE_BOT_REPOS:-material-lab-io/gascity material-lab-io/gasc
 MERGE_BOT_HOME="${MERGE_BOT_HOME:-$HOME/gt}"
 MERGE_BOT_METHOD="${MERGE_BOT_METHOD:---squash}"
 MERGE_BOT_PM_PAUSE="${MERGE_BOT_PM_PAUSE:-$HOME/.pm-scratch/MERGE-PAUSE}"
+MERGE_BOT_CITY="${MERGE_BOT_CITY:-$HOME/gascity-pilot/city}"
+MERGE_BOT_UNKNOWN_RETRIES="${MERGE_BOT_UNKNOWN_RETRIES:-3}"
+MERGE_BOT_UNKNOWN_SLEEP="${MERGE_BOT_UNKNOWN_SLEEP:-5}"
 # Accepted freeze timestamp shape; the character class is the coarse guard,
 # the full pattern pins it to ISO-8601 so e.g. "2026" can't parse as 20:26.
 FREEZE_TS_CHARS='^[0-9TZ:+-]+$'
@@ -119,9 +129,25 @@ announce() {
     gh pr comment "$pr" --repo "$repo" --body "merge-bot: merged as $sha" >/dev/null
     bead=$(printf '%s' "$body" | sed -nE 's/.*[Bb]ead:[[:space:]]*([a-z0-9]+-[a-z0-9]+).*/\1/p' | head -1)
     if [ -n "$bead" ]; then
-        gc bd comments add "$bead" "merge-bot: $repo#$pr merged as $sha" >/dev/null \
+        (cd "$MERGE_BOT_CITY" && gc bd comments add "$bead" "merge-bot: $repo#$pr merged as $sha") >/dev/null \
             || log "WARN $repo#$pr bead-comment-failed bead=$bead"
     fi
+}
+
+# decide_fresh REPO N PR_JSON FREEZE NOW: view the PR into PR_JSON and decide. A PR GitHub
+# still reports as mergeStateStatus UNKNOWN is re-read up to MERGE_BOT_UNKNOWN_RETRIES times,
+# MERGE_BOT_UNKNOWN_SLEEP seconds apart; any other verdict is final.
+decide_fresh() {
+    local repo="$1" n="$2" out="$3" freeze="$4" now="$5" verdict tries=0
+    while :; do
+        gh pr view "$n" --repo "$repo" --json "$PR_FIELDS" >"$out"
+        verdict=$(decide "$out" "$freeze" "$now")
+        if [ "$verdict" != "skip not-clean:UNKNOWN" ] || [ "$tries" -ge "$MERGE_BOT_UNKNOWN_RETRIES" ]; then
+            printf '%s' "$verdict"; return 0
+        fi
+        tries=$((tries + 1))
+        sleep "$MERGE_BOT_UNKNOWN_SLEEP"
+    done
 }
 
 # paused: print the first pause file present and return 0; else return 1.
@@ -161,8 +187,7 @@ run_pass() {
     log "pass start repos=$MERGE_BOT_REPOS"
     for repo in $MERGE_BOT_REPOS; do
         for n in $(gh pr list --repo "$repo" --label qa:pass --state open --json number --jq '.[].number'); do
-            gh pr view "$n" --repo "$repo" --json "$PR_FIELDS" >"$tmp/pr.json"
-            verdict=$(decide "$tmp/pr.json" "$MERGE_BOT_HOME/merge-freeze.txt" "$now")
+            verdict=$(decide_fresh "$repo" "$n" "$tmp/pr.json" "$MERGE_BOT_HOME/merge-freeze.txt" "$now")
             log "$repo#$n $verdict"
             [ "$verdict" = merge ] || continue
             [ -z "${MERGE_BOT_DRY_RUN:-}" ] || continue
