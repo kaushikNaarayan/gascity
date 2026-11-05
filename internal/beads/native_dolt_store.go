@@ -2,6 +2,7 @@ package beads
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -355,6 +356,26 @@ func OpenNativeStorage(ctx context.Context, scopeRoot string, env map[string]str
 	return storage, err
 }
 
+// nativeDoltConnMaxIdleTime bounds how long the in-process beads pool keeps an
+// idle connection. beads v1.1.1 defaults to 20s with liveness checks off, which
+// outlives the managed Dolt listener read_timeout (15s default): the server
+// reaps the socket first and the next query on it fails with EOF (gcf-b3kkh).
+// Keep this well under config.DefaultDoltReadTimeoutMillis.
+const nativeDoltConnMaxIdleTime = 5 * time.Second
+
+// boundNativeConnIdle sets the pool idle bound on storages that expose their
+// *sql.DB (beads RawDBAccessor) without forking beads. Storages without it are
+// left unchanged.
+func boundNativeConnIdle(storage any, idle time.Duration) {
+	acc, ok := storage.(interface{ DB() *sql.DB })
+	if !ok {
+		return
+	}
+	if db := acc.DB(); db != nil {
+		db.SetConnMaxIdleTime(idle)
+	}
+}
+
 // openNativeStorage projects the scoped Dolt env, opens the best-available
 // native storage, and (when readPrefix) reads the configured issue prefix while
 // the env is still projected. It is shared by the initial open and the
@@ -369,6 +390,7 @@ func openNativeStorage(ctx context.Context, scopeRoot string, env map[string]str
 	if err != nil {
 		return nil, "", err
 	}
+	boundNativeConnIdle(storage, nativeDoltConnMaxIdleTime)
 	var prefix string
 	if readPrefix {
 		prefix, err = storage.GetConfig(ctx, "issue_prefix")
