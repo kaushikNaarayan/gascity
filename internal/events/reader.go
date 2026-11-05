@@ -157,23 +157,9 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
-	for scanner.Scan() {
-		var e Event
-		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			continue // skip malformed lines
-		}
-		if !matchesFilter(e, filter) {
-			continue
-		}
-		result = append(result, e)
-		if limitReached(len(result), filter) {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return result, listed, fmt.Errorf("scanning events: %w", err)
+	result, err = scanActiveFile(path, f, filter, result)
+	if err != nil {
+		return result, listed, err
 	}
 	return result, listed, nil
 }
