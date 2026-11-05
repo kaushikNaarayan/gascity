@@ -2,31 +2,35 @@
 title: "Dispatch (Sling)"
 ---
 
-> Last verified against code: 2026-07-11
+> Last verified against code: 2026-11-05
 
 ## Summary
 
 Dispatch is Gas City's work routing mechanism -- a Layer 2-4 derived
 mechanism that composes primitives (Session, Bead Store, Event Bus,
 Config) to route work to agents. The `gc sling` command resolves a target
-agent or pool, optionally instantiates a formula as a wisp, executes the
-agent's sling query to route each bead, optionally wraps single beads in
-a tracking convoy, records telemetry, and nudges the target. Convoys are
+agent or pool, optionally instantiates a formula as a wisp, routes each
+bead to the target (stamping `gc.routed_to` in-process, or running a custom
+sling query), optionally wraps single beads in a tracking convoy, records
+telemetry, and nudges the target. Convoys are
 expanded to their open children before routing.
 
 ## Key Concepts
 
-- **Sling**: The act of routing a bead to an agent or pool by executing
-  the target's sling query. The sling query is a shell command template
-  with `{}` as a placeholder for the bead ID. Implemented in
-  `cmd/gc/cmd_sling.go`.
+- **Sling**: The act of routing a bead to an agent or pool. The core
+  pipeline lives in `internal/sling` (`DoSling`, `DoSlingBatch`); the CLI
+  in `cmd/gc/cmd_sling.go` parses flags, builds `sling.SlingDeps`, and
+  prints the structured `SlingResult`.
 
-- **Sling Query**: A shell command template on each agent config
-  (`sling_query`) that routes a bead to that agent. Defaults to
-  `bd update {} --assignee=<qualified-name>` for fixed agents and
-  `bd update {} --label=pool:<qualified-name>` for pool agents. The `{}`
-  placeholder is replaced with the actual bead ID at dispatch time.
-  Defined in `internal/config/config.go:EffectiveSlingQuery`.
+- **Sling Query**: A shell command template on an agent config
+  (`sling_query`) with `{}` as the bead-ID placeholder. It is only run for
+  a custom query. The default route is not shell: for every agent,
+  `Agent.DefaultSlingQuery` (`internal/config/workquery.go`) is
+  `bd update {} --set-metadata gc.routed_to=<target>`, where the target is
+  `Agent.PoolName` when set and `Agent.QualifiedName()` otherwise, and
+  `cliBeadRouter.Route` (`cmd/gc/cmd_sling.go`) writes that same
+  `gc.routed_to` in-process through the store. The shell template runs
+  only when `isCustomSlingQuery` reports an agent override.
 
 - **Container Expansion**: When a convoy is slung, dispatch expands it
   to its open children and routes each child individually. Non-open
@@ -37,10 +41,20 @@ expanded to their open children before routing.
   container), dispatch automatically wraps it in a new convoy bead for
   batch tracking. Suppressed with `--no-convoy`.
 
-- **Wisp Instantiation**: When `--formula` is set, dispatch creates an
-  ephemeral molecule (wisp) from the named formula via `Store.MolCook`
-  and routes the wisp's root bead to the target. Variable substitution
-  and custom titles are supported.
+- **Wisp Instantiation**: When `--formula` is set, dispatch compiles the
+  named formula and instantiates it through `internal/molecule`
+  (`InstantiateCompiledSlingFormula`), then routes the root bead to the
+  target. Variable substitution and custom titles are supported. A
+  graph-class (formula v2) recipe starts a graph workflow
+  (`doStartGraphWorkflow`) instead of routing a plain root.
+
+- **Launch modes**: `DoSling` picks one of four, in this order:
+  `--formula` (`slingFormula`, standalone wisp), `--on <formula>`
+  (`slingOnFormula`, attach a formula to an existing bead), the target's
+  default sling formula when `--no-formula` is not set
+  (`slingDefaultFormula`, attaches with method `default-on-formula`), and
+  otherwise a plain bead route (`slingPlainBead`). All four converge on
+  `finalize`.
 
 - **Target Resolution**: The 2-step resolution of agent names -- first
   literal match against qualified names, then contextual match using the
@@ -61,28 +75,30 @@ expanded to their open children before routing.
 
 ## Architecture
 
-Dispatch is not a separate Go package. It is a composition of primitives
-orchestrated by `cmd/gc/cmd_sling.go`. The dispatch pipeline has three
-layers:
+Dispatch lives in `internal/sling`; `cmd/gc/cmd_sling.go` is the CLI
+projection over it. The CLI only wires dependencies (`slingDeps`, the
+`cliBeadRouter`, nudge and output callbacks) and formats results.
 
 ```
 CLI layer (cmd/gc/cmd_sling.go)
-  |
-  +-- cmdSling()          resolve city, config, agent, store
-  |     |
-  |     v
-  +-- doSlingBatch()      container expansion (convoy -> children)
-        |
-        +-- doSling()     single-bead dispatch pipeline:
-              |
-              +-- instantiateWisp()     [if --formula] MolCook
-              +-- checkBeadState()      [pre-flight] warn re-route
-              +-- buildSlingCommand()   {} -> bead ID substitution
-              +-- runner(slingCmd)      execute shell command
-              +-- telemetry.RecordSling()
-              +-- store.SetMetadata()   [if --merge] merge strategy
-              +-- store.Create(convoy)  [if auto-convoy] tracking wrapper
-              +-- doSlingNudge()        [if --nudge] wake the agent
+  cmdSling()              resolve city, config, target agent, store
+    |
+    v
+  sling.DoSlingBatch()    container expansion (convoy -> open children)
+    |
+    +-- sling.DoSling()   single-bead pipeline:
+          |
+          +-- preflight()           validate bead exists, cross-rig guard,
+          |                         dependency-cycle check, idempotency
+          |                         short-circuit, built-in route store
+          |                         reachability, reassign reopen, dry-run
+          +-- one launch mode:      slingFormula | slingOnFormula |
+          |                         slingDefaultFormula | slingPlainBead
+          +-- finalize()            record initiator, Router.Route (or
+                                    custom sling_query via Runner),
+                                    telemetry.RecordSling, merge-strategy
+                                    metadata, auto-convoy
+  doSlingNudge()          [if --nudge] wake the target (CLI layer)
 ```
 
 ### Data Flow
@@ -91,50 +107,69 @@ CLI layer (cmd/gc/cmd_sling.go)
 
 1. `cmdSling` resolves the city path, loads config, and resolves the
    target agent via `resolveAgentIdentity`.
-2. `doSlingBatch` checks if the bead is a container type. If not, falls
-   through to `doSling`.
-3. `doSling` warns about suspended agents or empty pools (unless
-   `--force`).
-4. If `--formula`, calls `instantiateWisp` which delegates to
-   `Store.MolCook` to create the wisp and uses the root bead ID.
-5. Pre-flight: warns if the bead already has an assignee or pool labels
-   (unless `--force`).
-6. Builds the sling command by replacing `{}` in the agent's
-   `EffectiveSlingQuery()` with the bead ID.
-7. Executes the sling command via `SlingRunner` (shell `sh -c`).
-8. Records telemetry via `telemetry.RecordSling`.
-9. If `--merge` is set, writes the merge strategy as bead metadata.
-10. If auto-convoy is enabled (not `--no-convoy`, not `--formula`),
-    creates a convoy bead and sets the routed bead's ParentID to the
-    convoy.
-11. If `--nudge`, sends a nudge to the target agent.
+2. `DoSlingBatch` looks the bead up. If it is not a container it falls
+   through to `DoSling`.
+3. `preflight` builds the target warnings (suspended city, rig or agent;
+   pool with `max_active_sessions=0`) and then, unless `--force` or the
+   mode exempts it: verifies the bead exists, rejects a cross-rig route
+   (`CrossRigRouteError`), rejects a dependency cycle (`DetectCycle`), and
+   short-circuits an already-routed bead as idempotent
+   (`CheckBeadStateWithOptions`). `--reassign` clears the assignee and
+   reopens an `in_progress` bead so the target can claim it. `--dry-run`
+   returns a preview here.
+4. `DoSling` dispatches on launch mode (see Key Concepts). Formula modes
+   compile the recipe and instantiate it via `internal/molecule`; a
+   graph-class recipe goes through `doStartGraphWorkflow`, which stamps
+   `gc.execution_routed_to` on the source bead (clearing `gc.routed_to` and
+   `gc.run_target`) so the workflow's executable step is the only demand
+   unit.
+5. `finalize` routes the bead: the typed `Router` (`cliBeadRouter`) stamps
+   `gc.routed_to`; only a custom `sling_query` shells out through the
+   `Runner`.
+6. `finalize` records telemetry via `telemetry.RecordSling`.
+7. If a merge strategy applies (`--merge`, or the config fallback), it is
+   written as bead metadata.
+8. If auto-convoy is enabled (not `--no-convoy`, not `--formula`), a
+   tracking convoy is created and the routed bead is parented to it; a
+   live matching auto-convoy is reused instead of minting a duplicate.
+9. If `--nudge`, the CLI sends a nudge to the target agent.
 
 **Container expansion** (`gc sling <agent> <convoy-id>`):
 
-1. `doSlingBatch` looks up the bead and checks `IsContainerType`.
-2. Lists all children via `querier.Children`.
-3. Partitions children into open (routable) and skipped (non-open).
-4. Routes each open child individually through `buildSlingCommand` +
-   `runner`. No auto-convoy is created -- the container IS the convoy.
-5. Reports per-child success/failure and a summary line.
-6. Nudges once after all children are routed (if `--nudge` and at
-   least one succeeded).
+1. `DoSlingBatch` looks up the bead and checks `beads.IsContainerType`.
+   An epic is rejected: first-class support is for convoys only.
+2. Lists the container's children and partitions them into open
+   (routable), skipped (non-open), and owned (controller-owned or
+   coordination beads such as mail, which are never slung).
+3. Routes each open child individually. No auto-convoy is created -- the
+   container IS the convoy.
+4. Reports per-child success/failure and a summary line.
+5. Nudges once after all children are routed (if `--nudge` and at least
+   one succeeded).
 
 ### Key Types
 
-- **`SlingOpts`** (`cmd/gc/cmd_sling.go`) -- All flags for the sling
-  command: `IsFormula`, `DoNudge`, `Force`, `Title`, `Vars`, `Merge`,
-  `NoConvoy`, `Owned`.
+- **`sling.SlingOpts`** (`internal/sling/sling.go`) -- The caller's
+  intent: `Target`, `BeadOrFormula`, `IsFormula`, `OnFormula`,
+  `NoFormula`, `Merge`, `NoConvoy`, `Owned`, `Nudge`, `Force`, `DryRun`,
+  `Reassign`, `Vars`, `Title`, `ScopeKind`/`ScopeRef`, `Initiator`.
+  `cmd/gc/cmd_sling.go` aliases it as `slingOpts`.
 
-- **`SlingRunner`** (`cmd/gc/cmd_sling.go`) -- Function type
-  `func(command string) (string, error)` that executes the sling shell
-  command. Injectable for testing.
+- **`sling.SlingDeps`** (`internal/sling/sling.go`) -- Injected
+  dependencies: config, store, the typed `BeadRouter`, the shell
+  `SlingRunner` (custom queries only), notifier and resolvers.
 
-- **`BeadQuerier`** (`cmd/gc/cmd_sling.go`) -- Interface for retrieving
-  a single bead by ID. Used for pre-flight checks.
+- **`sling.SlingResult`** -- Structured outcome (target, bead or root ID,
+  method, convoy ID, warnings, batch counts); callers format display.
 
-- **`BeadChildQuerier`** (`cmd/gc/cmd_sling.go`) -- Extends `BeadQuerier`
-  with `Children(parentID)` for container expansion.
+- **`sling.BeadRouter`** -- Typed routing seam; `cliBeadRouter` is the
+  CLI implementation.
+
+- **`sling.SlingRunner`** -- `func(dir, command string, env
+  map[string]string) (string, error)`; executes a custom sling query.
+
+- **`sling.BeadQuerier` / `sling.BeadChildQuerier`** -- Bead lookup for
+  pre-flight checks, and container-child listing for expansion.
 
 - **`config.Agent`** (`internal/config/config.go`) -- Carries the
   `SlingQuery` field and `EffectiveSlingQuery()` method that determines
@@ -218,9 +253,10 @@ regressions.
 
 ## Invariants
 
-1. **Sling query placeholder is always `{}`.** The `buildSlingCommand`
-   function performs literal string replacement of all `{}` occurrences
-   with the bead ID. No other placeholder syntax is supported.
+1. **Sling query placeholder is always `{}`.** For a custom `sling_query`,
+   `sling.BuildSlingCommandForAgent` substitutes the bead ID for the
+   placeholder. No other placeholder syntax is supported. The default
+   route does not use a shell template at execution time.
 
 2. **Container expansion routes only open children.** Children with
    status other than `"open"` are skipped and reported, never routed.
@@ -237,8 +273,11 @@ regressions.
 5. **Merge strategy is one of three values.** `--merge` accepts only
    `"direct"`, `"mr"`, or `"local"`. The CLI validates before dispatch.
 
-6. **Pre-flight warnings are best-effort.** If the bead store query
-   fails, dispatch proceeds silently. Warnings never block routing.
+6. **Target and bead-state warnings never block; structural checks do.**
+   Suspension and empty-pool warnings, and bead-state probe failures,
+   are reported in the result and routing proceeds. Missing bead,
+   cross-rig route, and dependency cycle fail the sling, and `--force`
+   bypasses them (a forced missing-bead sling skips the local auto-convoy).
 
 7. **Telemetry records every dispatch attempt.** `RecordSling` is called
    on both success and failure paths with the target name, target type
@@ -254,10 +293,11 @@ regressions.
    formula files that are no longer embedded. Non-formula files in the
    directory are left alone.
 
-10. **Default sling queries differ by agent type.** Fixed agents default
-    to `bd update {} --assignee=<name>`; pool agents default to
-    `bd update {} --label=pool:<name>`. Custom `sling_query` overrides
-    the default entirely.
+10. **Default routing is metadata for every agent.** The default sling
+    query sets `gc.routed_to=<PoolName|QualifiedName>`; there is no
+    per-type `--assignee` or `pool:` label default. The default route is
+    written in-process by `cliBeadRouter`; a custom `sling_query`
+    overrides it entirely and runs through the shell `Runner`.
 
 11. **scale_check ↔ work_query correspondence.** The reconciler's
     pool-demand-detection path (`Agent.EffectivePoolDemandQuery`, count
@@ -321,7 +361,8 @@ in agreement.
 
 | Depends on | How |
 |---|---|
-| `internal/beads` (Store) | `MolCook` for wisp instantiation, `Create` for auto-convoy, `Get`/`Children` for container expansion, `Update` for ParentID linking, `SetMetadata` for merge strategy |
+| `internal/beads` (Store) | `Create` for auto-convoy, `Get`/`List` for lookup and container expansion, `Update` for ParentID linking, `SetMetadata` for routing and merge strategy |
+| `internal/molecule` | Formula recipe instantiation for `--formula`, `--on`, and default-formula launches |
 | `internal/config` | Agent resolution, `EffectiveSlingQuery`, pool detection via `IsPool`, `PoolConfig` for sizing, `Suspended` flag |
 | `internal/runtime` | `Provider.IsRunning` and `Provider.Nudge` for agent nudging via `doSlingNudge` |
 | `internal/agent` | `SessionNameFor` to compute session names |
@@ -332,7 +373,7 @@ in agreement.
 | Depended on by | How |
 |---|---|
 | `cmd/gc/cmd_convoy.go` | Convoys are the batch tracking containers that dispatch creates and expands |
-| `internal/orders` | Order dispatch creates wisps and routes them through the same formula instantiation path (`Store.MolCook`) |
+| `internal/orders` | Order dispatch creates wisps and routes them through the same formula instantiation path (`internal/molecule`) |
 | `cmd/gc/cmd_handoff.go` | Work handoff between agents uses similar agent resolution and bead routing patterns |
 | Controller | The controller's reconciliation loop drives pool sizing via `evaluatePool` which determines how many pool instances exist to receive slung work |
 
@@ -340,15 +381,19 @@ in agreement.
 
 | Path | Description |
 |---|---|
-| `cmd/gc/cmd_sling.go` | CLI command, `SlingOpts`, `doSling`, `doSlingBatch`, `buildSlingCommand`, `instantiateWisp`, `checkBeadState`, `doSlingNudge` |
-| `cmd/gc/cmd_sling_test.go` | Unit tests: command building, single-bead dispatch, formula dispatch, container expansion, nudge behavior, merge strategy, auto-convoy, pre-flight warnings |
+| `internal/sling/sling_core.go` | `DoSling`, `DoSlingBatch`, `preflight`, the four launch modes, `finalize`, `doStartGraphWorkflow`, `restampWorkBeadRouting` |
+| `internal/sling/sling.go` | `SlingOpts`, `SlingDeps`, `SlingResult`, `BuildSlingCommandForAgent`, `CrossRigRouteError` |
+| `internal/sling/sling_attachment.go` | `CheckBeadStateWithOptions` (idempotency and attachment checks) |
+| `internal/sling/cycle.go` | `DetectCycle` dependency-cycle guard |
+| `cmd/gc/cmd_sling.go` | CLI command, `cmdSling`, dependency wiring, `cliBeadRouter`, `isCustomSlingQuery`, nudge delivery (`doSlingNudge`), dry-run reporting |
+| `cmd/gc/cmd_sling_test.go` | CLI-layer tests: dispatch wiring, output, nudge behavior, dry-run |
 | `cmd/gc/cmd_convoy.go` | Convoy CRUD: create, list, status, add, close, check (auto-close), stranded, autoclose (hidden hook) |
 | `cmd/gc/system_formulas.go` | `MaterializeSystemFormulas`, `ListEmbeddedSystemFormulas`, stale file cleanup |
 | `cmd/gc/system_formulas_test.go` | Tests for materialization: empty FS, write, overwrite, stale cleanup, idempotency, orders |
 | `cmd/gc/pool.go` | `evaluatePool` (scale check), `poolAgents` (instance expansion), `expandSessionSetup` (template context) |
 | `internal/config/config.go` | `Agent.SlingQuery`, `Agent.EffectiveSlingQuery()`, `Agent.EffectiveWorkQuery()`, `Agent.EffectivePoolDemandQuery()`, `Agent.EffectiveScaleCheck()`, `bdReadyPoolDemandShell()`, `Agent.IsPool()` |
-| `internal/beads/beads.go` | `IsContainerType`, `Store.MolCook`, `Store.Children`, `Store.SetMetadata` |
-| `internal/beads/bdstore.go` | `BdStore.MolCook` and `BdStore.MolCookOn` -- formula-backed wisp instantiation via `bd mol wisp` / `bd mol bond` |
+| `internal/beads/beads.go` | `IsContainerType`, `Store.SetMetadata` |
+| `internal/molecule/` | Formula recipe instantiation used by sling and orders |
 | `internal/telemetry/recorder.go` | `RecordSling` -- metrics counter + structured log event for each dispatch |
 | `cmd/gc/cmd_agent.go` | `resolveAgentIdentity` -- 2-step agent name resolution |
 
@@ -412,12 +457,15 @@ reviewer-created mutations.
 Dispatch testing follows the philosophy in
 [TESTING.md](https://github.com/gastownhall/gascity/blob/main/TESTING.md), relying heavily on injected fakes:
 
-**Unit tests** (`cmd/gc/cmd_sling_test.go`): All dispatch logic is tested
-through `doSling` and `doSlingBatch` with injected `fakeRunner` (records
-shell commands), `session.NewFake()` (fake session provider), and
+**Unit tests** (`internal/sling/*_test.go`, `cmd/gc/cmd_sling_test.go`):
+Core dispatch logic is tested through `sling.DoSling` and
+`sling.DoSlingBatch` in `internal/sling`; the CLI wiring, output, and nudge
+behavior are tested in `cmd/gc`. Tests inject a fake runner (records shell
+commands), `session.NewFake()` (fake session provider), and
 `beads.NewMemStore()` (in-memory bead store). Tests cover:
 
-- `buildSlingCommand` placeholder substitution including multiple `{}`
+- Custom `sling_query` placeholder substitution including multiple `{}`
+- Preflight: cross-rig guard, dependency cycles, idempotent short-circuit
 - Single-bead dispatch to fixed agents and pools
 - Formula dispatch with `--formula` flag (wisp instantiation)
 - Container expansion: convoy beads expand to open children; epics are rejected
@@ -427,7 +475,7 @@ shell commands), `session.NewFake()` (fake session provider), and
 - Pre-flight warnings for already-assigned beads and pool-labeled beads
 - Suspended agent and empty pool warnings
 - Nudge delivery to fixed agents and first running pool member
-- Error paths: runner failure, MolCook failure, store failure
+- Error paths: runner failure, formula instantiation failure, store failure
 
 **System formula tests** (`cmd/gc/system_formulas_test.go`): Cover
 materialization from embedded FS including empty FS (no-op), file
@@ -442,10 +490,10 @@ both `sling_query` and `work_query` together or neither.
 
 ## Known Limitations
 
-- **Sling query is a shell command, not a Go function call.** Every
-  dispatch forks a shell process via `sh -c`. This is simple and
-  flexible (any CLI tool can be a routing backend) but adds per-bead
-  fork overhead during batch expansion of large containers.
+- **Custom sling queries are shell commands.** The default route is an
+  in-process metadata write, but a custom `sling_query` forks a shell
+  per bead. That is flexible (any CLI tool can be a routing backend)
+  but adds per-bead fork overhead during batch expansion.
 
 - **Container expansion is serial.** When expanding a convoy,
   each child is slung sequentially. A single slow or failing sling
@@ -453,26 +501,27 @@ both `sling_query` and `work_query` together or neither.
   not retried.
 
 - **No built-in load balancing across pool instances.** Sling routes to
-  the pool as a whole (via label), not to a specific instance. Work
-  distribution depends on the pool's work query and claim semantics
-  (`bd ready --label=pool:<name> --unassigned --limit=1`), which is first-come
-  first-served.
+  the pool as a whole (via `gc.routed_to`), not to a specific instance.
+  Work distribution depends on the pool's work query and claim semantics
+  (the routed tier of `EffectiveWorkQuery`: unassigned, non-epic ready work
+  with `gc.routed_to=<target>`, see "scale_check ↔ work_query
+  correspondence"), which is first-come first-served.
 
 - **Nudge targets only one pool instance.** After slinging to a pool,
   `--nudge` wakes the first running instance found. Other instances
   discover work on their next poll cycle.
 
-- **No dry-run mode.** There is no way to preview what a sling command
-  would do without actually executing it. The pre-flight `checkBeadState`
-  only warns; it does not prevent routing.
+- **Dry-run is a preview, not a full simulation.** `--dry-run` returns
+  the preflight outcome (target, method, container counts) without
+  routing, but it cannot report failures that only surface during
+  instantiation or routing.
 
 ## See Also
 
 - [Architecture glossary](glossary.md) -- authoritative definitions of
   sling, convoy, wisp, formula, and other terms used in this document
 - [Bead Store architecture](beads.md) -- the persistence substrate that
-  dispatch reads and writes through, including MolCook molecule
-  instantiation
+  dispatch reads and writes through
 - [Health Patrol architecture](health-patrol.md) -- the supervision
   model that keeps pool agents alive to receive dispatched work
 - [Config architecture](config.md) -- how agent configuration
