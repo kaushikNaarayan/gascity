@@ -248,6 +248,32 @@ func (t nudgeTarget) providerName() string {
 	return ""
 }
 
+// providerFamily returns the built-in launch family of the target's provider
+// ("claude" for a custom provider such as "claude-sonnet-primary" that wraps
+// it). Behaviour switches in the worker handle (RuntimeHandle.nudgeWaitIdle
+// delivers live only for family "claude") must key on the family, not the
+// operator-chosen alias: with the alias, every town seat on a named Claude
+// provider reported "not delivered" and wait-idle nudges were always queued
+// (gcf-puxup).
+func (t nudgeTarget) providerFamily() string {
+	if t.resolved != nil {
+		if family := strings.TrimSpace(t.resolved.BuiltinAncestor); family != "" {
+			return family
+		}
+	}
+	name := t.providerName()
+	if t.cfg != nil && name != "" {
+		if spec, ok := t.cfg.Providers[name]; ok {
+			if r, err := config.ResolveProviderChain(name, spec, t.cfg.Providers); err == nil {
+				if family := strings.TrimSpace(r.BuiltinAncestor); family != "" {
+					return family
+				}
+			}
+		}
+	}
+	return name
+}
+
 type queuedNudgeOptions struct {
 	ID                string
 	SessionID         string
@@ -842,7 +868,7 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 	// live in-process and non-claude returns immediately (see
 	// internal/worker/runtime_handle.go nudgeWaitIdle), so short-circuiting
 	// those would needlessly downgrade live delivery to queued. (gco-90ui)
-	if mode == nudgeDeliveryWaitIdle && target.sessionTransport() != "acp" && target.providerName() == "claude" {
+	if mode == nudgeDeliveryWaitIdle && target.sessionTransport() != "acp" && target.providerFamily() == "claude" {
 		if obs, obsErr := nudgeObserveTarget(target, sessStore, sp); obsErr == nil && obs.Running && nudgeObservationBusy(obs) {
 			return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, stdout, stderr)
 		}
@@ -1018,7 +1044,7 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 				runtimeName = strings.TrimSpace(obs.SessionName)
 			}
 			if runtimeName != "" {
-				return runtimeWorkerHandleWithConfig(target.cityPath, store, sp, target.cfg, runtimeName, strings.TrimSpace(target.providerName()), strings.TrimSpace(target.sessionTransport()), nil)
+				return runtimeWorkerHandleWithConfig(target.cityPath, store, sp, target.cfg, runtimeName, strings.TrimSpace(target.providerFamily()), strings.TrimSpace(target.sessionTransport()), nil)
 			}
 		}
 		return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
@@ -1048,7 +1074,7 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 			sp,
 			target.cfg,
 			target.sessionName,
-			strings.TrimSpace(target.providerName()),
+			strings.TrimSpace(target.providerFamily()),
 			strings.TrimSpace(target.sessionTransport()),
 			nil,
 		)
@@ -1065,7 +1091,7 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 		sp,
 		target.cfg,
 		target.sessionName,
-		strings.TrimSpace(target.providerName()),
+		strings.TrimSpace(target.providerFamily()),
 		strings.TrimSpace(target.sessionTransport()),
 		nil,
 	)

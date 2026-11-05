@@ -5728,3 +5728,30 @@ func TestQueuedNudgeBehindPermissionPromptIsReleasedThenDeliveredOnce(t *testing
 		t.Fatalf("after delivery pending=%d inFlight=%d dead=%d, want 0/0/0", len(pending), len(inFlight), len(dead))
 	}
 }
+
+// gcf-puxup: a custom provider that wraps the built-in claude (the town's
+// claude-sonnet-primary shape) must report family "claude", otherwise
+// RuntimeHandle.nudgeWaitIdle never delivers live and every wait-idle nudge is
+// queued.
+func TestNudgeTargetProviderFamilyResolvesCustomClaudeProvider(t *testing.T) {
+	base := "builtin:claude"
+	cfg := &config.City{Providers: map[string]config.ProviderSpec{
+		"claude-sonnet-primary": {Base: &base},
+	}}
+	tests := []struct {
+		name   string
+		target nudgeTarget
+		want   string
+	}{
+		{"custom provider via config chain", nudgeTarget{cfg: cfg, resolved: &config.ResolvedProvider{Name: "claude-sonnet-primary"}}, "claude"},
+		{"resolved ancestor wins", nudgeTarget{resolved: &config.ResolvedProvider{Name: "claude-sonnet-primary", BuiltinAncestor: "claude"}}, "claude"},
+		{"builtin name unchanged", nudgeTarget{resolved: &config.ResolvedProvider{Name: "claude"}}, "claude"},
+		{"non-claude stays itself (negative control)", nudgeTarget{resolved: &config.ResolvedProvider{Name: "codex", BuiltinAncestor: "codex"}}, "codex"},
+		{"unknown name falls back to name", nudgeTarget{cfg: cfg, resolved: &config.ResolvedProvider{Name: "mystery"}}, "mystery"},
+	}
+	for _, tt := range tests {
+		if got := tt.target.providerFamily(); got != tt.want {
+			t.Errorf("%s: providerFamily() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
