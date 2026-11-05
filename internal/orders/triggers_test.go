@@ -71,6 +71,19 @@ func TestCheckTriggerCronMatched(t *testing.T) {
 	}
 }
 
+func TestCheckTriggerCronWeekdayRangeMatchesWednesday(t *testing.T) {
+	a := Order{Name: "weekday-digest", Trigger: "cron", Schedule: "0 9 * * 1-5"}
+	wed := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC) // Wednesday
+	if got := CheckTrigger(a, wed, neverRan, nil, nil); !got.Due {
+		t.Errorf("Wednesday 09:00 Due = false, want true for 1-5 weekday range; reason=%q", got.Reason)
+	}
+	sat := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC) // Saturday
+	lastRunFriday := func(string) (time.Time, error) { return time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC), nil }
+	if got := CheckTrigger(a, sat, lastRunFriday, nil, nil); got.Due {
+		t.Errorf("Saturday 09:00 Due = true, want false for 1-5 weekday range; reason=%q", got.Reason)
+	}
+}
+
 func TestCheckTriggerCronEveryMinuteStepMatched(t *testing.T) {
 	a := Order{Name: "cleanup", Trigger: "cron", Schedule: "*/1 * * * *"}
 	now := time.Date(2026, 2, 27, 12, 34, 0, 0, time.UTC)
@@ -344,6 +357,25 @@ func TestCronFieldMatches(t *testing.T) {
 		{"5", 3, false},
 		{"1,3,5", 3, true},
 		{"1,3,5", 2, false},
+		{"1-5", 1, true},
+		{"1-5", 5, true},
+		{"1-5", 3, true},
+		{"1-5", 0, false},
+		{"1-5", 6, false},
+		{"9-17", 13, true},
+		{"9-17", 18, false},
+		{"0-30/10", 20, true},
+		{"0-30/10", 25, false},
+		{"0-30/10", 40, false},
+		{"10-20/5", 15, true},
+		{"10-20/5", 12, false},
+		{"*/15", 45, true},
+		{"1-3,10,20-22/2", 22, true},
+		{"1-3,10,20-22/2", 21, false},
+		{"5-1", 3, false},
+		{"MON", 1, false},
+		{"1-", 1, false},
+		{"0-30/0", 0, false},
 	}
 	for _, tt := range tests {
 		got := cronFieldMatches(tt.field, tt.value)

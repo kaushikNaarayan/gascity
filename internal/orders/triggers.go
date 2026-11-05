@@ -193,7 +193,7 @@ const wallMinuteLayout = "2006-01-02 15:04"
 //     order once at the first real minute after the jump.
 func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	fields := strings.Fields(a.Schedule)
-	if len(fields) != 5 {
+	if len(fields) != cronFieldCount {
 		return TriggerResult{Due: false, Reason: fmt.Sprintf("bad cron schedule: want 5 fields, got %d", len(fields))}
 	}
 
@@ -297,29 +297,6 @@ func matchesInWallGap(matchesAt func(time.Time) bool, prev, t time.Time) bool {
 	}
 	for w, end := naive(prev).Add(time.Minute), naive(t); w.Before(end); w = w.Add(time.Minute) {
 		if matchesAt(w) {
-			return true
-		}
-	}
-	return false
-}
-
-// cronFieldMatches checks if a single cron field matches a value.
-// Supports: "*" (any), exact integer, or comma-separated values.
-func cronFieldMatches(field string, value int) bool {
-	if field == "*" {
-		return true
-	}
-	for _, part := range strings.Split(field, ",") {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "*/") {
-			step, err := strconv.Atoi(strings.TrimPrefix(part, "*/"))
-			if err == nil && step > 0 && value%step == 0 {
-				return true
-			}
-			continue
-		}
-		n, err := strconv.Atoi(part)
-		if err == nil && n == value {
 			return true
 		}
 	}

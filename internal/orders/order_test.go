@@ -163,6 +163,23 @@ timeout = "120s"
 	}
 }
 
+func TestValidateCronScheduleSyntax(t *testing.T) {
+	valid := []string{"0 3 * * *", "*/5 * * * *", "0 9 * * 1-5", "0 9-17/2 * * *", "0-30/10 * * * *", "0 0 1,15 * *", "30 19 * 1-6 0,6"}
+	for _, sched := range valid {
+		a := Order{Name: "o", Formula: "mol-x", Trigger: "cron", Schedule: sched}
+		if err := Validate(a); err != nil {
+			t.Errorf("Validate(%q) = %v, want nil", sched, err)
+		}
+	}
+	invalid := []string{"0 9 * * MON-FRI", "0 9 * JAN *", "0 9 * *", "0 9 * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 7", "5-1 * * * *", "*/0 * * * *", "1- * * * *", "@daily"}
+	for _, sched := range invalid {
+		a := Order{Name: "o", Formula: "mol-x", Trigger: "cron", Schedule: sched}
+		if err := Validate(a); err == nil {
+			t.Errorf("Validate(%q) = nil, want an unsupported/invalid cron schedule error", sched)
+		}
+	}
+}
+
 func TestValidateCooldown(t *testing.T) {
 	a := Order{Name: "digest", Formula: "mol-digest", Trigger: "cooldown", Interval: "24h"}
 	if err := Validate(a); err != nil {
