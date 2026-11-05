@@ -32,9 +32,9 @@ other source should be updated.
   `city.toml` is the single config file. See
   [`internal/config/`](https://github.com/gastownhall/gascity/tree/main/internal/config/).
 
-- **Event Bus**: Append-only pub/sub log of all system activity. Two
-  tiers: critical (bounded queue for infrastructure) and optional
-  (fire-and-forget for audit). Events are immutable with monotonically
+- **Event Bus**: Append-only pub/sub log of all system activity. One
+  best-effort, cursor-resumable log per city, plus a strict batch-append
+  path (`AppendBatch`) that returns every write error. Events are immutable with monotonically
   increasing sequence numbers. See
   [`internal/events/`](https://github.com/gastownhall/gascity/tree/main/internal/events/).
 

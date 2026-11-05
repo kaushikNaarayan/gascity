@@ -142,8 +142,9 @@ How the code substrate maps onto the six user-facing primitives:
 2. **Task Store (Beads)** — CRUD + Hook + Dependencies + Labels + Query
    over work units. Everything is a bead: tasks, mail, convoy members.
    (The **Bead** primitive.)
-3. **Event Bus** — append-only pub/sub log of all system activity. Two
-   tiers: critical (bounded queue) and optional (fire-and-forget).
+3. **Event Bus** — append-only pub/sub log of all system activity. One
+   best-effort, cursor-resumable log per city, plus a strict
+   batch-append path (`AppendBatch`) that returns every write error.
    Events are fired by activity as outbound notifications so humans and
    agents can watch; the bus is the delivery machinery. (Under the
    **Event** primitive.)

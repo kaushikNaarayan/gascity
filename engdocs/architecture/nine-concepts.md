@@ -103,9 +103,9 @@ materialization of a formula run).
 
 An **Event** is the OBSERVE primitive: fired by activity so humans and
 agents can watch. The "bus" is the delivery machinery beneath it — an
-append-only log that carries fired events to subscribers. Two tiers:
-critical (bounded queue for infrastructure) and optional (fire-and-forget
-for audit).
+append-only log that carries fired events to subscribers. One
+best-effort, cursor-resumable log per city, plus a strict batch-append
+path (`AppendBatch`) that returns every write error to the caller.
 
 - **Interface**: `events.Provider` with Record, List, LatestSeq,
   Watch, Close
