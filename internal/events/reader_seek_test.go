@@ -121,3 +121,20 @@ func TestReadFilteredSeekNegativeControlFullScan(t *testing.T) {
 		}
 	}
 }
+
+// (4) An in-place rewrite (same inode, equal-width lines, rising seqs) puts a
+// different line before the hint offset. The hint must be verified against the
+// line ending at offset-1, not just the byte being a newline.
+func TestReadFilteredSeekInPlaceEqualWidthRewriteLosesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	writeSeqLines(t, path, 1000, 1099, false)
+	if evs, _ := tick(t, path, 1099); len(evs) != 0 {
+		t.Fatalf("warm-up returned %v, want none", seqsOf(evs))
+	}
+	// Same inode (O_TRUNC), every line the same width, seqs shifted upward.
+	writeSeqLines(t, path, 1050, 1249, false)
+	evs, _ := tick(t, path, 1099)
+	if len(evs) != 150 || evs[0].Seq != 1100 || evs[149].Seq != 1249 {
+		t.Fatalf("after in-place rewrite got %d events %v, want 1100..1249", len(evs), seqsOf(evs))
+	}
+}

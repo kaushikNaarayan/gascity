@@ -2,6 +2,7 @@ package events
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -101,7 +102,7 @@ func scanActiveFile(path string, f *os.File, filter Filter, result []Event) ([]E
 	if st, err := f.Stat(); err == nil {
 		ino, size = inodeOf(st), st.Size()
 	}
-	if h, ok := findSeekHint(path, ino, size, filter.AfterSeq); ok && hintBoundaryOK(f, h.offset) {
+	if h, ok := findSeekHint(path, ino, size, filter.AfterSeq); ok && hintBoundaryOK(f, h) {
 		out, valid, err := scanActiveFrom(path, f, h.offset, h.seq, ino, filter, result)
 		if valid {
 			return out, err
@@ -123,8 +124,49 @@ func byteIs(f *os.File, off int64, want byte) bool {
 	return b[0] == want
 }
 
-func hintBoundaryOK(f *os.File, offset int64) bool {
-	return offset <= 0 || byteIs(f, offset-1, '\n')
+// maxEventLineBytes bounds the backward line search; it matches the scanner's
+// 1MB line limit.
+const maxEventLineBytes = 1024 * 1024
+
+// hintBoundaryOK verifies a hint against the file: the byte before the offset
+// must be a newline AND the line ending there must carry the hinted seq. The
+// seq check catches an in-place rewrite (same inode, equal-width lines) that a
+// newline-only check cannot see.
+func hintBoundaryOK(f *os.File, h seekHint) bool {
+	if h.offset <= 0 {
+		return true
+	}
+	if !byteIs(f, h.offset-1, '\n') {
+		return false
+	}
+	end := h.offset - 1 // exclusive end of the previous line's content
+	start := end - 4096
+	var buf []byte
+	for {
+		if start < 0 {
+			start = 0
+		}
+		buf = make([]byte, end-start)
+		if _, err := f.ReadAt(buf, start); err != nil {
+			return false
+		}
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			buf = buf[i+1:]
+			break
+		}
+		if start == 0 {
+			break // first line of the file
+		}
+		if end-start >= maxEventLineBytes {
+			return false
+		}
+		start -= end - start // double the window
+	}
+	var e Event
+	if err := json.Unmarshal(buf, &e); err != nil {
+		return false
+	}
+	return e.Seq == h.seq
 }
 
 // scanActiveFrom scans from start. When start > 0, floor is the seq the first
