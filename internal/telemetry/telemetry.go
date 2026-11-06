@@ -156,13 +156,20 @@ func resolveEndpoints() (metricsURL, logsURL string, enabled bool) {
 		if base == "" {
 			return "", "", false
 		}
-		return base + "/v1/metrics", base + "/v1/logs", true
+		metricsURL, logsURL = base+"/v1/metrics", base+"/v1/logs"
+		if collectorsStalled(metricsURL, logsURL) {
+			return "", "", false
+		}
+		return metricsURL, logsURL, true
 	}
 	if metricsURL == "" {
 		metricsURL = DefaultMetricsURL
 	}
 	if logsURL == "" {
 		logsURL = DefaultLogsURL
+	}
+	if collectorsStalled(metricsURL, logsURL) {
+		return "", "", false
 	}
 	return metricsURL, logsURL, true
 }
