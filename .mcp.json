@@ -1,8 +1,11 @@
 {
+  "_comment": "MemPalace stdio MCP server — 1:1 with the fork's DefaultMCPServers() spec. gc projects project-scoped MCP servers when the session settings carry enableAllProjectMcpServers=true (the pilot city's .gc/settings.json already sets this). The command must be the ABSOLUTE resolved venv python; adjust the path per host, or template it if gc supports {{.Home}}/{{.CityRoot}} substitution in overlay files (UNVERIFIED — see README). If the venv is absent the fork omits this server entirely; a stdio server pointing at a missing binary simply fails to start (harmless), matching the graceful-degradation intent.",
   "mcpServers": {
-    "excalidraw": {
-      "type": "http",
-      "url": "https://mcp.excalidraw.com"
+    "mempalace": {
+      "type": "stdio",
+      "command": "/home/kanaba/gt/.mempalace-env/bin/python",
+      "args": ["-m", "mempalace.mcp_server"],
+      "env": {}
     }
   }
 }
