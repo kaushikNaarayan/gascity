@@ -52,8 +52,10 @@ other source should be updated.
   [`internal/orders/`](https://github.com/gastownhall/gascity/tree/main/internal/orders/).
 
 - **Convoy**: A container bead that groups related issues as a batch
-  work tracking unit. Child beads link to a convoy via ParentID.
-  Convoys track completion progress.
+  work tracking unit. A convoy links to its members with `tracks`
+  dependency edges (convoy -> member) and leaves each member's ParentID
+  untouched; legacy convoys whose members are parent-child children are
+  still read. Convoys track completion progress.
 
 - **Dispatch (Sling)**: The routing mechanism that composes: find/spawn
   agent -> select formula -> create molecule -> hook to agent -> nudge

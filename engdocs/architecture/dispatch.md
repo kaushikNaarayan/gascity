@@ -105,8 +105,9 @@ CLI layer (cmd/gc/cmd_sling.go)
 8. Records telemetry via `telemetry.RecordSling`.
 9. If `--merge` is set, writes the merge strategy as bead metadata.
 10. If auto-convoy is enabled (not `--no-convoy`, not `--formula`),
-    creates a convoy bead and sets the routed bead's ParentID to the
-    convoy.
+    creates a convoy bead that tracks the routed bead through a `tracks`
+    dependency edge (convoy -> routed bead); the routed bead's ParentID is
+    not changed.
 11. If `--nudge`, sends a nudge to the target agent.
 
 **Container expansion** (`gc sling <agent> <convoy-id>`):
@@ -312,7 +313,7 @@ in agreement.
 
 | Depends on | How |
 |---|---|
-| `internal/beads` (Store) | `MolCook` for wisp instantiation, `Create` for auto-convoy, `Get`/`Children` for container expansion, `Update` for ParentID linking, `SetMetadata` for merge strategy |
+| `internal/beads` (Store) | `MolCook` for wisp instantiation, `Create` for auto-convoy, `Get`/`Children` for container expansion, `DepAdd` (a `tracks` edge, via `convoy.TrackItem`) for auto-convoy linking, `SetMetadata` for merge strategy |
 | `internal/config` | Agent resolution, `EffectiveSlingQuery`, pool detection via `IsPool`, `PoolConfig` for sizing, `Suspended` flag |
 | `internal/runtime` | `Provider.IsRunning` and `Provider.Nudge` for agent nudging via `doSlingNudge` |
 | `internal/agent` | `SessionNameFor` to compute session names |

@@ -462,8 +462,9 @@ Before considering any task complete:
   `internal/api/openapi.json`, `docs/reference/schema/openapi.*`,
   `internal/api/dashboardspa/`, or generated dashboard types
 - The dashboard starts locally and serves the app for dashboard/API-schema
-  changes; use `npm run preview -- --host 127.0.0.1 --port <port>` from
-  `internal/api/dashboardspa/web` after `make dashboard-ci`
+  changes; use `npm run preview -- --host 127.0.0.1 --port <port> --strictPort`
+  from `internal/api/dashboardspa/web/frontend` (the `web` workspace root has no
+  `preview` script) after `make dashboard-ci`
 - Every exported function has a doc comment
 - No premature abstractions
 - Tests cover happy path AND edge cases

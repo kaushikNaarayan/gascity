@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -235,7 +236,7 @@ func renderRigStatusFromAPI(cr api.CachedRead[api.StatusView], rig config.Rig, d
 			continue
 		}
 		status := agentStatusLineWithPartial(a.Running, dops, a.SessionName, a.Suspended, cr.Body.Partial)
-		fmt.Fprintf(stdout, "    %-12s%s\n", a.QualifiedName, status) //nolint:errcheck // best-effort stdout
+		fmt.Fprint(stdout, rigStatusAgentLine(a.QualifiedName, status)) //nolint:errcheck // best-effort stdout
 	}
 	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
 		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck // best-effort stdout
@@ -311,13 +312,13 @@ func doRigStatusWithStoreAndSnapshot(
 			target := statusObservationTargetForIdentity(statusSnapshot, cityName, a.QualifiedName(), sessionTemplate)
 			obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, cfg, target, stderr)
 			status := agentStatusLineWithPartial(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended, statusProviderPartial(sp))
-			fmt.Fprintf(stdout, "    %-12s%s\n", a.QualifiedName(), status) //nolint:errcheck // best-effort stdout
+			fmt.Fprint(stdout, rigStatusAgentLine(a.QualifiedName(), status)) //nolint:errcheck // best-effort stdout
 		} else {
 			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, sessionTemplate, sp) {
 				target := statusObservationTargetForIdentity(statusSnapshot, cityName, qualifiedInstance, sessionTemplate)
 				obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, cfg, target, stderr)
 				status := agentStatusLineWithPartial(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended, statusProviderPartial(sp))
-				fmt.Fprintf(stdout, "    %-12s%s\n", qualifiedInstance, status) //nolint:errcheck // best-effort stdout
+				fmt.Fprint(stdout, rigStatusAgentLine(qualifiedInstance, status)) //nolint:errcheck // best-effort stdout
 			}
 		}
 	}
@@ -420,3 +421,17 @@ func agentStatusLineWithPartial(running bool, dops drainOps, sn string, suspende
 	}
 	return "running"
 }
+
+// rigStatusAgentLine formats one agent row of `gc rig status`: the name padded
+// to a 12-column field, then the status. Names of 12 or more characters fill the
+// field, so they get one explicit space instead of running into the status text.
+func rigStatusAgentLine(name, status string) string {
+	gap := ""
+	if utf8.RuneCountInString(name) >= rigStatusNameWidth {
+		gap = " "
+	}
+	return fmt.Sprintf("    %-*s%s%s\n", rigStatusNameWidth, name, gap, status)
+}
+
+// rigStatusNameWidth is the agent-name column width in `gc rig status`.
+const rigStatusNameWidth = 12

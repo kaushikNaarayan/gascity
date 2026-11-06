@@ -41,6 +41,10 @@ internal/api/dashboardspa/web/frontend/.playwright/
 !/.claude/
 /.claude/*
 !/.claude/skills/
+# gc materializes pack skills here as <binding>.<skill> symlinks plus a
+# .gc-skill-ownership.json manifest. Every materialized name contains a dot; the
+# committed project skills (gascity-docs) do not. Tracked files stay tracked.
+/.claude/skills/*.*
 
 # sync-project-agents writes local migration backups here; don't commit them.
 .agents/migration/
