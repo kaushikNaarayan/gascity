@@ -19,6 +19,12 @@ esac
 # shellcheck disable=SC1091
 . "$__SCRIPT_DIR/_bd_trace.sh" "orphan-sweep"
 
+# Run the whole sweep (and every gc child it forks per rig) at background CPU
+# and IO priority so it never competes with interactive agent work. Best-effort:
+# hosts without renice/ionice still run the sweep.
+renice -n 10 -p "$$" >/dev/null 2>&1 || true
+ionice -c3 -p "$$" >/dev/null 2>&1 || true
+
 # Step 1: Collect in-progress beads from HQ and every rig whose session
 # liveness can be determined.
 # `gc bd list` without --rig is HQ-scoped from the city cwd, so per-rig

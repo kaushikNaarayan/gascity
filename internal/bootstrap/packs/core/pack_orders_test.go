@@ -331,3 +331,27 @@ func TestRenudgeStaleHumanGatesScriptContract(t *testing.T) {
 		t.Error("renudge-stale-human-gates.sh must exit non-zero when a re-nudge failed, or the loud-fail message is never logged (#4543)")
 	}
 }
+
+// TestBackgroundOrderScriptsRunAtLowPriority pins that the periodic core order
+// scripts that fork many gc/bd children per rig lower their own CPU and IO
+// priority, so the children inherit it and never compete with interactive
+// agent work on a many-rig host (gcf-21olb).
+func TestBackgroundOrderScriptsRunAtLowPriority(t *testing.T) {
+	for _, script := range []string{"orphan-sweep.sh", "wisp-compact.sh"} {
+		t.Run(script, func(t *testing.T) {
+			data, err := fs.ReadFile(PackFS, "assets/scripts/"+script)
+			if err != nil {
+				t.Fatalf("read %s: %v", script, err)
+			}
+			body := string(data)
+			for _, want := range []string{
+				`renice -n 10 -p "$$"`,
+				`ionice -c3 -p "$$"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("%s does not run at background priority: missing %q", script, want)
+				}
+			}
+		})
+	}
+}
