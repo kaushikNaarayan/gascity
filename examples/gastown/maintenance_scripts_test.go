@@ -547,35 +547,11 @@ exit 1
 // action items are claims by a person, not by a dead agent — resetting them
 // silently wipes the operator's claim.
 func TestOrphanSweepPreservesHumanOperatorAssignee(t *testing.T) {
-	cityDir := t.TempDir()
-	binDir := t.TempDir()
-	gcLog := filepath.Join(t.TempDir(), "gc.log")
-
-	orphanSweepOperatorAssigneeGCStub(t, binDir, "human")
-
-	env := map[string]string{
-		"GC_CITY":      cityDir,
-		"GC_CITY_PATH": cityDir,
-		"GC_CALL_LOG":  gcLog,
-		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-	}
-
-	script := coreScriptPath("orphan-sweep.sh")
-	cmd := exec.Command(script)
-	cmd.Env = mergeTestEnv(env)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
-	}
-	if strings.Contains(string(out), "orphan-sweep: reset") {
+	out, log := runOrphanSweepForAssignee(t, "human", nil)
+	if strings.Contains(out, "orphan-sweep: reset") {
 		t.Fatalf("human-operator assignee was swept:\n%s", out)
 	}
-
-	logData, err := os.ReadFile(gcLog)
-	if err != nil {
-		t.Fatalf("ReadFile(gc log): %v", err)
-	}
-	if log := string(logData); strings.Contains(log, "bd release-if-current ga-op ") {
+	if strings.Contains(log, "bd release-if-current ga-op ") {
 		t.Fatalf("human-operator bead was reset:\n%s", log)
 	}
 }
@@ -616,6 +592,64 @@ func TestOrphanSweepResetsHumanLikeDeadAssignee(t *testing.T) {
 	}
 	if log := string(logData); !strings.Contains(log, "bd release-if-current ga-op humanoid") {
 		t.Fatalf("orphan bead was not reset:\n%s", log)
+	}
+}
+
+// runOrphanSweepForAssignee runs the core orphan sweep against the one-bead
+// fixture assigned to assignee and returns the sweep output and the gc call
+// log. extraEnv overrides or adds environment (for GC_ORPHAN_SWEEP_REMOTE_SEATS).
+func runOrphanSweepForAssignee(t *testing.T, assignee string, extraEnv map[string]string) (string, string) {
+	t.Helper()
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	orphanSweepOperatorAssigneeGCStub(t, binDir, assignee)
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+	script := coreScriptPath("orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	return string(out), string(logData)
+}
+
+// TestOrphanSweepPreservesRemoteSeatAssignee: a Mac iOS seat is not a
+// configured agent and has no gc session; its in_progress claim must survive
+// the sweep (gcf-w264u). Negative controls: the guard switched off releases
+// the same claim, and the list is an exact match, not a prefix.
+func TestOrphanSweepPreservesRemoteSeatAssignee(t *testing.T) {
+	out, log := runOrphanSweepForAssignee(t, "gymbo/ios_dev2", nil)
+	if strings.Contains(out, "orphan-sweep: reset") || strings.Contains(log, "bd release-if-current ga-op ") {
+		t.Fatalf("remote seat claim was swept:\n%s\n%s", out, log)
+	}
+
+	out, log = runOrphanSweepForAssignee(t, "gymbo/ios_dev2", map[string]string{"GC_ORPHAN_SWEEP_REMOTE_SEATS": ""})
+	if !strings.Contains(out, "orphan-sweep: reset 1 orphaned beads") || !strings.Contains(log, "bd release-if-current ga-op gymbo/ios_dev2") {
+		t.Fatalf("guard off did not reproduce the release:\n%s\n%s", out, log)
+	}
+
+	out, log = runOrphanSweepForAssignee(t, "gymbo/ios_dev2", map[string]string{"GC_ORPHAN_SWEEP_REMOTE_SEATS": "gymbo/ios_dev"})
+	if !strings.Contains(out, "orphan-sweep: reset 1 orphaned beads") || !strings.Contains(log, "bd release-if-current ga-op gymbo/ios_dev2") {
+		t.Fatalf("list entry ios_dev must not cover ios_dev2:\n%s\n%s", out, log)
+	}
+
+	out, _ = runOrphanSweepForAssignee(t, "gymbo/ios_dev3", nil)
+	if !strings.Contains(out, "orphan-sweep: reset 1 orphaned beads") {
+		t.Fatalf("an unlisted look-alike seat must still be swept:\n%s", out)
 	}
 }
 

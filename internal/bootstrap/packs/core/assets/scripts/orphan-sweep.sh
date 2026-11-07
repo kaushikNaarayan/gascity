@@ -283,6 +283,16 @@ is_known_agent() {
     # claim. Exact match only: agents that merely start with "human" still
     # resolve through the normal paths below.
     if [ "$name" = "human" ]; then return 0; fi
+    # Remote-host seats (the Mac iOS crew: gymbo/ios_dev, ios_dev2, ios_tester;
+    # gcf-w264u). They are not configured agents and have no gc session by
+    # construction, so without this guard every in_progress claim they take reads
+    # as "assigned to a dead agent" and release-if-current resets it to open and
+    # unassigned a few minutes later. Exact match against a space-separated list;
+    # GC_ORPHAN_SWEEP_REMOTE_SEATS="" disables the guard, a different value
+    # replaces the list.
+    case " ${GC_ORPHAN_SWEEP_REMOTE_SEATS-gymbo/ios_dev gymbo/ios_dev2 gymbo/ios_tester} " in
+        *" $name "*) return 0 ;;
+    esac
     # Direct match against a configured agent template name.
     if agent_exists "$name"; then return 0; fi
     # Pool instance: strip trailing -<digits> and check template name.
