@@ -1,6 +1,9 @@
 package tmuxtest
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,12 +42,12 @@ func pidPrefixedTestDir(t *testing.T, root, prefix string, pid int) string {
 	return dir
 }
 
-func TestSweepOrphanPIDPrefixedDirsRemovesStaleDeadPID(t *testing.T) {
+func TestSweepOrphanPIDPrefixedDirsRemovesStaleDeadPIDWithNilDiagnostics(t *testing.T) {
 	root := t.TempDir()
 	dir := pidPrefixedTestDir(t, root, "pfx-", nonLivePID(t))
 	backdatePastSweepAge(t, dir)
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", nil)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("stale dead-PID dir survived sweep: %s", dir)
@@ -62,7 +65,7 @@ func TestSweepOrphanPIDPrefixedDirsPreservesHeldSentinel(t *testing.T) {
 	}
 	defer func() { _ = sentinel.Close() }()
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("dir with held sentinel was removed by sweep: %v", err)
@@ -81,10 +84,15 @@ func TestSweepOrphanPIDPrefixedDirsRemovesFreeSentinel(t *testing.T) {
 
 	backdatePastSweepAge(t, dir)
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	var diagnostics bytes.Buffer
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", &diagnostics)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("dir with free sentinel survived sweep: %s", dir)
+	}
+	wantDiagnostics := fmt.Sprintf("tmuxtest: removing orphaned socket parent %s (free sentinel)\n", dir)
+	if got := diagnostics.String(); got != wantDiagnostics {
+		t.Errorf("diagnostics = %q, want %q", got, wantDiagnostics)
 	}
 }
 
@@ -93,7 +101,7 @@ func TestSweepOrphanPIDPrefixedDirsSkipsYoungDir(t *testing.T) {
 	dir := pidPrefixedTestDir(t, root, "pfx-", nonLivePID(t))
 	// No backdate: dir is fresh, inside the min-age window.
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("young dir was removed by sweep despite age guard: %v", err)
@@ -105,7 +113,7 @@ func TestSweepOrphanPIDPrefixedDirsSkipsSelfPID(t *testing.T) {
 	dir := pidPrefixedTestDir(t, root, "pfx-", os.Getpid())
 	backdatePastSweepAge(t, dir)
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("sweep removed a dir carrying its own PID: %v", err)
@@ -118,7 +126,7 @@ func TestSweepOrphanPIDPrefixedDirsSkipsNonDirectories(t *testing.T) {
 	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Error("SweepOrphanPIDPrefixedDirs removed a non-directory file")
 	}
@@ -127,7 +135,7 @@ func TestSweepOrphanPIDPrefixedDirsSkipsNonDirectories(t *testing.T) {
 func TestNewSocketParentDirCreatesSentinelHeldDir(t *testing.T) {
 	root := t.TempDir()
 
-	dir, sentinel, err := NewSocketParentDir(root)
+	dir, sentinel, err := NewSocketParentDir(root, io.Discard)
 	if err != nil {
 		t.Fatalf("NewSocketParentDir: %v", err)
 	}
@@ -152,7 +160,8 @@ func TestNewSocketParentDirReapsOrphanedSibling(t *testing.T) {
 	orphan := pidPrefixedTestDir(t, root, SocketParentDirPrefix, nonLivePID(t))
 	backdatePastSweepAge(t, orphan)
 
-	dir, sentinel, err := NewSocketParentDir(root)
+	var diagnostics bytes.Buffer
+	dir, sentinel, err := NewSocketParentDir(root, &diagnostics)
 	if err != nil {
 		t.Fatalf("NewSocketParentDir: %v", err)
 	}
@@ -164,6 +173,10 @@ func TestNewSocketParentDirReapsOrphanedSibling(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("freshly created dir missing: %v", err)
+	}
+	wantDiagnostics := fmt.Sprintf("tmuxtest: removing orphaned socket parent %s (pid dead, no sentinel)\n", orphan)
+	if got := diagnostics.String(); got != wantDiagnostics {
+		t.Errorf("diagnostics = %q, want %q", got, wantDiagnostics)
 	}
 }
 
@@ -182,10 +195,93 @@ func TestSweepOrphanPIDPrefixedDirsPreservesLegacyNoDashDir(t *testing.T) {
 	}
 	backdatePastSweepAge(t, legacy)
 
-	SweepOrphanPIDPrefixedDirs(root, "pfx-")
+	SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
 
 	if _, err := os.Stat(legacy); err != nil {
 		t.Errorf("legacy no-separator dir was removed by sweep: %v", err)
+	}
+}
+
+// TestSweepOrphanPIDPrefixedDirsAgeFenceBySentinelState verifies the
+// sentinel probe gates removal before any age fence applies, with each
+// sentinel state carrying its own age threshold (ga-lygcyb): a held
+// sentinel is never removed regardless of age; a free (unlocked) sentinel
+// proves the creator is gone and only needs a short grace window, not the
+// full legacy fence; a dir with no sentinel at all keeps the existing
+// hour-long fence. Today the age check runs before the sentinel probe, so
+// the "free sentinel, 5 minutes old" case wrongly survives — this must fail
+// until the sentinel probe is checked first.
+func TestSweepOrphanPIDPrefixedDirsAgeFenceBySentinelState(t *testing.T) {
+	tests := []struct {
+		name       string
+		age        time.Duration
+		setup      func(t *testing.T, dir string) (cleanup func())
+		wantRemove bool
+	}{
+		{
+			name: "held sentinel, 5 minutes old",
+			age:  5 * time.Minute,
+			setup: func(t *testing.T, dir string) func() {
+				sentinel, err := HoldAliveSentinel(dir)
+				if err != nil {
+					t.Fatalf("HoldAliveSentinel: %v", err)
+				}
+				return func() { _ = sentinel.Close() }
+			},
+			wantRemove: false,
+		},
+		{
+			name: "free sentinel, 90 seconds old",
+			age:  90 * time.Second,
+			setup: func(t *testing.T, dir string) func() {
+				sentinel, err := HoldAliveSentinel(dir)
+				if err != nil {
+					t.Fatalf("HoldAliveSentinel: %v", err)
+				}
+				_ = sentinel.Close()
+				return func() {}
+			},
+			wantRemove: false,
+		},
+		{
+			name: "free sentinel, 5 minutes old",
+			age:  5 * time.Minute,
+			setup: func(t *testing.T, dir string) func() {
+				sentinel, err := HoldAliveSentinel(dir)
+				if err != nil {
+					t.Fatalf("HoldAliveSentinel: %v", err)
+				}
+				_ = sentinel.Close()
+				return func() {}
+			},
+			wantRemove: true,
+		},
+		{
+			name:       "no sentinel (legacy), over an hour old",
+			age:        2 * socketParentSweepMinAge,
+			setup:      func(_ *testing.T, _ string) func() { return func() {} },
+			wantRemove: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := pidPrefixedTestDir(t, root, "pfx-", nonLivePID(t))
+			cleanup := tt.setup(t, dir)
+			defer cleanup()
+			old := time.Now().Add(-tt.age)
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatalf("Chtimes(%s): %v", dir, err)
+			}
+
+			SweepOrphanPIDPrefixedDirs(root, "pfx-", io.Discard)
+
+			_, err := os.Stat(dir)
+			removed := os.IsNotExist(err)
+			if removed != tt.wantRemove {
+				t.Errorf("dir removed = %v, want %v", removed, tt.wantRemove)
+			}
+		})
 	}
 }
 

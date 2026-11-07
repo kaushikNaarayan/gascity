@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -41,6 +42,196 @@ func (s *droppingListStore) Get(id string) (Bead, error) {
 		return cloneBead(b), nil
 	}
 	return s.Store.Get(id)
+}
+
+// staleAssignmentListStore simulates a syntactically valid full-scan row whose
+// ownership fields lag the authoritative point read. This is the failure shape
+// observed when Dolt served cache reconciliation during read timeouts: List
+// showed an assigned in-progress bead as open and unassigned even though no
+// durable write had made that transition.
+type staleAssignmentListStore struct {
+	Store
+	listOverride map[string]Bead
+	getErr       map[string]error
+	getCalls     map[string]int
+}
+
+func (s *staleAssignmentListStore) List(query ListQuery) ([]Bead, error) {
+	items, err := s.Store.List(query)
+	if err != nil || !query.AllowScan {
+		return items, err
+	}
+	for i := range items {
+		if override, ok := s.listOverride[items[i].ID]; ok {
+			items[i] = cloneBead(override)
+		}
+	}
+	return items, nil
+}
+
+func (s *staleAssignmentListStore) Get(id string) (Bead, error) {
+	if s.getCalls == nil {
+		s.getCalls = make(map[string]int)
+	}
+	s.getCalls[id]++
+	if err, ok := s.getErr[id]; ok {
+		return Bead{}, err
+	}
+	return s.Store.Get(id)
+}
+
+func TestReconcileRevalidatesDestructiveAssignmentRegression(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	bead, err := mem.Create(Bead{Title: "Externally owned work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assignee := "external/ios_dev2"
+	inProgress := "in_progress"
+	if err := mem.Update(bead.ID, UpdateOpts{Assignee: &assignee, Status: &inProgress}); err != nil {
+		t.Fatalf("claim backing bead: %v", err)
+	}
+	claimed, err := mem.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get claimed bead: %v", err)
+	}
+
+	backing := &staleAssignmentListStore{Store: mem}
+	var events []string
+	cache := NewCachingStoreForTest(backing, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	stale := cloneBead(claimed)
+	stale.Status = "open"
+	stale.Assignee = ""
+	backing.listOverride = map[string]Bead{bead.ID: stale}
+	events = nil
+
+	cache.runReconciliation()
+
+	got, err := cache.Handles().Cached.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("cached Get after reconcile: %v", err)
+	}
+	if got.Status != inProgress || got.Assignee != assignee {
+		t.Fatalf("cached ownership = status %q assignee %q, want status %q assignee %q", got.Status, got.Assignee, inProgress, assignee)
+	}
+	if backing.getCalls[bead.ID] != 1 {
+		t.Fatalf("authoritative Get calls = %d, want 1", backing.getCalls[bead.ID])
+	}
+	for _, event := range events {
+		if event == "bead.updated:"+bead.ID {
+			t.Fatalf("reconcile emitted destructive update from stale List row: events=%v", events)
+		}
+	}
+}
+
+func TestReconcileAcceptsConfirmedAssignmentRelease(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	bead, err := mem.Create(Bead{Title: "Released work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assignee := "external/ios_dev2"
+	inProgress := "in_progress"
+	if err := mem.Update(bead.ID, UpdateOpts{Assignee: &assignee, Status: &inProgress}); err != nil {
+		t.Fatalf("claim backing bead: %v", err)
+	}
+
+	backing := &staleAssignmentListStore{Store: mem}
+	var events []string
+	cache := NewCachingStoreForTest(backing, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	open := "open"
+	empty := ""
+	if err := mem.Update(bead.ID, UpdateOpts{Assignee: &empty, Status: &open}); err != nil {
+		t.Fatalf("release backing bead: %v", err)
+	}
+	events = nil
+
+	cache.runReconciliation()
+
+	got, err := cache.Handles().Cached.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("cached Get after reconcile: %v", err)
+	}
+	if got.Status != open || got.Assignee != empty {
+		t.Fatalf("cached ownership = status %q assignee %q, want confirmed release", got.Status, got.Assignee)
+	}
+	if backing.getCalls[bead.ID] != 1 {
+		t.Fatalf("authoritative Get calls = %d, want 1", backing.getCalls[bead.ID])
+	}
+	wantEvent := "bead.updated:" + bead.ID
+	found := false
+	for _, event := range events {
+		if event == wantEvent {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("events=%v, want confirmed release event %q", events, wantEvent)
+	}
+}
+
+func TestReconcileDefersAssignmentRegressionWhenPointReadFails(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	bead, err := mem.Create(Bead{Title: "Owned work during backend outage"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assignee := "external/ios_dev2"
+	inProgress := "in_progress"
+	if err := mem.Update(bead.ID, UpdateOpts{Assignee: &assignee, Status: &inProgress}); err != nil {
+		t.Fatalf("claim backing bead: %v", err)
+	}
+	claimed, err := mem.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get claimed bead: %v", err)
+	}
+
+	backing := &staleAssignmentListStore{Store: mem}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	stale := cloneBead(claimed)
+	stale.Status = "open"
+	stale.Assignee = ""
+	backing.listOverride = map[string]Bead{bead.ID: stale}
+	backing.getErr = map[string]error{bead.ID: errors.New("read packet: i/o timeout")}
+
+	cache.runReconciliation()
+
+	got, err := cache.Handles().Cached.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("cached Get after reconcile: %v", err)
+	}
+	if got.Status != inProgress || got.Assignee != assignee {
+		t.Fatalf("cached ownership = status %q assignee %q, want fail-closed status %q assignee %q", got.Status, got.Assignee, inProgress, assignee)
+	}
+	problem := cache.Stats().LastProblem
+	for _, want := range []string{bead.ID, "runReconciliation", "list_status=\"open\"", "read packet: i/o timeout"} {
+		if !strings.Contains(problem, want) {
+			t.Fatalf("LastProblem = %q, want diagnostic field %q", problem, want)
+		}
+	}
 }
 
 func assertNotCached(t *testing.T, cache *CachingStore, id string) {

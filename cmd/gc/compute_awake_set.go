@@ -19,21 +19,22 @@ const defaultOnDemandIdleTimeout = 5 * time.Minute
 // should be awake. All external I/O (shell commands, tmux checks, store
 // queries) happens before this function is called.
 type AwakeInput struct {
-	Agents             []AwakeAgent
-	NamedSessions      []AwakeNamedSession
-	SessionBeads       []AwakeSessionBead
-	WorkBeads          []AwakeWorkBead // in_progress assigned work plus ready open assigned work
-	ScaleCheckCounts   map[string]int  // agent template → scale_check count
-	NamedSessionDemand map[string]bool // named-session identity → routed/assigned work demand
-	NamedSessionWorkQ  map[string]bool // named-session identity → bridge-carried work_query demand
-	WorkSet            map[string]bool // agent template → work_query found pending work
-	RunningSessions    map[string]bool // session name → tmux exists
-	AttachedSessions   map[string]bool // session name → user attached
-	PendingSessions    map[string]bool // session name → pending interaction
-	ReadyWaitSet       map[string]bool // session bead ID → durable wait is ready
-	ChatIdleTimeout    time.Duration   // global idle timeout for manual/chat sessions (0 = disabled)
-	ManualGracePeriod  time.Duration   // grace period before manual sessions can be idle-slept (0 = disabled)
-	Now                time.Time
+	Agents                   []AwakeAgent
+	NamedSessions            []AwakeNamedSession
+	SessionBeads             []AwakeSessionBead
+	WorkBeads                []AwakeWorkBead // in_progress assigned work plus ready open assigned work
+	ScaleCheckCounts         map[string]int  // agent template → scale_check count
+	NamedSessionDemand       map[string]bool // named-session identity → routed/assigned work demand
+	NamedSessionRoutedDemand map[string]bool // named-session identity → pre-suppression routed demand on backing template (wake-only, see DesiredStateResult.NamedSessionRoutedDemand)
+	NamedSessionWorkQ        map[string]bool // named-session identity → bridge-carried work_query demand
+	WorkSet                  map[string]bool // agent template → work_query found pending work
+	RunningSessions          map[string]bool // session name → tmux exists
+	AttachedSessions         map[string]bool // session name → user attached
+	PendingSessions          map[string]bool // session name → pending interaction
+	ReadyWaitSet             map[string]bool // session bead ID → durable wait is ready
+	ChatIdleTimeout          time.Duration   // global idle timeout for manual/chat sessions (0 = disabled)
+	ManualGracePeriod        time.Duration   // grace period before manual sessions can be idle-slept (0 = disabled)
+	Now                      time.Time
 }
 
 // AwakeAgent represents an [[agent]] config entry.
@@ -76,6 +77,7 @@ type AwakeSessionBead struct {
 	RestartRequested          bool      // restart_requested metadata is still active
 	ContinuationResetPending  bool      // continuation_reset_pending metadata is set
 	CurrentlyProcessingBeadID string    // work bead the session is currently processing
+	PostCreateProtected       bool      // fresh successful pool create; preferred for scaled slots during grace
 }
 
 // AwakeWorkBead represents a work bead with an assignee.
@@ -84,6 +86,17 @@ type AwakeWorkBead struct {
 	Assignee string
 	Status   string // "open", "in_progress"
 	Ready    bool   // true for open work only after readiness/blocker filtering
+	// Blocked is true when an in_progress bead carries an open
+	// ready-blocking dependency or gate (bd's IsBlocked projection). It is
+	// meaningless for open work, whose blocker state is already folded into
+	// Ready. Zero value is false, so every existing in_progress caller that
+	// does not populate it keeps today's unconditional-wake behavior.
+	//
+	// Setting it is not purely suppressive: workBeadHasAwakeDemand also feeds
+	// countAssignedScaleSlots, so blocked in_progress work additionally
+	// releases the session's scale slot, which can wake a different session
+	// as scaled:demand.
+	Blocked bool
 }
 
 // AwakeDecision is the output for a single session.
@@ -185,6 +198,8 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			switch {
 			case input.NamedSessionDemand[ns.Identity]:
 				reason = "named-demand"
+			case input.NamedSessionRoutedDemand[ns.Identity]:
+				reason = "routed-demand"
 			case input.NamedSessionWorkQ[ns.Identity]:
 				reason = "work-query"
 			default:
@@ -213,7 +228,7 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !ok || agent.Suspended {
 			continue
 		}
-		active := collectActiveBeads(input.SessionBeads, template)
+		active := collectActiveBeads(input.SessionBeads, template, input.Now)
 		filled := countAssignedScaleSlots(input.SessionBeads, input.WorkBeads, input.NamedSessions, template)
 		for _, bead := range active {
 			if filled >= count {
@@ -257,7 +272,7 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			continue // named sessions are handled in the named-session pass
 		}
 		// collectActiveBeads already excludes DependencyOnly and Drained
-		if active := collectActiveBeads(input.SessionBeads, template); len(active) > 0 {
+		if active := collectActiveBeads(input.SessionBeads, template, input.Now); len(active) > 0 {
 			desired[active[0].SessionName] = "work-query"
 			continue
 		}
@@ -365,8 +380,19 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		}
 	}
 
+	// continuation_reset_pending means "the next wake must start a fresh
+	// conversation" — it is not itself a reason to wake a Drained session.
+	// AcknowledgeDrainPatch(freshWake=true) stamps state=drained +
+	// continuation_reset_pending=true together when a wake_mode=fresh session
+	// drain-acks (e.g. it only has blocked assigned work). Without this guard
+	// that pending flag alone re-desires the session every tick, undoing the
+	// drain-ack and driving a perpetual wake/drain oscillation (each cycle a
+	// full fresh model boot). Mirrors the Drained guard on the pin arm below.
+	// A legitimate reset-pending session is asleep-but-not-drained (restart
+	// request, config-drift reset) or already carries pending-create/
+	// explicit-wake — both remain unaffected by this guard.
 	for _, bead := range input.SessionBeads {
-		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold {
+		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
 		switch desired[bead.SessionName] {
@@ -449,28 +475,38 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 
 		// Idle sleep: desired sessions idle too long should sleep.
 		// Attached, pending, pinned, mode=always named, and sessions with
-		// assigned demand work are exempt. Assigned demand work means either
-		// in_progress ownership or open work with Ready=true; blocked open
-		// assignments do not prevent idle sleep. Manual sessions within their
-		// grace period are also exempt.
+		// assigned demand work are exempt. A claimed in_progress bead also
+		// vetoes idle sleep even when blocked: blocked work does not wake an
+		// asleep owner, but it must not park the live seat that owns the claim.
+		// Blocked open assignments do not prevent idle sleep. Manual sessions
+		// within their grace period are also exempt.
 		//
 		// On_demand named sessions woken by routed/named demand
-		// ("named-demand", "work-query") are also exempt: that demand means
-		// there is pending work for this specific session, so an idle window
-		// must not put it back to sleep. Without this, an asleep on_demand
-		// named session (e.g. a refinery) with routed work that already exists
-		// (open_count==desired_count==1) is re-slept every tick and the work
-		// is wedged forever — the reconciler reports reason_code=retained
-		// indefinitely. A fresh cold-create wakes only because it has no
-		// idle reference. The "work done, no demand" drain still fires via the
-		// "on-demand:running" reason, which is NOT exempt. See #3413.
-		if decision.ShouldWake && !input.AttachedSessions[name] && !input.PendingSessions[name] && !bead.Pinned && !bead.IdleSince.IsZero() &&
+		// ("named-demand", "routed-demand", "work-query") are also exempt:
+		// that demand means there is pending work for this specific session,
+		// so an idle window must not put it back to sleep. Without this, an
+		// asleep on_demand named session (e.g. a refinery) with routed work
+		// that already exists (open_count==desired_count==1) is re-slept every
+		// tick and the work is wedged forever — the reconciler reports
+		// reason_code=retained indefinitely. A fresh cold-create wakes only
+		// because it has no idle reference. The "work done, no demand" drain
+		// still fires via the "on-demand:running" reason, which is NOT exempt.
+		// See #3413.
+		//
+		// A durable explicit wake request ("explicit-wake") is exempt for the
+		// same reason: it is a standing operator/wake-path demand for this
+		// specific session, so an idle window that predates it (e.g. from a
+		// supervisor-restart re-projection) must not silently cancel it. See
+		// #5739.
+		agent, hasAgent := lookupAgent(bead.Template)
+		holdsClaimedWork := hasAgent && !agent.Suspended && sessionHasClaimedInProgressWork(input.WorkBeads, input.NamedSessions, bead)
+		if decision.ShouldWake && !input.AttachedSessions[name] && !input.PendingSessions[name] && !bead.Pinned && !holdsClaimedWork && !bead.IdleSince.IsZero() &&
 			!isAlwaysNamedSession(input.NamedSessions, bead) &&
 			desired[name] != "assigned-work" && desired[name] != "min-active" &&
 			desired[name] != "reset-pending" &&
-			desired[name] != "named-demand" && desired[name] != "work-query" &&
+			desired[name] != "named-demand" && desired[name] != "routed-demand" &&
+			desired[name] != "work-query" && desired[name] != "explicit-wake" &&
 			!inManualGracePeriod(bead, input.ManualGracePeriod, input.Now) {
-			agent, hasAgent := lookupAgent(bead.Template)
 			var idleTimeout time.Duration
 			switch {
 			case bead.ManualSession && input.ChatIdleTimeout > 0:
@@ -662,7 +698,7 @@ func isNamedSessionTemplate(named []AwakeNamedSession, template string) bool {
 	return false
 }
 
-func collectActiveBeads(beads []AwakeSessionBead, template string) []AwakeSessionBead {
+func collectActiveBeads(beads []AwakeSessionBead, template string, now time.Time) []AwakeSessionBead {
 	var result []AwakeSessionBead
 	for _, b := range beads {
 		// Exclude both NamedIdentity-tagged beads AND ConfiguredNamedSession
@@ -674,10 +710,23 @@ func collectActiveBeads(beads []AwakeSessionBead, template string) []AwakeSessio
 		// session getting woken by generic template scale_check demand.
 		if b.Template == template && b.State == "active" &&
 			b.NamedIdentity == "" && !b.ConfiguredNamedSession &&
-			!b.ManualSession && !b.Drained && !b.DependencyOnly {
+			!b.ManualSession && !b.Drained && !b.DependencyOnly &&
+			!minActiveHardBlocked(b, now) {
 			result = append(result, b)
 		}
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].PostCreateProtected != result[j].PostCreateProtected {
+			return result[i].PostCreateProtected
+		}
+		if !result[i].PostCreateProtected {
+			return false
+		}
+		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			return result[i].CreatedAt.Before(result[j].CreatedAt)
+		}
+		return result[i].ID < result[j].ID
+	})
 	return result
 }
 
@@ -694,10 +743,19 @@ func sessionHasAssignedWork(workBeads []AwakeWorkBead, named []AwakeNamedSession
 	return false
 }
 
+func sessionHasClaimedInProgressWork(workBeads []AwakeWorkBead, named []AwakeNamedSession, bead AwakeSessionBead) bool {
+	for _, wb := range workBeads {
+		if wb.Status == "in_progress" && sessionAssigneeMatches(named, bead, strings.TrimSpace(wb.Assignee)) {
+			return true
+		}
+	}
+	return false
+}
+
 func workBeadHasAwakeDemand(bead AwakeWorkBead) bool {
 	switch bead.Status {
 	case "in_progress":
-		return true
+		return !bead.Blocked
 	case "open":
 		return bead.Ready
 	default:

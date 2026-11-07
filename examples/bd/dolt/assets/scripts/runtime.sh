@@ -215,11 +215,35 @@ managed_runtime_port() (
   printf '%s\n' "$port"
 )
 
-# Resolve GC_DOLT_PORT. The shared helper prefers validated live managed
-# runtime state over stale inherited env, then falls back to GC_DOLT_PORT as an
-# operator seed, and exits 78 if neither yields a port.
 . "${GC_PACK_DIR:-${PACK_DIR:-${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt}}/assets/scripts/port_resolve.sh"
-GC_DOLT_PORT=$(resolve_dolt_port_or_die "$DOLT_STATE_FILE" "$DOLT_PROVIDER_STATE_FILE" "$DOLT_DATA_DIR" "$GC_CITY_PATH") || exit $?
+. "${GC_PACK_DIR:-${PACK_DIR:-${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt}}/assets/scripts/proxied_scope.sh"
+
+# On a bd-owned proxied scope there is no gc-managed Dolt server: bd starts,
+# supervises and stops it. Every command in this pack is a typed no-op there,
+# and there is no managed runtime port to resolve. A command that shapes its
+# own output (health, cleanup) sets GC_DOLT_PROXIED_HANDLED=1 before sourcing
+# this file and emits its own skip document instead.
+#
+# The guard runs before the commands parse their own flags, so it has to
+# honour --json itself: status, cleanup, compact and sync all have machine
+# consumers, and a plain sentence on stdout would break every one of them.
+if bd_owns_proxied_scope; then
+  GC_DOLT_SCOPE_BD_PROXIED=1
+  if [ "${GC_DOLT_PROXIED_HANDLED:-0}" != "1" ]; then
+    case " $* " in
+      *" --json "*) print_proxied_skip_json ;;
+      *) printf '%s\n' "$GC_DOLT_PROXIED_NOOP_MESSAGE" ;;
+    esac
+    exit 0
+  fi
+  GC_DOLT_PORT=""
+else
+  GC_DOLT_SCOPE_BD_PROXIED=0
+  # Resolve GC_DOLT_PORT. The shared helper prefers validated live managed
+  # runtime state over stale inherited env, then falls back to GC_DOLT_PORT as
+  # an operator seed, and exits 78 if neither yields a port.
+  GC_DOLT_PORT=$(resolve_dolt_port_or_die "$DOLT_STATE_FILE" "$DOLT_PROVIDER_STATE_FILE" "$DOLT_DATA_DIR" "$GC_CITY_PATH") || exit $?
+fi
 
 # Resolve a bounded-execution helper. Prefer gtimeout (coreutils on
 # macOS), fall back to timeout (coreutils on Linux), then to running
@@ -262,14 +286,18 @@ import sys
 
 limit = float(sys.argv[1])
 cmd = sys.argv[2:]
+
+proc = subprocess.Popen(cmd)
 try:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
-except subprocess.TimeoutExpired as exc:
-    sys.stdout.write(exc.stdout or "")
-    sys.stderr.write(exc.stderr or "")
+    proc.wait(timeout=limit)
+except subprocess.TimeoutExpired:
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
     sys.exit(124)
-sys.stdout.write(proc.stdout)
-sys.stderr.write(proc.stderr)
 sys.exit(proc.returncode)
 PY
   else

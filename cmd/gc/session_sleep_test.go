@@ -205,7 +205,9 @@ func TestReconcileDetachedAtUsesRoutedSleepCapability(t *testing.T) {
 		t.Fatalf("policy capability = %q, want %q", policy.Capability, runtime.SessionSleepCapabilityFull)
 	}
 
-	reconcileDetachedAtInfo(sessiontest.SeedBead(t, session), store, policy, true, provider, &clock.Fake{Time: now})
+	if _, err := reconcileDetachedAtInfo(sessiontest.SeedBead(t, session), store, policy, true, provider, &clock.Fake{Time: now}); err != nil {
+		t.Fatalf("reconcileDetachedAtInfo: %v", err)
+	}
 
 	got, err := store.Get(session.ID)
 	if err != nil {
@@ -402,6 +404,26 @@ func TestReconcilerWakeDemandOverridesSleepSuppressionForAssignedWork(t *testing
 	}
 	if wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", true) {
 		t.Fatal("explicit sleep intent should still override assigned-work demand")
+	}
+}
+
+// Routed demand wakes the canonical alias holder, but alias suppression
+// deliberately zeroes the standby's poolDesired. Without an explicit override
+// the holder stays asleep under a configured non-interactive sleep policy
+// (sleep_after_idle) and the routed work is never picked up.
+func TestReconcilerWakeDemandOverridesSleepSuppressionForRoutedDemand(t *testing.T) {
+	policy := resolvedSessionSleepPolicy{Class: config.SessionSleepNonInteractive}
+	decision := AwakeDecision{ShouldWake: true, Reason: "routed-demand"}
+	eval := wakeEvaluation{Reasons: []WakeReason{WakeWork}}
+
+	if !wakeDemandOverridesSleepSuppression(decision, eval, policy, map[string]int{"worker": 0}, "worker", false) {
+		t.Fatal("routed demand should override noninteractive sleep suppression when alias suppression zeroed poolDesired")
+	}
+	if !wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", false) {
+		t.Fatal("routed demand should override noninteractive sleep suppression with no pool entry at all")
+	}
+	if wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", true) {
+		t.Fatal("explicit sleep intent should still override routed demand")
 	}
 }
 

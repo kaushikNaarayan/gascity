@@ -217,7 +217,7 @@ Read **`engdocs/architecture/api-control-plane.md`** and
 - `internal/extmsg/` (external-messaging emitters)
 - Anything that affects `internal/api/openapi.json`,
   `docs/reference/schema/openapi.json`, or the generated TS types under
-  `cmd/gc/dashboard/web/src/generated/`
+  `internal/api/dashboardspa/web/shared/src/generated/`
 
 Load-bearing invariants enforced by CI (violating any fails the
 build; full rationale is in the architecture docs):
@@ -314,6 +314,9 @@ These decisions are final. Do not revisit them.
   consumer layer. Apply this before adding any new primitive.
 - **`engdocs/archive/backlogs/worktree-roadmap.md`** — Worktree isolation roadmap, polecat
   lifecycle analysis, and Gas Town cleanup bug lessons.
+- **`engdocs/contributors/release-gate-criteria-conventions.md`** — What the
+  "Tests pass" criterion in a `release-gates/*.md` file must cite. Apply this
+  before signing off that criterion on any deploy gate.
 
 ## Key design principles
 
@@ -372,6 +375,14 @@ becoming more useful as models improve — it becomes LESS useful instead.
   default tmux server. If tmux cleanup is required, target only the known
   city/test socket explicitly with `tmux -L <socket> ...`, or prefer `gc stop`
   for city shutdown. Treat personal tmux servers as out of bounds.
+- **Git safety:** Never run `git checkout <ref> -- .` (or any pathspec
+  checkout) in a worktree you do not own — above all the shared rig root
+  (`$GC_RIG_ROOT`). Unlike `git checkout <ref>`, the pathspec form overwrites
+  the index and worktree for every tracked path, moves no HEAD (so no reflog
+  entry) and stages nothing (so no dangling blob): overwritten uncommitted
+  work is unrecoverable. To read a file at a ref use `git show <ref>:<path>`.
+  To check something out, use your own worktree or a disposable
+  `git worktree add`.
 - **Adding agent config fields:** When adding a field to `config.Agent`,
   also add it to `AgentPatch` and `AgentOverride`, wire it into the shared
   merge body `applyAgentMutation` (in `internal/config/patch.go`) — and, for
@@ -428,13 +439,29 @@ unconditionally with a `trap`, and redirect `TMPDIR` to the same dir so the
 linker's own scratch also stays off tmpfs:
 
 ```bash
-tmp=$(mktemp -d -p /var/tmp) && trap 'rm -rf "$tmp"' EXIT
-GOCACHE="$tmp" TMPDIR="$tmp" go build ./cmd/gc/
+scripts/task-cache-run \
+  --owner "$GC_AGENT" --bead "$BEAD_ID" --session "$GC_SESSION_NAME" -- \
+  go build ./cmd/gc/
 ```
+
+`task-cache-run` creates a disk-backed, task-owned cache root with owner,
+bead, session, PID, and PID-start metadata, then removes it on normal exit or
+signal. It defaults to `/var/tmp`; set `GC_TASK_CACHE_PARENT` only to another
+disk-backed directory. `scripts/task-cache-reap --root <parent>` is report-only
+by default and requires explicit `--delete`; it only reaps metadata-owned
+roots after proving the recorded process identity is dead.
 
 **Exception:** `go clean -testcache` is explicitly allowed. It clears only the
 test-result cache, not the compiled-object cache, and does not corrupt
 concurrent builds.
+
+**Hermetic Git test config is mirrored.** `Makefile`'s `TEST_ENV` and the
+nested `env -i` wrappers in `scripts/test-local-parallel`,
+`scripts/test-go-test-shard`, and `scripts/test-integration-shard` must all pin
+`GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. Updating only the
+Makefile is insufficient because each nested runner rebuilds the environment
+and would otherwise restore user Git configuration through the preserved
+`HOME`.
 
 ## Code quality gates
 
@@ -445,17 +472,45 @@ Before considering any task complete:
 - Broader process/integration coverage uses the sharded targets documented in
   `TESTING.md` instead of one monolithic `go test ./...` sweep
 - `go vet ./...` clean
-- `.githooks/pre-commit` is active locally (`git config core.hooksPath`
-  prints `.githooks`) and has run for the staged change
-- `make dashboard-check` passes for any change touching `internal/api/`,
+- `.githooks/pre-commit` is active locally (verify with `make check-hooks`)
+  and has run for the staged change. See "Git hook ownership" below — beads'
+  installer silently takes `core.hooksPath` over, and a bypassed hook cannot
+  report its own absence.
+- `make dashboard-ci` passes for any change touching `internal/api/`,
   `internal/api/openapi.json`, `docs/reference/schema/openapi.*`,
-  `cmd/gc/dashboard/`, or generated dashboard types
+  `internal/api/dashboardspa/`, or generated dashboard types
 - The dashboard starts locally and serves the app for dashboard/API-schema
   changes; use `npm run preview -- --host 127.0.0.1 --port <port>` from
-  `cmd/gc/dashboard/web` after `make dashboard-check`
+  `internal/api/dashboardspa/web` after `make dashboard-ci`
 - Every exported function has a doc comment
 - No premature abstractions
 - Tests cover happy path AND edge cases
+
+## Git hook ownership
+
+**`.githooks` is the single owner of `core.hooksPath`.** Install it with
+`make setup`; verify it with `make check-hooks`.
+
+Only one directory can own `core.hooksPath`, and beads' installer claims it
+for `.beads/hooks`. Those hooks exec `bd hooks run <hook>` without chaining
+onward, so while beads owns the path every gate in `.githooks` — staged-Go
+formatting, `lint-changed`, the three codegen+stage steps, `make vet`, and the
+push-time suite — is skipped on every commit. Nothing reports this: git simply
+stops invoking the hooks, so commits look clean while spec-derived drift lands
+on the mainline until a later suite failure surfaces the drift.
+
+Reclaiming the path does not disable beads. Each `.githooks` hook forwards to
+`.githooks/lib/beads-chain.sh`, which runs `bd hooks run <hook>` with the same
+timeout and exit-code carve-outs beads' own integration block used. Adding a
+hook that beads manages means adding its `.githooks` counterpart too —
+`TestGitHooksCoverEveryBeadsManagedHook` in `scripts/` fails otherwise.
+
+Beads' installer can reclaim `core.hooksPath` at any time. When it does,
+`make check-hooks` fails and `make setup` puts it back.
+
+`make spec-ci` (run by the required `preflight-generated` CI job) is the
+backstop for spec/client drift, but it only sees work that reaches a PR —
+locally merged branches depend on the pre-commit gate actually running.
 
 ## Non-Interactive Shell Commands
 
@@ -524,6 +579,13 @@ bd close <id>         # Complete work
    NOTE: gascity Dolt is LOCAL-ONLY (no remote). Do NOT run `bd dolt push`,
    `bd dolt pull`, or `bd dolt remote add` here -- they fail and re-introduce
    a doomed `origin` remote (ga-9wsri). Use `git push` only.
+
+   That same no-remote shape is why bd >= 1.3.0 refuses to auto-apply pending
+   schema migrations to gascity's shared Dolt sql-server: migrating would lock
+   out every co-resident bd still on the old schema. If a bd WRITE fails with a
+   refusal naming pending migrations, the sanctioned fix is `bd migrate schema`
+   run once by a designated migrator after every bd client is upgraded -- NOT
+   `bd dolt pull`, and not an ad-hoc `BD_ALLOW_REMOTE_MIGRATE=1`.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session

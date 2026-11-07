@@ -21,14 +21,30 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$__SCRIPT_DIR/_bd_trace.sh" "wisp-compact"
 
+# Run the whole compaction (and every gc/bd child it forks per wisp) at
+# background CPU and IO priority so it never competes with interactive agent
+# work. Best-effort: hosts without renice/ionice still run the compaction.
+renice -n 10 -p "$$" >/dev/null 2>&1 || true
+ionice -c3 -p "$$" >/dev/null 2>&1 || true
+
 CITY="${GC_CITY:-.}"
 
-# Get all ephemeral beads.
-ALL=$(gc bd list --json --all -n 0 2>/dev/null) || exit 0
-EPHEMERALS=$(echo "$ALL" | jq '[.[] | select(.ephemeral == true)]' 2>/dev/null) || exit 0
-
-if [ -z "$EPHEMERALS" ] || [ "$EPHEMERALS" = "[]" ]; then
-    exit 0
+# Get all ephemeral beads. `gc bd list --json` does not project the
+# `ephemeral` field (or several other fields, e.g. labels, on some rows) so
+# it cannot be used to select wisps; `bd query` does project `ephemeral` and
+# `labels` and is the selection surface this script is contracted to. --all
+# is required because closed ephemeral wisps (the delete path) are excluded
+# from query's default open-only filter. This calls `gc bd`, not bare `bd`,
+# deliberately: bare `bd` resolves its store from the CWD, which would let
+# the selection query silently scope to a different store than the `gc bd
+# update`/`delete` mutations below use.
+if ! EPHEMERALS=$(gc bd query "ephemeral=true" --all --json -n 0 2>&1); then
+    echo "wisp-compact: ERROR: ephemeral-wisp query failed: $EPHEMERALS" >&2
+    exit 1
+fi
+if ! echo "$EPHEMERALS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "wisp-compact: ERROR: ephemeral-wisp query returned non-array output: $EPHEMERALS" >&2
+    exit 1
 fi
 
 NOW=$(date +%s)
@@ -36,12 +52,17 @@ PROMOTED=0
 DELETED=0
 SKIPPED=0
 
+if [ "$EPHEMERALS" = "[]" ]; then
+    echo "wisp-compact: promoted=0 deleted=0 skipped=0"
+    exit 0
+fi
+
 # Process each ephemeral bead. Capturing jq output into BEADS first
 # (instead of piping into the loop) preserves the original pipefail
 # fail-loud on jq error AND keeps PROMOTED/DELETED/SKIPPED in the parent
 # shell so they survive to the summary echo below. EPHEMERALS is
-# pre-validated as a non-empty array on lines 22-27, so BEADS is
-# guaranteed non-empty here.
+# pre-validated above as a non-empty array (the "[]" case exits early),
+# so BEADS is guaranteed non-empty here.
 BEADS=$(echo "$EPHEMERALS" | jq -c '.[]' 2>/dev/null)
 while IFS= read -r bead; do
     id=$(echo "$bead" | jq -r '.id')
@@ -91,7 +112,4 @@ while IFS= read -r bead; do
     DELETED=$((DELETED + 1))
 done <<< "$BEADS"
 
-TOTAL=$((PROMOTED + DELETED))
-if [ "$TOTAL" -gt 0 ]; then
-    echo "wisp-compact: promoted=$PROMOTED deleted=$DELETED skipped=$SKIPPED"
-fi
+echo "wisp-compact: promoted=$PROMOTED deleted=$DELETED skipped=$SKIPPED"
