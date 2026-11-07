@@ -63,7 +63,7 @@ func TestCityStatusSnapshotIncludesStoreHealthWhenControllerRunning(t *testing.T
 	stubSupervisorAlive(t)
 
 	ep := events.NewFake()
-	ts := time.Date(2026, 4, 1, 3, 0, 0, 0, time.UTC)
+	ts := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second) // inside storehealth.MaintenanceLookback
 	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 5})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: ts, Payload: payload})
 	stubStoreHealthEvents(t, ep)
@@ -91,8 +91,8 @@ func TestCityStatusSnapshotIncludesStoreHealthWhenControllerRunning(t *testing.T
 	if h.Warning {
 		t.Errorf("Warning = true, want false for empty store dir")
 	}
-	if h.LastGCAt != "2026-04-01T03:00:00Z" {
-		t.Errorf("LastGCAt = %q, want 2026-04-01T03:00:00Z", h.LastGCAt)
+	if want := ts.Format(time.RFC3339); h.LastGCAt != want {
+		t.Errorf("LastGCAt = %q, want %s", h.LastGCAt, want)
 	}
 	if h.LastGCStatus != "success" {
 		t.Errorf("LastGCStatus = %q, want success", h.LastGCStatus)

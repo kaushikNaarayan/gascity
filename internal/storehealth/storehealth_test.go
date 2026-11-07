@@ -1,7 +1,11 @@
 package storehealth
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -216,8 +220,8 @@ func TestLastMaintenanceNilProvider(t *testing.T) {
 
 func TestLastMaintenanceReturnsLatestAcrossTypes(t *testing.T) {
 	ep := events.NewFake()
-	older := time.Date(2026, 4, 1, 3, 0, 0, 0, time.UTC)
-	newer := time.Date(2026, 4, 8, 3, 0, 0, 0, time.UTC)
+	older := time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)
+	newer := time.Now().UTC().Add(-1 * 24 * time.Hour).Truncate(time.Second)
 
 	payloadDone, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
 	payloadFail, _ := json.Marshal(events.StoreMaintenanceFailedPayload{Stage: "gc"})
@@ -236,8 +240,8 @@ func TestLastMaintenanceReturnsLatestAcrossTypes(t *testing.T) {
 
 func TestLastMaintenanceOnlyDoneEvents(t *testing.T) {
 	ep := events.NewFake()
-	t1 := time.Date(2026, 4, 1, 3, 0, 0, 0, time.UTC)
-	t2 := time.Date(2026, 4, 8, 3, 0, 0, 0, time.UTC)
+	t1 := time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)
+	t2 := time.Now().UTC().Add(-1 * 24 * time.Hour).Truncate(time.Second)
 	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 2})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: t1, Payload: payload})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: t2, Payload: payload})
@@ -256,5 +260,149 @@ func TestLastMaintenanceNoEvents(t *testing.T) {
 	ts, status := LastMaintenance(ep)
 	if !ts.IsZero() || status != "" {
 		t.Fatalf("LastMaintenance(empty) = (%v,%q), want (zero,\"\")", ts, status)
+	}
+}
+
+// archiveLine renders one JSONL event line.
+func archiveLine(t *testing.T, seq uint64, typ string, ts time.Time) string {
+	t.Helper()
+	b, err := json.Marshal(events.Event{Seq: seq, Type: typ, Ts: ts, Actor: "gc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b) + "\n"
+}
+
+func writeGzArchive(t *testing.T, dir, name, body string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// openFileProvider returns the real file-backed provider over dir/events.jsonl.
+func openFileProvider(t *testing.T, dir string) events.Provider {
+	t.Helper()
+	rec, err := events.NewFileRecorder(filepath.Join(dir, "events.jsonl"), io.Discard)
+	if err != nil {
+		t.Fatalf("NewFileRecorder: %v", err)
+	}
+	t.Cleanup(func() { rec.Close() }) //nolint:errcheck // test cleanup
+	return rec
+}
+
+// An event in the newest archive must be found without opening any older
+// archive. The older archives here are corrupt gzip on purpose: the reader
+// returns an error the moment it opens one, so a regression to a full scan
+// shows up as a missing result (the error path yields no events).
+func TestLastMaintenanceNewestArchiveDoesNotOpenOlderOnes(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	hit := now.Add(-26 * time.Hour)
+
+	// Active log: seq 100001.., no maintenance events.
+	var active bytes.Buffer
+	for s := uint64(100001); s <= 100010; s++ {
+		active.WriteString(archiveLine(t, s, "session.woke", now))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), active.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Newest archive (seq 80001-100000) holds the maintenance event.
+	var newest bytes.Buffer
+	newest.WriteString(archiveLine(t, 80001, "session.woke", hit))
+	newest.WriteString(archiveLine(t, 95000, events.StoreMaintenanceDone, hit))
+	newest.WriteString(archiveLine(t, 100000, "session.woke", hit))
+	stamp := func(d time.Duration) string { return now.Add(d).Format("20060102T150405Z") }
+	writeGzArchive(t, dir, fmt.Sprintf("events.jsonl.archive-%s-seq-80001-100000.gz", stamp(-25*time.Hour)), newest.String())
+
+	// Older archives: not valid gzip. Opening one fails the read.
+	for _, a := range []struct {
+		first, last uint64
+		age         time.Duration
+	}{{1, 30000, -20 * 24 * time.Hour}, {30001, 60000, -15 * 24 * time.Hour}, {60001, 80000, -10 * 24 * time.Hour}} {
+		name := fmt.Sprintf("events.jsonl.archive-%s-seq-%d-%d.gz", stamp(a.age), a.first, a.last)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("not gzip"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ts, status := lastMaintenance(openFileProvider(t, dir), now)
+	if !ts.Equal(hit) || status != "success" {
+		t.Fatalf("lastMaintenance = (%v,%q), want (%v,success): older archives were opened or the newest was missed", ts, status, hit)
+	}
+}
+
+// No event inside the lookback window: report none, and do not gunzip an
+// archive rotated before the window (it is corrupt here, so opening it fails).
+func TestLastMaintenanceNoneInWindowSkipsArchivesOlderThanLookback(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-40 * 24 * time.Hour)
+
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte(archiveLine(t, 5001, "session.woke", now)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Rotated 40 d ago, holds a maintenance event: outside the 30 d window.
+	name := fmt.Sprintf("events.jsonl.archive-%s-seq-1-5000.gz", old.Format("20060102T150405Z"))
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("not gzip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts, status := lastMaintenance(openFileProvider(t, dir), now)
+	if !ts.IsZero() || status != "" {
+		t.Fatalf("lastMaintenance = (%v,%q), want none: an archive older than the lookback was read", ts, status)
+	}
+}
+
+// An event older than the lookback is not reported, even from a provider that
+// holds it (in-memory fake: no archives to skip).
+func TestLastMaintenanceIgnoresEventsOlderThanLookback(t *testing.T) {
+	ep := events.NewFake()
+	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
+	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: time.Now().UTC().Add(-45 * 24 * time.Hour), Payload: payload})
+	if ts, status := LastMaintenance(ep); !ts.IsZero() || status != "" {
+		t.Fatalf("LastMaintenance = (%v,%q), want none (event is 45 d old)", ts, status)
+	}
+}
+
+// The newest hit wins even when an older window also holds one.
+func TestLastMaintenanceNewestWindowWinsOverOlder(t *testing.T) {
+	ep := events.NewFake()
+	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
+	old := time.Now().UTC().Add(-10 * 24 * time.Hour).Truncate(time.Second)
+	recent := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: old, Payload: payload})
+	for i := 0; i < 25000; i++ { // push the old event out of the first seq window
+		ep.Record(events.Event{Type: "session.woke", Ts: recent})
+	}
+	ep.Record(events.Event{Type: events.StoreMaintenanceFailed, Ts: recent, Payload: payload})
+	ts, status := LastMaintenance(ep)
+	if !ts.Equal(recent) || status != "failed" {
+		t.Fatalf("LastMaintenance = (%v,%q), want (%v,failed)", ts, status, recent)
+	}
+}
+
+// An event only in an older seq window is still found (windows widen).
+func TestLastMaintenanceWidensToOlderWindow(t *testing.T) {
+	ep := events.NewFake()
+	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
+	when := time.Now().UTC().Add(-10 * 24 * time.Hour).Truncate(time.Second)
+	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: when, Payload: payload})
+	for i := 0; i < 30000; i++ { // beyond the 20k first window
+		ep.Record(events.Event{Type: "session.woke", Ts: time.Now().UTC()})
+	}
+	ts, status := LastMaintenance(ep)
+	if !ts.Equal(when) || status != "success" {
+		t.Fatalf("LastMaintenance = (%v,%q), want (%v,success)", ts, status, when)
 	}
 }

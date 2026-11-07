@@ -348,7 +348,7 @@ func TestComputeStoreHealthServerIntegration(t *testing.T) {
 		}
 	}
 	ep := events.NewFake()
-	ts := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
+	ts := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second) // inside storehealth.MaintenanceLookback
 	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: ts, Payload: payload})
 
@@ -371,8 +371,8 @@ func TestComputeStoreHealthServerIntegration(t *testing.T) {
 	if got.ThresholdMB != 1.0 {
 		t.Errorf("ThresholdMB = %v, want 1.0", got.ThresholdMB)
 	}
-	if got.LastGCAt != "2026-04-08T00:00:00Z" {
-		t.Errorf("LastGCAt = %q, want 2026-04-08T00:00:00Z", got.LastGCAt)
+	if want := ts.Format(time.RFC3339); got.LastGCAt != want {
+		t.Errorf("LastGCAt = %q, want %s", got.LastGCAt, want)
 	}
 }
 

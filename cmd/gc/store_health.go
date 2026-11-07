@@ -136,6 +136,10 @@ func renderStoreHealthBlock(w io.Writer, h *StoreHealth) {
 	}
 	if h.LastGCAt != "" {
 		fmt.Fprintf(w, "  Last GC:     %s (%s)\n", h.LastGCAt, h.LastGCStatus) //nolint:errcheck // best-effort stdout
+	} else {
+		// The search is bounded (storehealth.MaintenanceLookback), so say what was
+		// searched rather than implying maintenance has never run.
+		fmt.Fprintf(w, "  Last GC:     none found in last %d d\n", int(storehealth.MaintenanceLookback/(24*time.Hour))) //nolint:errcheck // best-effort stdout
 	}
 }
 

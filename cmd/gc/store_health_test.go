@@ -103,8 +103,11 @@ func TestRenderStoreHealthBlockNoWarning(t *testing.T) {
 	if strings.Contains(out, "maintenance overdue") {
 		t.Errorf("output contains overdue text when Warning=false:\n%s", out)
 	}
-	if strings.Contains(out, "Last GC:") {
-		t.Errorf("output contains Last GC when not set:\n%s", out)
+	if !strings.Contains(out, "Last GC:     none found in last 30 d") {
+		t.Errorf("output does not say the bounded search found nothing:\n%s", out)
+	}
+	if strings.Contains(strings.ToLower(out), "never") {
+		t.Errorf("output claims maintenance never ran, but the search is bounded:\n%s", out)
 	}
 }
 
@@ -197,7 +200,7 @@ func TestCollectStoreHealthReadsEvents(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	ep := events.NewFake()
-	ts := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	ts := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second) // inside storehealth.MaintenanceLookback
 	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 5})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: ts, Payload: payload})
 
@@ -208,8 +211,8 @@ func TestCollectStoreHealthReadsEvents(t *testing.T) {
 	if h.LiveRows != 1 {
 		t.Errorf("LiveRows = %d, want 1", h.LiveRows)
 	}
-	if h.LastGCAt != "2026-04-08T12:00:00Z" {
-		t.Errorf("LastGCAt = %q, want 2026-04-08T12:00:00Z", h.LastGCAt)
+	if want := ts.Format(time.RFC3339); h.LastGCAt != want {
+		t.Errorf("LastGCAt = %q, want %s", h.LastGCAt, want)
 	}
 	if h.LastGCStatus != "success" {
 		t.Errorf("LastGCStatus = %q, want success", h.LastGCStatus)

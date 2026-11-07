@@ -115,17 +115,68 @@ func WalkSize(path string) int64 {
 	return total
 }
 
+// MaintenanceLookback bounds how far back LastMaintenance searches. A city
+// with no maintenance event inside this window reports none, and the search
+// never gunzips an archive rotated before it.
+const MaintenanceLookback = 30 * 24 * time.Hour
+
+// maintenanceSeqWindows are the widths (in event sequence numbers) of the
+// newest-first search windows. The first window normally covers only the live
+// log, so a recent event is found without opening any archive; each later
+// window widens the search into older archives only when the earlier ones held
+// no maintenance event.
+var maintenanceSeqWindows = []uint64{20_000, 80_000, 320_000, 1_280_000}
+
 // LastMaintenance returns the timestamp and status ("success" or
-// "failed") of the most-recent store-maintenance event in provider.
-// Zero time and empty status when no events, provider is nil, or the
-// provider returns an error.
+// "failed") of the most-recent store-maintenance event in provider within
+// MaintenanceLookback. Zero time and empty status when there is no such
+// event, provider is nil, or the provider returns an error.
+//
+// The event log can hold gigabytes of gzip archives, and a Type-only filter
+// makes the reader gunzip and decode every one of them (gcf-thn63: that made
+// `gc status` take 90-110 s). So the search runs newest-first over sequence
+// windows and stops at the first window with a hit: nothing in an older window
+// can be newer than a hit in a newer one. The AfterSeq/BeforeSeq bounds let
+// the reader skip whole archives by filename, without opening them.
 func LastMaintenance(ep events.Provider) (time.Time, string) {
+	return lastMaintenance(ep, time.Now())
+}
+
+func lastMaintenance(ep events.Provider, now time.Time) (time.Time, string) {
 	if ep == nil {
 		return time.Time{}, ""
 	}
+	since := now.Add(-MaintenanceLookback)
+	latest, err := ep.LatestSeq()
+	if err != nil {
+		latest = 0
+	}
+	// hi is the exclusive upper seq bound of the window being searched
+	// (0 = unbounded, for the first window and the unknown-latest case).
+	var hi uint64
+	for _, width := range maintenanceSeqWindows {
+		if latest <= width {
+			break // window would reach seq 0: the unbounded pass below covers it
+		}
+		lo := latest - width
+		if ts, status, ok := maintenanceInWindow(ep, lo, hi, since); ok {
+			return ts, status
+		}
+		hi = lo + 1
+	}
+	if ts, status, ok := maintenanceInWindow(ep, 0, hi, since); ok {
+		return ts, status
+	}
+	return time.Time{}, ""
+}
+
+// maintenanceInWindow returns the newest maintenance event with
+// lo < Seq < hi (hi == 0: no upper bound) and Ts >= since.
+func maintenanceInWindow(ep events.Provider, lo, hi uint64, since time.Time) (time.Time, string, bool) {
 	var (
 		latestTs     time.Time
 		latestStatus string
+		found        bool
 	)
 	for _, spec := range []struct {
 		typ    string
@@ -134,18 +185,19 @@ func LastMaintenance(ep events.Provider) (time.Time, string) {
 		{events.StoreMaintenanceDone, "success"},
 		{events.StoreMaintenanceFailed, "failed"},
 	} {
-		evts, err := ep.List(events.Filter{Type: spec.typ})
+		evts, err := ep.List(events.Filter{Type: spec.typ, AfterSeq: lo, BeforeSeq: hi, Since: since})
 		if err != nil {
 			continue
 		}
 		for _, e := range evts {
-			if e.Ts.After(latestTs) {
+			if !found || e.Ts.After(latestTs) {
 				latestTs = e.Ts
 				latestStatus = spec.status
+				found = true
 			}
 		}
 	}
-	return latestTs, latestStatus
+	return latestTs, latestStatus, found
 }
 
 const bytesPerMB = 1_000_000
