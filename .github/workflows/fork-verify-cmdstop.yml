@@ -1,0 +1,40 @@
+name: fork-verify-cmdstop
+
+# Fork-only: proves the cmdStop wall-clock timeout tests are not load-sensitive
+# (gcf-vwxgd). Runs the TestCmdStop family 20x while every core is saturated by
+# busy-loop processes, mirroring a loaded CI runner.
+
+on:
+  push:
+    branches: ["fix/gcf-vwxgd-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cmdstop-loaded:
+    if: ${{ github.repository != 'gastownhall/gascity' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      DOLT_VERSION: "2.1.7"
+      BD_VERSION: "v1.3.0"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: ./.github/actions/setup-gascity-ubuntu
+        with:
+          dolt-version: ${{ env.DOLT_VERSION }}
+          bd-version: ${{ env.BD_VERSION }}
+          install-claude-cli: "false"
+      - name: TestCmdStop x20 under CPU load
+        run: |
+          go test -c -o "$RUNNER_TEMP/cmdgc.test" ./cmd/gc/
+          for i in $(seq "$(nproc)"); do
+            timeout 1500 sh -c 'while :; do :; done' &
+          done
+          cd cmd/gc
+          "$RUNNER_TEMP/cmdgc.test" -test.run 'TestCmdStop' -test.count=20 -test.v 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          status=${PIPESTATUS[0]}
+          kill $(jobs -p) 2>/dev/null || true
+          exit "$status"
