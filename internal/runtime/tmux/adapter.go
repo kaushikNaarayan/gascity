@@ -30,6 +30,17 @@ type Provider struct {
 	cache    *StateCache
 	mu       sync.Mutex
 	workDirs map[string]string // session name → workDir (for CopyTo)
+
+	// processNames memoizes each session's GT_PROCESS_NAMES (see
+	// sessionProcessNames). Guarded by mu.
+	processNames map[string]cachedProcessNames
+}
+
+// cachedProcessNames is a session's process names as read when its first pane
+// had panePID. A different pane PID means the session was restarted.
+type cachedProcessNames struct {
+	panePID string
+	names   []string
 }
 
 var instanceTokenReader = rand.Reader
@@ -421,12 +432,37 @@ func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.L
 	}
 }
 
+// sessionProcessNames returns the process names recorded in the session's
+// GT_PROCESS_NAMES environment. The variable is set once at session creation,
+// so the answer is memoized per session and keyed by the first pane's PID from
+// the state-cache snapshot: a restarted session has a new pane PID and is
+// re-read. Without a known pane PID, or after a failed lookup, nothing is
+// cached. This keeps the liveness path from spawning one `tmux
+// show-environment` per session per observation.
 func (p *Provider) sessionProcessNames(name string) []string {
+	panePID := p.cache.firstPanePID(name)
+	if panePID != "" {
+		p.mu.Lock()
+		entry, ok := p.processNames[name]
+		p.mu.Unlock()
+		if ok && entry.panePID == panePID {
+			return append([]string(nil), entry.names...)
+		}
+	}
 	namesRaw, err := p.tm.GetEnvironment(name, gtProcessNamesEnvKey)
 	if err != nil {
 		return nil
 	}
-	return nonEmptyProcessNames(strings.Split(namesRaw, ","))
+	names := nonEmptyProcessNames(strings.Split(namesRaw, ","))
+	if panePID != "" {
+		p.mu.Lock()
+		if p.processNames == nil {
+			p.processNames = make(map[string]cachedProcessNames)
+		}
+		p.processNames[name] = cachedProcessNames{panePID: panePID, names: append([]string(nil), names...)}
+		p.mu.Unlock()
+	}
+	return names
 }
 
 func nonEmptyProcessNames(processNames []string) []string {

@@ -117,6 +117,16 @@ func (c *StateCache) ProcessAlive(name string, processNames []string) bool {
 	return c.currentState().processAlive(name, processNames)
 }
 
+// firstPanePID returns the PID of the named session's first pane in the cached
+// snapshot, or "" when the session or its panes are unknown.
+func (c *StateCache) firstPanePID(name string) string {
+	session, ok := c.currentState().Sessions[name]
+	if !ok || len(session.Panes) == 0 {
+		return ""
+	}
+	return session.Panes[0].PID
+}
+
 func (c *StateCache) currentState() runtimeStateSnapshot {
 	c.mu.RLock()
 	state := c.state
