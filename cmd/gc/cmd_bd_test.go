@@ -2852,3 +2852,37 @@ func writeGcBdProbeScript(t *testing.T, path, identity string) {
 		t.Fatal(err)
 	}
 }
+
+func TestBdAdhocActorOverride(t *testing.T) {
+	bead := func(assignee string) map[string]beads.Bead {
+		return map[string]beads.Bead{"gy-1": {ID: "gy-1", Assignee: assignee}}
+	}
+	const adhoc = "r/x.web_dev-adhoc-53fb200cfd"
+	cases := []struct {
+		name     string
+		actor    string
+		args     []string
+		known    map[string]beads.Bead
+		wantRole string
+		wantOK   bool
+	}{
+		{"close role bead", adhoc, []string{"close", "gy-1"}, bead("r/x.web_dev"), "r/x.web_dev", true},
+		{"claim role bead", adhoc, []string{"update", "gy-1", "--claim"}, bead("r/x.web_dev"), "r/x.web_dev", true},
+		{"other role stays refused", "r/x.web_dev2-adhoc-53fb200cfd", []string{"close", "gy-1"}, bead("r/x.web_dev"), "", false},
+		{"adhoc on web_dev2 bead stays refused", adhoc, []string{"close", "gy-1"}, bead("r/x.web_dev2"), "", false},
+		{"pool worker holding by adhoc id unchanged", adhoc, []string{"close", "gy-1"}, bead(adhoc), "", false},
+		{"unknown bead unchanged", adhoc, []string{"close", "gy-1"}, map[string]beads.Bead{}, "", false},
+		{"plain actor unchanged", "r/x.web_dev", []string{"close", "gy-1"}, bead("r/x.web_dev"), "", false},
+		{"update without claim unchanged", adhoc, []string{"update", "gy-1", "--status", "open"}, bead("r/x.web_dev"), "", false},
+		{"show unchanged", adhoc, []string{"show", "gy-1"}, bead("r/x.web_dev"), "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_ACTOR", tc.actor)
+			role, ok := bdAdhocActorOverride(tc.args, tc.known)
+			if ok != tc.wantOK || role != tc.wantRole {
+				t.Fatalf("got (%q,%v), want (%q,%v)", role, ok, tc.wantRole, tc.wantOK)
+			}
+		})
+	}
+}

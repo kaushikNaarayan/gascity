@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -417,6 +418,9 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if role, ok := bdAdhocActorOverride(bdArgs, guardBeads); ok {
+		env = mergeRuntimeEnv(env, map[string]string{"BEADS_ACTOR": role})
+	}
 	cmd.Env = workQueryEnvForDir(env, cmd.Dir)
 
 	traceStart := time.Now()
@@ -465,6 +469,59 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return 0
+}
+
+// bdAdhocActorSuffix matches the "-adhoc-<token>" tail GenerateAdhocIdentity /
+// GenerateAdhocExplicitName append to a session's base identity.
+var bdAdhocActorSuffix = regexp.MustCompile(`-adhoc-[0-9A-Za-z]+$`)
+
+// bdAdhocActorOverride lets a role seat whose live session runs under an
+// "<role>-adhoc-<token>" actor close or claim a bead that is assigned to plain
+// "<role>" (gcf-uvf07). bd compares BEADS_ACTOR with the assignee exactly and
+// refuses, so the seat and its pm both needed a reassign round trip.
+//
+// It returns the role to present as BEADS_ACTOR only when the command is a
+// close or an update --claim, BEADS_ACTOR is an adhoc actor, and EVERY target
+// bead is known and assigned to exactly that actor with the suffix removed.
+// Anything else (different role, a bead held by the adhoc id itself such as a
+// pool worker's, an unreadable or unassigned bead) keeps the actor unchanged,
+// so the guard stays strict.
+func bdAdhocActorOverride(bdArgs []string, known map[string]beads.Bead) (string, bool) {
+	actor := bdByIDClaimActor()
+	loc := bdAdhocActorSuffix.FindStringIndex(actor)
+	if loc == nil || loc[0] == 0 {
+		return "", false
+	}
+	role := actor[:loc[0]]
+	ids, ok, ambiguous := bdMutationWriteIDs(bdArgs)
+	if !ok || ambiguous || len(ids) == 0 {
+		return "", false
+	}
+	switch bdArgs[0] {
+	case "close":
+	case "update":
+		claim := false
+		for _, a := range bdArgs[1:] {
+			if a == "--" {
+				break
+			}
+			if a == "--claim" {
+				claim = true
+			}
+		}
+		if !claim {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	for _, id := range ids {
+		b, found := known[id]
+		if !found || strings.TrimSpace(b.Assignee) != role {
+			return "", false
+		}
+	}
+	return role, true
 }
 
 // bdLedgerUnreadableExitCode is the exit code for a frontier read that came
