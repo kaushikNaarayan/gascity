@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.19] - 2026-11-07
+
 ### Known issues
 
 - **v1.3.12 is not a rollback target for v1.3.13.** It lacks the
