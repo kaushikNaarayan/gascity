@@ -32,36 +32,9 @@ type approvedHostedException struct {
 	reason string
 }
 
-var approvedHostedExceptions = []approvedHostedException{
-	{"ci.yml", "credential-provider-windows", "no self-hosted Windows runner; gated on internal/credentialprovider/** changes; Job Object assertions have no Linux/macOS equivalent"},
-	{"gc-edge-publish.yml", "publish-gc-edge", "gated `if: github.repository == 'gastownhall/gascity'`; never runs for our fork"},
-
-	// Everything below is disabled_manually as of the gcf-ye0 audit
-	// (2026-08-22) and out of scope for gcf-5y0's re-enable waves. Named
-	// explicitly rather than silently ignored (gcf-5y0 AC6): each is a
-	// real, if currently dormant, hosted-runner exposure and deserves its
-	// own re-enable decision, not a blanket pass.
-	{"rc-gate.yml", "ubuntu_fast_tests", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_make_check_docs", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_acceptance_a", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_acceptance_b", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_acceptance_c", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_integration_shards", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_tutorial", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "ubuntu_goreleaser_snapshot", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"rc-gate.yml", "rc_summary", "RC gate (Blacksmith), disabled; separate governance decision, not gcf-5y0 scope"},
-	{"homebrew-tap-smoke.yml", "tap-smoke", "Blacksmith macOS smoke test, disabled; not gcf-5y0 scope"},
-	{"ollama-acceptance-c.yml", "acceptance-c", "Blacksmith, disabled; not gcf-5y0 scope"},
-	{"close-stale-needs.yml", "close-needs-info", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"dispatch-labeled-pr-suite.yml", "dispatch-suite", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"docs-autofix.yml", "autofix", "cheap docs-check bot, disabled; not gcf-5y0 scope"},
-	{"docs-render.yml", "broken-links", "cheap docs-check bot, disabled; not gcf-5y0 scope"},
-	{"docs-title-review.yml", "request-docs-review", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"remove-needs-info.yml", "remove-label", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"remove-needs-triage.yml", "remove-triage-label", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"request-needs-info.yml", "post-request", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-	{"triage-label.yml", "add-triage-label", "cheap GH label-metadata bot, disabled; not gcf-5y0 scope"},
-}
+// Empty since gcf-kjrft: the inactive upstream workflows that carried hosted-runner
+// exceptions were deleted; only release/rc-release/fork-verify remain, all self-hosted.
+var approvedHostedExceptions = []approvedHostedException{}
 
 func isApprovedHostedException(file, job string) bool {
 	for _, exception := range approvedHostedExceptions {

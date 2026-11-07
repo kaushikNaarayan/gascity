@@ -121,11 +121,6 @@ func TestAgentImageRebuildsBDAndGCWithPatchedGRPC(t *testing.T) {
 	if got := strings.Count(goMod, wantGRPCModule); got != 1 {
 		t.Errorf("go.mod contains %q %d times, want exactly 1 so the gc binary embeds the patched grpc", wantGRPCModule, got)
 	}
-
-	workflow := readFile(t, root, ".github/workflows/container-scan.yml")
-	if !strings.Contains(workflow, "CGO_ENABLED=0 go build -o gc ./cmd/gc") {
-		t.Error("container scan must build gc with the release's portable CGO_ENABLED=0 configuration")
-	}
 }
 
 func TestMCPMailImagePinsPatchedPythonDependencies(t *testing.T) {

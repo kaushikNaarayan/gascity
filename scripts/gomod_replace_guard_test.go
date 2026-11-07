@@ -266,17 +266,3 @@ func TestCheckGomodReplaceGuardWiredIntoMakefile(t *testing.T) {
 		}
 	}
 }
-
-// TestCheckGomodReplaceGuardWiredIntoCI verifies that the guard is wired
-// into the preflight-static CI job so every PR is checked.
-func TestCheckGomodReplaceGuardWiredIntoCI(t *testing.T) {
-	repoRoot := repoRoot(t)
-
-	workflow, err := os.ReadFile(filepath.Join(repoRoot, ".github", "workflows", "ci.yml"))
-	if err != nil {
-		t.Fatalf("read ci.yml: %v", err)
-	}
-	if !strings.Contains(string(workflow), "check-gomod-replace") {
-		t.Error("ci.yml preflight-static job is missing the check-gomod-replace step")
-	}
-}

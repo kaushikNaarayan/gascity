@@ -90,6 +90,13 @@ jobs:
 }
 
 func TestCheckRunnerLabelsHonorsApprovedExceptionsOnlyByExactJobName(t *testing.T) {
+	// The shipped table is empty (gcf-kjrft); register one exception for the
+	// duration of this test to prove the exact (file, job) matching still works.
+	saved := approvedHostedExceptions
+	approvedHostedExceptions = append(append([]approvedHostedException{}, saved...),
+		approvedHostedException{"ci.yml", "credential-provider-windows", "test-only exception"})
+	t.Cleanup(func() { approvedHostedExceptions = saved })
+
 	dir := t.TempDir()
 	writeWorkflow(t, dir, "ci.yml", `
 jobs:
