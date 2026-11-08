@@ -363,7 +363,7 @@ jobs:
       - name: cmd/gc fast suite (repo's 6 shards in parallel on the one test binary) + test-policy packages
         env:
           # How many of the 6 shards run at once. 6 = all; lower it if the memory line below ever nears the VM's RAM.
-          UNIT_SHARD_PARALLEL: "6"
+          UNIT_SHARD_PARALLEL: "3"  # 8 Nov pm: 6 at once on a 4 vCPU VM gave 2 wall-clock flakes in ~1 h (TestDispatchAllQueuedNudgesBoundsWedgedTarget, TestCmdStopMarginExhaustion); capped path tested in #192
         run: |
           # One `-run` regex per shard: the whole package as ONE regex is 452,085 bytes, over Linux's 131,072-byte
           # MAX_ARG_STRLEN (exec fails with 126), hence the repo's own 6 shards, ~75 KB each.
