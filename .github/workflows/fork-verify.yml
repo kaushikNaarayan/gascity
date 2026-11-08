@@ -310,12 +310,24 @@ jobs:
     # test env (scripts/test-go-test-shard). It is a NEW job; `verify` is unchanged. It is NOT
     # required yet: pm's bar is 5 consecutive green runs on unchanged main, zero retries.
     # Deliberately excludes unit-core (internal/productmetrics timing tests flake under load: gcf-30gb).
+    #
+    # gcf-a28gx: this job used to be 14-21 min wall: install dolt+bd, then 6 shards back to back, each run through
+    # `go test` (list + compile + link), then the policy packages. Measured on Anton, the shards spend most of their
+    # time waiting, not computing (a shard: ~30 s user, ~20 s sys over ~90 s wall), and the fast suite uses neither
+    # dolt nor bd. So, still ONE job (sharding it into 3 legs cost +86% runner-min and was slower on a saturated pool):
+    #   * no dolt/bd install (15-280 s). Evidence: with the prebuilt test binary and dolt/bd off PATH all 6 shards pass,
+    #     and shard 6 is identical with and without them (5911 pass, the same 18 skips, 0 fail). A test added to the
+    #     fast suite that needs dolt/bd must be tagged out of it, or the installs come back.
+    #   * compile the cmd/gc test binary ONCE (`go test -c`), then run the repo's 6 shards (same round-robin partition,
+    #     same -run regexes, same hermetic env) as 6 parallel processes of that binary, with the policy packages
+    #     alongside. setup-go keeps its module+build cache restore: with it the compile is ~60 s, without it ~270 s
+    #     cold on 4 cores (measured), so skipping the restore would cost more than it saves in a job that compiles.
+    #   * the shard-union guard proves the six shards still ran exactly the full `go test -list` (test count
+    #     unchanged), and goes red on a dropped/duplicated/missing shard (negative control runs every time).
     if: ${{ github.repository != 'gastownhall/gascity' }}
     runs-on: [self-hosted, pool]
-    timeout-minutes: 40
+    timeout-minutes: 30
     env:
-      DOLT_VERSION: "2.1.10"
-      BD_VERSION: "v1.1.0"
       GO_VERSION: "1.26.5"
       UNIT_MIN_FREE_GB: "5"
       # CI runners' user systemd cannot reliably create the transient scope the slice helper
@@ -339,36 +351,88 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: Verify jq is present (no sudo install on self-hosted)
         run: command -v jq || { echo "jq missing on this runner — sudo apt-get is not available on gt2, install it out-of-band"; exit 1; }
-      - name: Install dolt v${{ env.DOLT_VERSION }} (cached, no sudo)
-        run: .github/scripts/install-dolt-archive.sh "${{ env.DOLT_VERSION }}" --cache
-      - name: Install bd ${{ env.BD_VERSION }} (cached, no sudo)
-        run: .github/scripts/install-bd-archive.sh "${{ env.BD_VERSION }}" --cache
-      - name: cmd/gc fast suite (repo's 6 shards, run sequentially, repo hermetic test env)
-        run: |
-          # One `-run` regex per shard: the whole package as ONE shard is 452,085 bytes, over Linux's
-          # 131,072-byte MAX_ARG_STRLEN (exec fails with 126). 6 shards is ~75 KB each, the repo's own split.
-          # Keep going after a failed shard so one run reports every failing test; fail at the end.
-          # GitHub runs `bash -e {0}`, and `set -uo pipefail` does not clear -e: without `set +e` the first
-          # failing shard aborts the step and shards after it never run (seen on probe run 35431173501).
-          set +e
-          set -uo pipefail
-          total_start=$SECONDS
-          failed=0
-          for i in 1 2 3 4 5 6; do
-            start=$SECONDS
-            GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=30m ./scripts/test-go-test-shard ./cmd/gc "$i" 6
-            rc=$?
-            echo "cmd/gc shard $i/6: exit=$rc wall=$(( SECONDS - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
-            if [ "$rc" -ne 0 ]; then failed=$(( failed + 1 )); fi
-          done
-          echo "cmd/gc fast suite total wall time: $(( SECONDS - total_start ))s, failed shards: $failed" | tee -a "$GITHUB_STEP_SUMMARY"
-          [ "$failed" -eq 0 ]
-      - name: Test-policy packages (resourcecensus ledger, docsync, scripts manifests)
+      - name: Compile the cmd/gc test binary once
         run: |
           set -euo pipefail
+          out="$RUNNER_TEMP/gc-test"
+          mkdir -p "$out"
           start=$SECONDS
-          go test ./internal/testpolicy/... ./test/docsync/... ./scripts/... -count=1
-          echo "policy packages wall time: $(( SECONDS - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -c -o "$out/cmd-gc.test" ./cmd/gc
+          ls -l "$out/cmd-gc.test" | awk '{printf "test binary: %.0f MB\n", $5/1e6}' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "compile wall time: $(( SECONDS - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: cmd/gc fast suite (repo's 6 shards in parallel on the one test binary) + test-policy packages
+        env:
+          # How many of the 6 shards run at once. 6 = all; lower it if the memory line below ever nears the VM's RAM.
+          UNIT_SHARD_PARALLEL: "6"
+        run: |
+          # One `-run` regex per shard: the whole package as ONE regex is 452,085 bytes, over Linux's 131,072-byte
+          # MAX_ARG_STRLEN (exec fails with 126), hence the repo's own 6 shards, ~75 KB each.
+          # Every shard and the policy run are background processes; none aborts the others, so one run reports every
+          # failing test. GitHub runs `bash -e {0}`: `set +e` first.
+          # FAIL CLOSED: a shard writes shard-N.rc only after it finished. A killed shard (OOM, cancel, SIGKILL) leaves
+          # no .rc, and scripts/ci-collect-shard-results turns a missing .rc, or fewer than 6 of them, into red.
+          set +e
+          set -uo pipefail
+          logs="$RUNNER_TEMP/gc-test/logs"
+          lists="$RUNNER_TEMP/gc-test/lists"
+          mkdir -p "$logs" "$lists"
+          total_start=$SECONDS
+          # Peak memory of the VM while the suite runs (the VM is dedicated to this job): MemTotal - MemAvailable, 1 Hz.
+          mem_base_mb=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print int((t-a)/1024)}' /proc/meminfo)
+          mem_total_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+          echo "$mem_base_mb" > "$logs/mem-peak-mb"
+          (
+            peak="$mem_base_mb"
+            while :; do
+              used=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print int((t-a)/1024)}' /proc/meminfo)
+              if [ "$used" -gt "$peak" ]; then peak="$used"; echo "$peak" > "$logs/mem-peak-mb"; fi
+              sleep 1
+            done
+          ) &
+          sampler=$!
+          run_shard() {
+            local i="$1" start=$SECONDS
+            GC_TEST_BINARY="$RUNNER_TEMP/gc-test/cmd-gc.test" \
+            GC_TEST_SHARD_FULL_LIST_OUT="$lists/full-$i.txt" GC_TEST_SHARD_SELECTED_OUT="$lists/selected-$i.txt" \
+            GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=30m \
+              ./scripts/test-go-test-shard ./cmd/gc "$i" 6 > "$logs/shard-$i.log" 2>&1
+            echo $? > "$logs/shard-$i.rc"
+            echo "cmd/gc shard $i/6: exit=$(cat "$logs/shard-$i.rc") wall=$(( SECONDS - start ))s" > "$logs/shard-$i.sum"
+          }
+          pids=()
+          (
+            start=$SECONDS
+            go test ./internal/testpolicy/... ./test/docsync/... ./scripts/... -count=1 > "$logs/policy.log" 2>&1
+            echo $? > "$logs/policy.rc"
+            echo "policy packages: exit=$(cat "$logs/policy.rc") wall=$(( SECONDS - start ))s" > "$logs/policy.sum"
+          ) &
+          pids+=($!)
+          running=0
+          for i in 1 2 3 4 5 6; do
+            if [ "$running" -ge "$UNIT_SHARD_PARALLEL" ]; then wait -n; running=$(( running - 1 )); fi
+            run_shard "$i" &
+            pids+=($!)
+            running=$(( running + 1 ))
+          done
+          # explicit pids: a bare `wait` would also wait for the memory sampler forever
+          wait "${pids[@]}" 2>/dev/null
+          kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
+          peak_mb=$(cat "$logs/mem-peak-mb")
+          echo "peak memory used on the VM during the suite: ${peak_mb} MiB of ${mem_total_mb} MiB (baseline before ${mem_base_mb} MiB), $UNIT_SHARD_PARALLEL shards at once" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "cmd/gc fast suite + policy total wall time: $(( SECONDS - total_start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+          ./scripts/ci-collect-shard-results "$logs" 6 | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${PIPESTATUS[0]}" -eq 0 ]
+      - name: Prove the result collector fails closed (killed shard, missing rc) and the union guard goes red
+        run: |
+          bash scripts/test-ci-collect-shard-results.sh
+          bash scripts/test-check-shard-union.sh
+      - name: Shard-union check — the 6 shards still ran exactly the full cmd/gc test list (count unchanged)
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/gc-test/lists"
+          for f in "$d"/full-*.txt; do cmp -s "$f" "$d/full-1.txt" || { echo "::error::$f differs from full-1.txt: the shards did not see the same test list"; exit 1; }; done
+          cp "$d/full-1.txt" "$d/full.txt"
+          scripts/check-shard-union "$d" 6 | tee -a "$GITHUB_STEP_SUMMARY"
 
   examples:
     name: examples

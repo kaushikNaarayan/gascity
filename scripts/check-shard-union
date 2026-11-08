@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# check-shard-union <dir> <shard-total>
+#
+# CI guard for a sharded test package (gcf-a28gx): <dir> holds `full.txt` (every test the package lists) and
+# `selected-<i>.txt` for i = 1..<shard-total> (what shard i ran), one test name per line. Fails unless
+#   * every shard 1..total is present (a leg that never ran = tests silently dropped),
+#   * no test was selected by two shards (a duplicate wastes time and double-counts), and
+#   * the union of the selections is exactly the full list (nothing dropped, nothing invented).
+# Prints the offending names. Exit 0 = the shards partition the package.
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 <dir> <shard-total>" >&2
+  exit 2
+fi
+dir="$1"
+total="$2"
+if ! [[ "$total" =~ ^[0-9]+$ ]] || (( total < 1 )); then
+  echo "shard total must be a positive integer" >&2
+  exit 2
+fi
+[[ -s "$dir/full.txt" ]] || { echo "check-shard-union: $dir/full.txt is missing or empty" >&2; exit 1; }
+
+fail=0
+sel=()
+for ((i = 1; i <= total; i++)); do
+  f="$dir/selected-$i.txt"
+  if [[ ! -s "$f" ]]; then
+    echo "check-shard-union: shard $i of $total has no selection file ($f): its tests did not run" >&2
+    fail=1
+  else
+    sel+=("$f")
+  fi
+done
+
+full_sorted="$(LC_ALL=C sort "$dir/full.txt")"
+if (( ${#sel[@]} > 0 )); then
+  all_sel="$(cat "${sel[@]}" | LC_ALL=C sort)"
+  dups="$(printf '%s\n' "$all_sel" | LC_ALL=C uniq -d)"
+  if [[ -n "$dups" ]]; then
+    echo "check-shard-union: tests selected by more than one shard:" >&2
+    printf '%s\n' "$dups" | sed 's/^/  /' >&2
+    fail=1
+  fi
+  uniq_sel="$(printf '%s\n' "$all_sel" | LC_ALL=C uniq)"
+  dropped="$(LC_ALL=C comm -23 <(printf '%s\n' "$full_sorted") <(printf '%s\n' "$uniq_sel"))"
+  invented="$(LC_ALL=C comm -13 <(printf '%s\n' "$full_sorted") <(printf '%s\n' "$uniq_sel"))"
+  if [[ -n "$dropped" ]]; then
+    echo "check-shard-union: tests in the package list that NO shard ran ($(printf '%s\n' "$dropped" | wc -l)):" >&2
+    printf '%s\n' "$dropped" | head -20 | sed 's/^/  /' >&2
+    fail=1
+  fi
+  if [[ -n "$invented" ]]; then
+    echo "check-shard-union: tests a shard ran that are not in the package list:" >&2
+    printf '%s\n' "$invented" | head -20 | sed 's/^/  /' >&2
+    fail=1
+  fi
+fi
+
+if (( fail )); then
+  exit 1
+fi
+echo "check-shard-union: OK, $total shards partition $(wc -l < "$dir/full.txt") tests (no drops, no duplicates)"

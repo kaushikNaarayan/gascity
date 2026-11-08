@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# ci-collect-shard-results <logs-dir> <shard-total>
+#
+# Fail-closed collector for the parallel cmd/gc shards in fork-verify's unit-cmd-gc (gcf-a28gx, qa NEEDS-FIX on #191).
+# Each shard N writes <logs-dir>/shard-N.rc (its exit code) only AFTER it finished; policy.rc likewise. A shard that
+# was killed (OOM killer, runner cancel, SIGKILL of its subshell) leaves NO .rc file, and "no rc" must be red, never
+# green. So this fails unless
+#   * every shard 1..total has a non-empty numeric .rc equal to 0, and policy.rc exists and is 0, and
+#   * exactly total shard .rc files exist (fewer = something never reported; more = a stale or foreign file).
+# Prints one line per job (the .sum line when present) and the verdict; the failed jobs' logs are dumped in groups.
+set -uo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 <logs-dir> <shard-total>" >&2
+  exit 2
+fi
+logs="$1"
+total="$2"
+if ! [[ "$total" =~ ^[0-9]+$ ]] || (( total < 1 )); then
+  echo "shard total must be a positive integer" >&2
+  exit 2
+fi
+
+failed=0
+status() { # status <name> <rc-file> ; echoes OK or a reason, sets nothing
+  local rcf="$1"
+  if [[ ! -s "$rcf" ]]; then echo "NO-RC"; return; fi
+  local v; v="$(<"$rcf")"
+  if ! [[ "$v" =~ ^[0-9]+$ ]]; then echo "BAD-RC($v)"; return; fi
+  if [[ "$v" != 0 ]]; then echo "EXIT-$v"; return; fi
+  echo OK
+}
+
+for n in $(seq 1 "$total") policy; do
+  base="shard-$n"; [[ "$n" == policy ]] && base="policy"
+  st="$(status "$logs/$base.rc")"
+  if [[ -s "$logs/$base.sum" ]]; then cat "$logs/$base.sum"; else echo "$base: no summary line"; fi
+  if [[ "$st" != OK ]]; then
+    failed=$((failed + 1))
+    if [[ "$st" == NO-RC ]]; then
+      echo "::error::$base produced no exit code: the process was killed before it finished (OOM, cancel or SIGKILL). No rc is a failure."
+    else
+      echo "::error::$base failed: $st"
+    fi
+    echo "::group::$base log (last 200 lines)"
+    tail -n 200 "$logs/$base.log" 2>/dev/null || echo "(no log)"
+    echo "::endgroup::"
+  fi
+done
+
+have="$(find "$logs" -maxdepth 1 -name 'shard-*.rc' | wc -l)"
+if (( have != total )); then
+  echo "::error::expected exactly $total shard .rc files, found $have"
+  failed=$((failed + 1))
+fi
+
+if (( failed )); then
+  echo "ci-collect-shard-results: FAILED ($failed problem(s))"
+  exit 1
+fi
+echo "ci-collect-shard-results: OK, $total shards and the policy run all exited 0"

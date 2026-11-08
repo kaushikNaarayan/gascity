@@ -175,7 +175,14 @@ else
   # assignment's non-zero status is swallowed by `set -e` (the script dies before
   # the "no tests discovered" branch below), producing an undebuggable empty
   # shard failure. Check the status explicitly and print what go printed.
-  if ! list_output="$(run_go_test "${go_test_args[@]}" "$test_pkg" -list '^Test' 2>&1)"; then
+  if [[ -n "${GC_TEST_BINARY:-}" ]]; then
+    # gcf-a28gx: enumerate from the prebuilt test binary (compiled once by CI), run from the package dir like `go test`.
+    if ! list_output="$(cd "$repo_root/${test_pkg#./}" && run_in_test_env "$GC_TEST_BINARY" -test.list '^Test' 2>&1)"; then
+      echo "prebuilt test binary -test.list failed for ${test_pkg}; output:" >&2
+      printf '%s\n' "$list_output" >&2
+      exit 1
+    fi
+  elif ! list_output="$(run_go_test "${go_test_args[@]}" "$test_pkg" -list '^Test' 2>&1)"; then
     echo "go test -list failed for ${test_pkg} (build/compile error); output:" >&2
     printf '%s\n' "$list_output" >&2
     exit 1
@@ -204,6 +211,15 @@ if [[ ${#selected[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Optional evidence for CI's shard-union check (scripts/check-shard-union): the full discovered list and this
+# shard's selection, one test name per line. Written before the run so a failing shard still leaves them.
+if [[ -n "${GC_TEST_SHARD_FULL_LIST_OUT:-}" ]]; then
+  printf '%s\n' "${tests[@]}" > "$GC_TEST_SHARD_FULL_LIST_OUT"
+fi
+if [[ -n "${GC_TEST_SHARD_SELECTED_OUT:-}" ]]; then
+  printf '%s\n' "${selected[@]}" > "$GC_TEST_SHARD_SELECTED_OUT"
+fi
+
 join_regex() {
   local IFS='|'
   printf '%s' "$*"
@@ -212,7 +228,15 @@ join_regex() {
 regex="^($(join_regex "${selected[@]}"))$"
 echo "Running ${test_pkg} shard ${shard_index} of ${shard_total} (${#selected[@]} tests)"
 printf '  %s\n' "${selected[@]}"
-if [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
+if [[ -n "${GC_TEST_BINARY:-}" ]]; then
+  if [[ -n "${GO_TEST_TIMING_FILE:-}" || -n "${GO_TEST_COVERPROFILE:-}" ]]; then
+    echo "GC_TEST_BINARY cannot be combined with GO_TEST_TIMING_FILE or GO_TEST_COVERPROFILE" >&2
+    exit 1
+  fi
+  # The same flags `go test` passes to the binary, from the package dir (testdata and runtime.Caller paths resolve there).
+  cd "$repo_root/${test_pkg#./}"
+  run_in_test_env "$GC_TEST_BINARY" -test.run "$regex" -test.timeout "$timeout" -test.count="${GO_TEST_COUNT:-1}" -test.paniconexit0
+elif [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
   run_observable_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
 else
   run_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
