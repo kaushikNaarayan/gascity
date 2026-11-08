@@ -407,13 +407,10 @@ jobs:
             echo "policy packages: exit=$(cat "$logs/policy.rc") wall=$(( SECONDS - start ))s" > "$logs/policy.sum"
           ) &
           pids+=($!)
-          running=0
-          for i in 1 2 3 4 5 6; do
-            if [ "$running" -ge "$UNIT_SHARD_PARALLEL" ]; then wait -n; running=$(( running - 1 )); fi
-            run_shard "$i" &
-            pids+=($!)
-            running=$(( running + 1 ))
-          done
+          # The pool runs in its own subshell so its `wait -n` only sees shards, not the policy job or the sampler (gcf-lgfao).
+          source scripts/lib/shard-pool.sh
+          ( shard_pool_run 6 "$UNIT_SHARD_PARALLEL" run_shard ) &
+          pids+=($!)
           # explicit pids: a bare `wait` would also wait for the memory sampler forever
           wait "${pids[@]}" 2>/dev/null
           kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
@@ -422,9 +419,10 @@ jobs:
           echo "cmd/gc fast suite + policy total wall time: $(( SECONDS - total_start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
           ./scripts/ci-collect-shard-results "$logs" 6 | tee -a "$GITHUB_STEP_SUMMARY"
           [ "${PIPESTATUS[0]}" -eq 0 ]
-      - name: Prove the result collector fails closed (killed shard, missing rc) and the union guard goes red
+      - name: Prove the result collector fails closed (killed shard, missing rc), the shard pool honours its cap, and the union guard goes red
         run: |
           bash scripts/test-ci-collect-shard-results.sh
+          bash scripts/test-shard-pool.sh
           bash scripts/test-check-shard-union.sh
       - name: Shard-union check — the 6 shards still ran exactly the full cmd/gc test list (count unchanged)
         run: |
