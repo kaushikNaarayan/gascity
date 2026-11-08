@@ -59,6 +59,8 @@ parked seats are only reported, e.g. for mailing the owning rig PM the list.`,
 type sweepParkedResult struct {
 	SchemaVersion string               `json:"schema_version"`
 	Fixed         bool                 `json:"fix"`
+	Scanned       int                  `json:"scanned"`
+	Unreadable    []string             `json:"unreadable,omitempty"`
 	Sessions      []sweepParkedFinding `json:"sessions"`
 }
 
@@ -110,6 +112,12 @@ func cmdSessionSweepParked(fix, jsonOutput bool, stdout, stderr io.Writer) int {
 	sessions := catalog.ListFromInfos(sessionBeads.OpenInfos(), string(session.StateActive), "")
 
 	findings := make([]sweepParkedFinding, 0)
+	// scanned counts panes actually read; unreadable lists sessions whose pane
+	// could not be peeked. A detector that cannot see a seat must say so: a
+	// silent skip folds "could not evaluate" into "clean" (gcf-fwnju AC4,
+	// gy-to6wy).
+	scanned := 0
+	unreadable := make([]string, 0)
 	for _, info := range sessions {
 		name := strings.TrimSpace(info.SessionName)
 		if name == "" {
@@ -118,8 +126,10 @@ func cmdSessionSweepParked(fix, jsonOutput bool, stdout, stderr io.Writer) int {
 		promptPrefix := sweepParkedPromptPrefix(cfg, info.Template)
 		pane, err := sp.Peek(name, sweepParkedPeekLines)
 		if err != nil {
-			continue // unreadable pane: nothing to detect, not an error worth surfacing per-session
+			unreadable = append(unreadable, name)
+			continue
 		}
+		scanned++
 		text, parked := runtime.ParkedPromptContent(strings.Split(pane, "\n"), promptPrefix)
 		if !parked {
 			continue
@@ -151,14 +161,52 @@ func cmdSessionSweepParked(fix, jsonOutput bool, stdout, stderr io.Writer) int {
 	}
 
 	if jsonOutput {
-		return writeCLIJSONLineOrExit(stdout, stderr, "gc session sweep-parked", sweepParkedResult{
+		jsonCode := writeCLIJSONLineOrExit(stdout, stderr, "gc session sweep-parked", sweepParkedResult{
 			SchemaVersion: "1",
 			Fixed:         fix,
+			Scanned:       scanned,
+			Unreadable:    unreadable,
 			Sessions:      findings,
 		})
+		return sweepParkedExitCode(findings, unreadable, scanned, jsonCode)
 	}
-	if len(findings) == 0 {
-		fmt.Fprintln(stdout, "No parked seats found.") //nolint:errcheck // best-effort stdout
+	unrecovered := sweepParkedUnrecovered(findings)
+	if len(findings) == 0 && len(unreadable) == 0 && scanned > 0 {
+		fmt.Fprintf(stdout, "No parked seats found (%d panes scanned).\n", scanned) //nolint:errcheck // best-effort stdout
+	}
+	if len(unreadable) > 0 {
+		fmt.Fprintf(stderr, "gc session sweep-parked: COULD NOT EVALUATE %d session(s), pane unreadable: %s\n", len(unreadable), strings.Join(unreadable, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	if scanned == 0 && len(unreadable) == 0 {
+		fmt.Fprintln(stderr, "gc session sweep-parked: COULD NOT EVALUATE: no active session pane was scanned") //nolint:errcheck // best-effort stderr
+	}
+	if unrecovered > 0 {
+		fmt.Fprintf(stderr, "gc session sweep-parked: %d parked seat(s) left unsubmitted\n", unrecovered) //nolint:errcheck // best-effort stderr
+	}
+	return sweepParkedExitCode(findings, unreadable, scanned, 0)
+}
+
+// sweepParkedUnrecovered counts findings still parked after the run: every
+// finding in report-only mode, and any whose recovery failed with --fix.
+func sweepParkedUnrecovered(findings []sweepParkedFinding) int {
+	n := 0
+	for _, f := range findings {
+		if !f.Recovered {
+			n++
+		}
+	}
+	return n
+}
+
+// sweepParkedExitCode makes the sweep fail loud: nonzero when a parked seat
+// remains unsubmitted, when any pane could not be read, or when nothing was
+// scanned at all (a clean answer needs at least one pane actually read).
+func sweepParkedExitCode(findings []sweepParkedFinding, unreadable []string, scanned, base int) int {
+	if base != 0 {
+		return base
+	}
+	if sweepParkedUnrecovered(findings) > 0 || len(unreadable) > 0 || scanned == 0 {
+		return 2
 	}
 	return 0
 }
