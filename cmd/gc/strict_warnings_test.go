@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -119,5 +121,90 @@ func TestSplitStrictConfigWarnings_MissingSiteBindingRemainsFatal(t *testing.T) 
 	}
 	if len(fatal) != 1 {
 		t.Fatalf("fatal = %v, want missing-binding warning to stay fatal", fatal)
+	}
+}
+
+func alwaysFreshTestWarnings(t *testing.T, names ...string) []string {
+	t.Helper()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	for _, n := range names {
+		cfg.Agents = append(cfg.Agents, config.Agent{Name: n, WakeMode: "fresh"})
+		cfg.NamedSessions = append(cfg.NamedSessions, config.NamedSession{Template: n, Mode: "always"})
+	}
+	warnings, err := config.ValidateNamedSessions(cfg)
+	if err != nil {
+		t.Fatalf("config.ValidateNamedSessions: %v", err)
+	}
+	if len(warnings) != len(names) {
+		t.Fatalf("warnings = %v, want one always+fresh advisory per session", warnings)
+	}
+	return warnings
+}
+
+// TestEmitLoadCityConfigWarningsCollapsesAlwaysFresh proves the generic
+// per-command emit path prints exactly one summary line, carrying the count,
+// for any number of always+fresh advisories, while unrelated warnings pass
+// through and the summary stays non-fatal and emittable.
+func TestEmitLoadCityConfigWarningsCollapsesAlwaysFresh(t *testing.T) {
+	warnings := alwaysFreshTestWarnings(t, "a", "b", "c", "d", "e")
+	mixed := append([]string{}, warnings[:2]...)
+	mixed = append(mixed, `/city/pack.toml: [agents] is a deprecated compatibility alias for [agent_defaults]; rewrite the table name to [agent_defaults]`)
+	mixed = append(mixed, warnings[2:]...)
+
+	var stderr bytes.Buffer
+	emitLoadCityConfigWarnings(&stderr, &config.Provenance{Warnings: mixed})
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	var fresh []string
+	for _, l := range lines {
+		if config.IsAlwaysFreshWakeModeWarning(l) {
+			fresh = append(fresh, l)
+		}
+	}
+	if len(fresh) != 1 {
+		t.Fatalf("always+fresh lines = %d (%q), want exactly 1 summary", len(fresh), stderr.String())
+	}
+	for _, want := range []string{"5 named sessions", "a, b, c, ...", "gc config show"} {
+		if !strings.Contains(fresh[0], want) {
+			t.Errorf("summary %q missing %q", fresh[0], want)
+		}
+	}
+	if len(lines) != 2 || !strings.Contains(stderr.String(), "deprecated compatibility alias") {
+		t.Errorf("want summary + the unrelated warning, got %q", stderr.String())
+	}
+	if fatal, _ := splitStrictConfigWarnings(fresh); len(fatal) != 0 {
+		t.Errorf("summary must stay non-fatal, fatal=%v", fatal)
+	}
+	if !shouldEmitLoadCityConfigWarning(fresh[0]) {
+		t.Error("summary must be emitted")
+	}
+}
+
+// TestCollapseAlwaysFreshWarningsFewNamesNoEllipsis covers the under-limit
+// case and the no-advisory passthrough.
+func TestCollapseAlwaysFreshWarningsFewNamesNoEllipsis(t *testing.T) {
+	got := collapseAlwaysFreshWarnings(alwaysFreshTestWarnings(t, "x", "y"))
+	if len(got) != 1 || !strings.Contains(got[0], "2 named sessions") || strings.Contains(got[0], "...") {
+		t.Fatalf("got %q, want one 2-session summary without ellipsis", got)
+	}
+	plain := []string{"unrelated"}
+	if out := collapseAlwaysFreshWarnings(plain); len(out) != 1 || out[0] != "unrelated" {
+		t.Fatalf("passthrough = %q", out)
+	}
+}
+
+// TestConfigShowKeepsFullAlwaysFreshList proves the collapse lives only in the
+// per-command emit path: the raw Provenance.Warnings that gc config show
+// prints still carries one advisory per session.
+func TestConfigShowKeepsFullAlwaysFreshList(t *testing.T) {
+	warnings := alwaysFreshTestWarnings(t, "a", "b", "c", "d")
+	prov := &config.Provenance{Warnings: warnings}
+	if len(prov.Warnings) != 4 {
+		t.Fatalf("provenance mutated: %v", prov.Warnings)
+	}
+	var stderr bytes.Buffer
+	emitLoadCityConfigWarnings(&stderr, prov)
+	if len(prov.Warnings) != 4 {
+		t.Fatalf("emit mutated provenance warnings: %v", prov.Warnings)
 	}
 }

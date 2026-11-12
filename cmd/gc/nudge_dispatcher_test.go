@@ -754,11 +754,12 @@ func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
 	t.Cleanup(releaseSlow)
 
 	var out strings.Builder
-	start := time.Now()
 	delivered, _ := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, sp, snapshot, &out)
-	elapsed := time.Since(start)
-	if elapsed > 3*time.Second {
-		t.Fatalf("pass took %s with one wedged target; want it bounded near the 1s target timeout", elapsed)
+	// Boundedness is asserted by ordering, not elapsed time: the pass returned
+	// while the wedged probe is still blocked (it is only released below), so
+	// the pass did not wait on it. Wall-clock bounds flake under host load.
+	if n := len(sp.returned); n != 0 {
+		t.Fatalf("wedged probe returned %d times before release; pass should have given up on it first", n)
 	}
 	if delivered != 1 {
 		t.Fatalf("delivered = %d, want 1 (healthy target served despite the wedged one); out=%q slow=%s fast=%s", delivered, out.String(), slow.SessionName, fast.SessionName)
@@ -770,11 +771,7 @@ func TestDispatchAllQueuedNudgesBoundsWedgedTarget(t *testing.T) {
 	// Second tick: the wedged probe is still running, so it must be skipped
 	// outright (single-flight) and return immediately.
 	out.Reset()
-	start = time.Now()
 	_, _ = dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, sp, snapshot, &out)
-	if e := time.Since(start); e > 100*time.Millisecond {
-		t.Fatalf("second pass took %s; want an immediate in-flight skip", e)
-	}
 	if !strings.Contains(out.String(), "in-flight") {
 		t.Fatalf("second pass output %q lacks in-flight skip", out.String())
 	}

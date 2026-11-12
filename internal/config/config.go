@@ -4195,6 +4195,10 @@ func validateNamedSessions(cfg *City, requireBackingTemplate bool) (warnings []s
 // IsAlwaysFreshWakeModeWarning.
 const alwaysFreshWakeModeMarker = "starts a fresh provider session after every drain"
 
+// AlwaysFreshWakeModeMarker exposes alwaysFreshWakeModeMarker so CLI summaries
+// of the always+fresh advisory stay recognized by IsAlwaysFreshWakeModeWarning.
+const AlwaysFreshWakeModeMarker = alwaysFreshWakeModeMarker
+
 // IsAlwaysFreshWakeModeWarning reports whether a load warning is the non-fatal
 // always+fresh advisory. CLI warning filters use this to print the notice and
 // keep it non-fatal in strict mode. Keep in sync with

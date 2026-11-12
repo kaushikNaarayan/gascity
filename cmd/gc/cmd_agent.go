@@ -112,7 +112,7 @@ func emitLoadCityConfigWarnings(w io.Writer, prov *config.Provenance) {
 		return
 	}
 	seen := make(map[string]struct{}, len(prov.Warnings))
-	for _, warning := range prov.Warnings {
+	for _, warning := range collapseAlwaysFreshWarnings(prov.Warnings) {
 		if !shouldEmitLoadCityConfigWarning(warning) {
 			continue
 		}
@@ -122,6 +122,65 @@ func emitLoadCityConfigWarnings(w io.Writer, prov *config.Provenance) {
 		seen[warning] = struct{}{}
 		fmt.Fprintln(w, warning) //nolint:errcheck // best-effort warning emission
 	}
+}
+
+// alwaysFreshSummaryNames is how many session names the collapsed always+fresh
+// advisory lists before pointing at `gc config show` for the rest.
+const alwaysFreshSummaryNames = 3
+
+// collapseAlwaysFreshWarnings replaces every always+fresh advisory in warnings
+// with a single summary line, placed where the first advisory was. A city with
+// many restart-per-cycle sessions otherwise prints one line per session on
+// every gc command. gc config show reads Provenance.Warnings directly and so
+// still lists every session.
+func collapseAlwaysFreshWarnings(warnings []string) []string {
+	var names []string
+	for _, warning := range warnings {
+		if !config.IsAlwaysFreshWakeModeWarning(warning) {
+			continue
+		}
+		names = append(names, alwaysFreshWarningSession(warning))
+	}
+	if len(names) == 0 {
+		return warnings
+	}
+	shown := names
+	suffix := ""
+	if len(shown) > alwaysFreshSummaryNames {
+		shown = shown[:alwaysFreshSummaryNames]
+		suffix = ", ..."
+	}
+	summary := fmt.Sprintf(
+		"%d named sessions are mode=always + wake_mode=fresh (restart-per-cycle; each %s): %s%s (gc config show for all)",
+		len(names), config.AlwaysFreshWakeModeMarker, strings.Join(shown, ", "), suffix,
+	)
+	out := make([]string, 0, len(warnings)-len(names)+1)
+	emitted := false
+	for _, warning := range warnings {
+		if !config.IsAlwaysFreshWakeModeWarning(warning) {
+			out = append(out, warning)
+			continue
+		}
+		if !emitted {
+			out = append(out, summary)
+			emitted = true
+		}
+	}
+	return out
+}
+
+// alwaysFreshWarningSession extracts the quoted named-session identity from an
+// always+fresh advisory, falling back to the whole warning if it is not quoted.
+func alwaysFreshWarningSession(warning string) string {
+	start := strings.IndexByte(warning, '"')
+	if start < 0 {
+		return warning
+	}
+	end := strings.IndexByte(warning[start+1:], '"')
+	if end < 0 {
+		return warning
+	}
+	return warning[start+1 : start+1+end]
 }
 
 // Alias-only warnings, deferred future-surface keys, and tombstone attachment

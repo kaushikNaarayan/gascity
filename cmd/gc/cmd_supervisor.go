@@ -2511,7 +2511,7 @@ func emitSupervisorLoadCityConfigWarnings(w io.Writer, cityPath string, prov *co
 		return
 	}
 	seen := make(map[string]struct{}, len(prov.Warnings))
-	for _, warning := range prov.Warnings {
+	for _, warning := range collapseAlwaysFreshWarnings(prov.Warnings) {
 		if !shouldEmitLoadCityConfigWarning(warning) {
 			continue
 		}
