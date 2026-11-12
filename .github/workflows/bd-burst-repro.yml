@@ -1,0 +1,58 @@
+name: bd-burst-repro
+
+# gcf-6986 AC1/AC2: reproduce the >60-way concurrent bd hang against a
+# throwaway city and capture goroutine dumps. Manual only; never a PR gate.
+on:
+  workflow_dispatch:
+    inputs:
+      burst_sizes:
+        description: "Space-separated burst sizes"
+        required: false
+        default: "50 100 200 400"
+      stuck_after_s:
+        description: "Seconds a bd call may run before it is SIGQUIT-dumped"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bd-burst-repro
+  cancel-in-progress: false
+
+jobs:
+  burst:
+    if: ${{ github.repository != 'gastownhall/gascity' }}
+    runs-on: [self-hosted, pool]
+    timeout-minutes: 30
+    env:
+      DOLT_VERSION: "2.1.10"
+      BD_VERSION: "v1.1.0"
+      GO_VERSION: "1.26.5"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Verify jq is present (no sudo install on self-hosted)
+        run: command -v jq || { echo "jq missing on this runner"; exit 1; }
+      - name: Install dolt v${{ env.DOLT_VERSION }} (cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ env.DOLT_VERSION }}" --cache
+      - name: Install bd ${{ env.BD_VERSION }} (cached, no sudo)
+        run: .github/scripts/install-bd-archive.sh "${{ env.BD_VERSION }}" --cache
+      - name: Build gc
+        run: go build -o "$RUNNER_TEMP/bin/gc" ./cmd/gc && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Burst
+        env:
+          BURST_SIZES: ${{ inputs.burst_sizes }}
+          STUCK_AFTER_S: ${{ inputs.stuck_after_s }}
+          OUT_DIR: ${{ runner.temp }}/bd-burst-out
+        run: scripts/ci/bd-burst-repro.sh
+      - name: Upload dumps and results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bd-burst-out
+          path: ${{ runner.temp }}/bd-burst-out
+          if-no-files-found: warn
