@@ -1041,13 +1041,6 @@ func (s *Server) humaHandleSessionWake(ctx context.Context, input *SessionIDInpu
 	if err := withdrawQueuedWaitNudges(s.state.NudgesBeadStore(), s.state.CityPath(), res.NudgeIDs); err != nil {
 		log.Printf("gc api: withdrawing queued wait nudges after wake %s: %v", id, err)
 	}
-	// RAW SessionNameMetadata (not Info.SessionName, which falls back to
-	// sessionNameFor(ID)) to preserve the skip-when-unset behavior. res.Info is
-	// the typed WakeResult projection (WI-4), so no raw bead is cracked here.
-	sessionName := res.Info.SessionNameMetadata
-	if sessionName != "" {
-		s.state.ClearCrashHistory(sessionName)
-	}
 	handle, err := s.workerHandleForSession(store.Store, id)
 	if err != nil {
 		return nil, humaSessionManagerError(err)

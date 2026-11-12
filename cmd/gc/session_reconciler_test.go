@@ -5520,6 +5520,75 @@ func TestReconcileSessionBeads_SkipsQuarantinedSession(t *testing.T) {
 	}
 }
 
+func TestReconcileSessionBeads_QuarantinedRespawnRecordsTraceDecision(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session) // alive before it died; the runtime is gone
+	until := env.clk.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
+	// A heartbeat hold with assigned work forces shouldWake=true past the awake
+	// set's quarantine suppression, which is the only route into the respawn arm.
+	env.setSessionMetadata(&session, map[string]string{
+		"quarantined_until": until,
+		"held_until":        env.clk.Now().Add(45 * time.Minute).UTC().Format(time.RFC3339),
+		"last_woke_at":      env.clk.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	task, err := env.store.Create(beads.Bead{Title: "assigned task", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(task): %v", err)
+	}
+	status, assignee := "in_progress", session.ID
+	if err := env.store.Update(task.ID, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+		t.Fatalf("Update(task): %v", err)
+	}
+	task, err = env.store.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get(task): %v", err)
+	}
+
+	trace := &sessionReconcilerTraceCycle{
+		tracer: &SessionReconcilerTracer{
+			detail: map[string]TraceSource{"worker": TraceSourceManual},
+		},
+		dropReasons:       map[string]int{},
+		pendingDetail:     map[string][]SessionReconcilerTraceRecord{},
+		pendingDropped:    map[string]int{},
+		templatesTouched:  map[string]struct{}{},
+		detailedTemplates: map[string]struct{}{},
+		decisionCounts:    map[string]int{},
+		operationCounts:   map[string]int{},
+		mutationCounts:    map[string]int{},
+		reasonCounts:      map[string]int{},
+		outcomeCounts:     map[string]int{},
+	}
+	poolDesired := map[string]int{"worker": 1}
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	woken := reconcileSessionBeadsTraced(
+		context.Background(), "", []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
+		env.store, nil, []beads.Bead{task}, nil, nil, env.dt, poolDesired, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, trace,
+	)
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0 (quarantined)", woken)
+	}
+
+	var found bool
+	for _, r := range trace.records {
+		if r.SiteCode == TraceSiteReconcilerWakeDecision &&
+			r.ReasonCode == TraceReasonQuarantined &&
+			r.OutcomeCode == TraceOutcomeRespawnSkipped {
+			found = true
+			if got := r.Fields["quarantined_until"]; got != until {
+				t.Errorf("quarantined_until field = %v, want %q", got, until)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("quarantine skip recorded no trace decision; records=%#v", trace.records)
+	}
+}
+
 func TestReconcileSessionBeads_RespectsWakeBudget(t *testing.T) {
 	env := newReconcilerTestEnv()
 	var cfgAgents []config.Agent

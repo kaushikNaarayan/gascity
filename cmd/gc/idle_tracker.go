@@ -9,7 +9,7 @@ import (
 
 // idleTracker checks for agents that have been idle longer than their
 // configured timeout. Nil means idle checking is disabled (backward
-// compatible). Follows the same nil-guard pattern as crashTracker.
+// compatible).
 //
 // Timeouts may be registered two ways:
 //   - Per session name (setTimeout) for sessions whose runtime names are

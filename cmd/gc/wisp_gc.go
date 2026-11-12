@@ -95,7 +95,7 @@ func parseBoolEnv(v string) bool {
 
 // wispGC performs mechanical garbage collection of closed molecules that
 // have exceeded their TTL. Follows the nil-guard tracker pattern used by
-// crashTracker and idleTracker: nil means disabled.
+// idleTracker: nil means disabled.
 type wispGC interface {
 	// shouldRun returns true if enough time has elapsed since the last run.
 	shouldRun(now time.Time) bool

@@ -118,7 +118,6 @@ type CityRuntime struct {
 	buildFnWithSessionBeads func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult
 
 	dops            drainOps
-	ct              crashTracker
 	it              idleTracker
 	mat             maxSessionAgeTracker
 	adt             assignedWorkDeferTracker
@@ -256,7 +255,7 @@ type runtimeDemandSnapshot struct {
 }
 
 // CityRuntimeParams holds the caller-provided parameters for creating a
-// CityRuntime. Internal components (crashTracker, etc.) are built by the
+// CityRuntime. Internal components (idleTracker, etc.) are built by the
 // constructor from these inputs.
 type CityRuntimeParams struct {
 	CityPath     string
@@ -321,7 +320,7 @@ const cityRuntimeReloadLifecycleRetryLimit = 2
 const postCreateProtectionTimeout = 2 * time.Minute
 
 // newCityRuntime creates a CityRuntime, building internal components
-// (crash tracker, idle tracker, wisp GC, order dispatcher) from the
+// (idle tracker, wisp GC, order dispatcher) from the
 // provided parameters.
 //
 // It returns an error when this city must not start. Today there is exactly one
@@ -334,10 +333,6 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	configName := lockedConfigName(p.Cfg, p.CityPath)
 	applyRuntimeCityIdentity(p.Cfg, p.CityName)
 
-	var ct crashTracker
-	if maxR := p.Cfg.Daemon.MaxRestartsOrDefault(); maxR > 0 {
-		ct = newCrashTracker(maxR, p.Cfg.Daemon.RestartWindowDuration())
-	}
 	configDirty := p.ConfigDirty
 	if configDirty == nil {
 		configDirty = &atomic.Bool{}
@@ -399,7 +394,6 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		buildFn:                 p.BuildFn,
 		buildFnWithSessionBeads: p.BuildFnWithSessionBeads,
 		dops:                    p.Dops,
-		ct:                      ct,
 		it:                      it,
 		mat:                     mat,
 		adt:                     adt,
@@ -465,11 +459,6 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 // accessors read it under RLock.
 func (cr *CityRuntime) setControllerState(cs *controllerState) {
 	cr.cs = cs
-}
-
-// crashTracker returns the crash tracker for API server wiring.
-func (cr *CityRuntime) crashTrack() crashTracker {
-	return cr.ct
 }
 
 // run executes the reconciliation loop until ctx is canceled. This is
@@ -2378,29 +2367,6 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.poolSessions = computePoolSessions(nextCfg, cr.cityName, cr.cityPath, nextSp)
 	cr.poolDeathHandlers = computePoolDeathHandlers(nextCfg, cr.cityName, cityRoot, nextSp, cr.stderr)
 	cr.suspendedNames = computeSuspendedNames(nextCfg, cr.cityName, cr.cityPath)
-
-	// Rebuild crash tracker if config values changed, otherwise clear all
-	// crash history so that a fixed config automatically unquarantines agents.
-	newMaxR := nextCfg.Daemon.MaxRestartsOrDefault()
-	newWindow := nextCfg.Daemon.RestartWindowDuration()
-	switch {
-	case newMaxR <= 0:
-		cr.ct = nil
-	case cr.ct == nil:
-		cr.ct = newCrashTracker(newMaxR, newWindow)
-	default:
-		oldMaxR, oldWindow := cr.ct.limits()
-		if newMaxR != oldMaxR || newWindow != oldWindow {
-			cr.ct = newCrashTracker(newMaxR, newWindow)
-		} else {
-			cr.ct.clearAll()
-		}
-	}
-	if cr.cs != nil {
-		cr.cs.mu.Lock()
-		cr.cs.ct = cr.ct
-		cr.cs.mu.Unlock()
-	}
 
 	cr.it = buildIdleTracker(nextCfg, cr.cityName, cr.cityPath, nextSp)
 	cr.mat = buildMaxSessionAgeTracker(nextCfg, cr.cityName, nextSp)

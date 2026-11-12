@@ -2480,10 +2480,14 @@ type DaemonConfig struct {
 	GraphWorkflows bool `toml:"graph_workflows,omitempty"`
 	// PatrolInterval is the health patrol interval. Duration string (e.g., "30s", "5m", "1h"). Defaults to "30s".
 	PatrolInterval string `toml:"patrol_interval,omitempty" jsonschema:"default=30s"`
-	// MaxRestarts is the maximum number of agent restarts within RestartWindow before
-	// the agent is quarantined. 0 means unlimited (no crash loop detection). Defaults to 5.
+	// MaxRestarts is the restart threshold of the named-session respawn circuit
+	// breaker when SessionCircuitBreakerMaxRestarts is unset, and the attempt limit
+	// for retried controller startup steps. 0 means unlimited startup retries and,
+	// absent an override, disables the circuit breaker. Per-session crash-loop
+	// quarantine is bead-backed and does not read this key. Defaults to 5.
 	MaxRestarts *int `toml:"max_restarts,omitempty" jsonschema:"default=5"`
-	// RestartWindow is the sliding time window for counting restarts.
+	// RestartWindow is the sliding time window of the named-session respawn
+	// circuit breaker when SessionCircuitBreakerWindow is empty.
 	// Duration string (e.g., "30s", "5m", "1h"). Defaults to "1h".
 	RestartWindow string `toml:"restart_window,omitempty" jsonschema:"default=1h"`
 	// SessionCircuitBreaker enables the named-session respawn circuit breaker.

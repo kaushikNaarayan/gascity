@@ -1199,7 +1199,6 @@ func controllerLoop(
 	buildFn func(*config.City, runtime.Provider, beads.Store) DesiredStateResult,
 	sp runtime.Provider,
 	dops drainOps,
-	ct crashTracker,
 	it idleTracker,
 	wg wispGC,
 	od orderDispatcher,
@@ -1231,7 +1230,6 @@ func controllerLoop(
 		sp:                  sp,
 		buildFn:             buildFn,
 		dops:                dops,
-		ct:                  ct,
 		it:                  it,
 		wg:                  wg,
 		od:                  od,
@@ -1391,7 +1389,6 @@ func runController(
 	// disabled. Standalone runtime still needs cached city/rig stores for
 	// session-bead sync and rig-scoped wake decisions.
 	cs := newControllerStateWithRoutes(ctx, cr.storageRoutes, cfg, sp, eventProv, cityName, cityPath)
-	cs.ct = cr.crashTrack()
 	cs.pokeCh = pokeCh
 	cs.configDirty = configDirty
 	cs.services = cr.svc

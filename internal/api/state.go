@@ -97,13 +97,9 @@ type State interface {
 	StartedAt() time.Time
 
 	// IsQuarantined reports whether an agent (by session name) is
-	// currently quarantined due to crash-loop detection.
+	// currently quarantined due to crash-loop detection, as recorded in the
+	// session bead's quarantined_until metadata.
 	IsQuarantined(sessionName string) bool
-
-	// ClearCrashHistory removes in-memory crash tracking for a session.
-	// Called by wake to prevent the in-memory tracker from immediately
-	// re-quarantining a session whose dolt metadata was just cleared.
-	ClearCrashHistory(sessionName string)
 
 	// CityBeadStore returns the city-level bead store for session beads.
 	// Returns nil if no store is available.

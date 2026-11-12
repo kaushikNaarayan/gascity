@@ -3666,7 +3666,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				continue
 			}
 			if sessionIsQuarantinedInfo(info, clk) {
-				continue // crash-loop protection
+				// Crash-loop protection: record the skip so gc trace shows a
+				// quarantined session rather than only a missing wake.
+				if trace != nil {
+					trace.RecordDecision(TraceSiteReconcilerWakeDecision, TraceReasonQuarantined, TraceOutcomeRespawnSkipped, target.tp.TemplateName, name, traceRecordPayload{
+						"quarantined_until": info.QuarantinedUntil,
+					})
+				}
+				continue
 			}
 			if pendingCreateStartInFlightInfo(info, clk, startupTimeout) {
 				if trace != nil {

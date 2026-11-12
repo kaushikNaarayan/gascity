@@ -41,7 +41,7 @@ func TestControllerLoopCancel(t *testing.T) {
 
 	var stdout, stderr lockedBuffer
 
-	controllerLoop(ctx, time.Hour, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+	controllerLoop(ctx, time.Hour, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	if got := reconcileCount.Load(); got != 1 {
 		t.Errorf("reconcile count = %d, want 1", got)
@@ -71,7 +71,7 @@ func TestControllerLoopTick(t *testing.T) {
 
 	var stdout, stderr lockedBuffer
 
-	controllerLoop(ctx, time.Millisecond, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+	controllerLoop(ctx, time.Millisecond, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	if got := reconcileCount.Load(); got != 2 {
 		t.Errorf("reconcile count = %d, want 2", got)
@@ -514,7 +514,7 @@ func TestControllerReloadsConfig(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+			buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 		close(loopDone)
 	}()
 
@@ -605,7 +605,7 @@ func TestControllerReloadsConfigImmediatelyOnWatchEvent(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		controllerLoop(ctx, 30*time.Second, cfg, "test", tomlPath, nil,
-			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+			buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 		close(loopDone)
 	}()
 
@@ -1186,7 +1186,7 @@ func TestControllerReloadsNamedSessionModeAndAppliesIdleTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, config.WatchTargets(prov, cfg, dir),
-			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+			buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 		close(done)
 	}()
 	var shutdownOnce sync.Once
@@ -1811,7 +1811,7 @@ func TestControllerReloadInvalidConfig(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+			buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 		close(done)
 	}()
 
@@ -1874,7 +1874,7 @@ func TestControllerReloadCityNameChange(t *testing.T) {
 	var stdout, stderr lockedBuffer
 
 	go controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-		buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+		buildFn, sp, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	// Wait for initial reconcile.
 	for reconcileCount.Load() < 1 {

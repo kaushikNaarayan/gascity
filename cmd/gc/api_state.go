@@ -86,7 +86,6 @@ type controllerState struct {
 	version                string
 	startedAt              time.Time
 	storeMetadataSignature string
-	ct                     crashTracker  // nil if crash tracking disabled
 	pokeCh                 chan struct{} // nil when poke is not available; triggers immediate reconciler tick
 	configDirty            *atomic.Bool  // optional dirty flag shared with the reconciler reload path
 	services               workspacesvc.Registry
@@ -1437,26 +1436,30 @@ func (cs *controllerState) StartedAt() time.Time {
 	return cs.startedAt
 }
 
-// IsQuarantined reports whether an agent is quarantined by the crash tracker.
+// IsQuarantined reports whether the open session bead for sessionName carries
+// an unexpired quarantined_until, the crash-loop protection the session
+// reconciler persists. A store read error reads as not quarantined and is
+// logged, so a degraded store never marks a healthy agent quarantined.
 func (cs *controllerState) IsQuarantined(sessionName string) bool {
-	cs.mu.RLock()
-	ct := cs.ct
-	cs.mu.RUnlock()
-	if ct == nil {
+	sessStore := cs.SessionsBeadStore()
+	if sessStore.Store == nil {
 		return false
 	}
-	return ct.isQuarantined(sessionName, time.Now())
-}
-
-// ClearCrashHistory removes in-memory crash tracking for a session.
-func (cs *controllerState) ClearCrashHistory(sessionName string) {
-	cs.mu.RLock()
-	ct := cs.ct
-	cs.mu.RUnlock()
-	if ct == nil {
-		return
+	infos, err := session.NewStore(sessStore).ListByMetadataInfos(map[string]string{"session_name": sessionName}, 0)
+	if err != nil {
+		log.Printf("gc api: reading quarantine state for session %q: %v", sessionName, err)
+		return false
 	}
-	ct.clearHistory(sessionName)
+	now := time.Now()
+	for _, info := range infos {
+		if info.Closed {
+			continue
+		}
+		if metadataTimeInFuture(info.QuarantinedUntil, now) {
+			return true
+		}
+	}
+	return false
 }
 
 // loadRawSnapshot loads the raw (pre-expansion, site-bound) config using the

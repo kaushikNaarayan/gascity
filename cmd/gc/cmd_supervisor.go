@@ -2167,7 +2167,6 @@ func reconcileCities(
 			recordInitFailure(cityName, fmt.Sprintf("controller state: %v", err))
 			continue
 		}
-		cs.ct = cityRuntime.crashTrack()
 		cs.pokeCh = pokeCh
 		cs.configDirty = configDirty
 		cs.services = cityRuntime.svc

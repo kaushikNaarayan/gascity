@@ -236,7 +236,6 @@ func (s *seededState) CityPath() string               { return s.cityPath }
 func (s *seededState) Version() string                { return s.version }
 func (s *seededState) StartedAt() time.Time           { return s.startedAt }
 func (s *seededState) IsQuarantined(string) bool      { return false }
-func (s *seededState) ClearCrashHistory(string)       {}
 func (s *seededState) CityBeadStore() beads.Store     { return s.cityStore }
 
 // ScopedStoreLike returns (nil, nil): the seeded stores are in-memory, so there

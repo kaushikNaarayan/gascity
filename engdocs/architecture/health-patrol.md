@@ -30,10 +30,14 @@ die, hooks persist, fresh sessions resume the work).
   from the current config. Detected via `runtime.ConfigFingerprint()` and
   resolved by stop + start.
 
-- **Crash Loop Quarantine**: When an agent exceeds `max_restarts` within
-  `restart_window`, it enters quarantine. The controller stops attempting
-  to restart it until the window expires. In-memory only -- intentionally
-  lost on controller restart (counter reset, same as Erlang/OTP).
+- **Crash Loop Quarantine**: Bead-backed. Consecutive wake failures
+  (`wake_attempts`, quarantine at 5) and non-productive churn cycles
+  (`churn_count`) make the reconciler write `quarantined_until` on the
+  session bead (5 minutes ahead). The reconciler skips quarantined
+  sessions until it expires, and the state survives controller restarts.
+  `max_restarts` / `restart_window` do not drive this; they configure the
+  opt-in named-session respawn circuit breaker (and `max_restarts` also
+  bounds controller startup retries).
 
 - **Idle Timeout**: An opt-in per-agent duration after which an agent
   with no session I/O activity is killed and restarted. Queries
@@ -79,7 +83,6 @@ use):
                      │  ┌─────────────────────────────┐   │
                      │  │ reconcileSessionBeads()      │   │
                      │  │ (session_reconciler.go)      │   │
-                     │  │   ├─ crashTracker            │   │
                      │  │   ├─ idleTracker             │   │
                      │  │   ├─ config drift repair     │   │
                      │  │   └─ drainOps (pool scaling) │   │
@@ -103,7 +106,7 @@ A single controller tick proceeds as follows:
 1. **Config reload** (conditional). If the `dirty` atomic flag is set
    (via fsnotify debounce on config directory changes),
    `tryReloadConfig()` re-parses `city.toml` with includes and patches.
-   If the reload succeeds, the crash tracker, idle tracker, wisp GC, and
+   If the reload succeeds, the idle tracker, wisp GC, and
    order dispatcher are all rebuilt from the new config.
 
 2. **Agent list build**. `buildFn(cfg)` re-evaluates the desired agent
@@ -144,12 +147,14 @@ Additional sub-states within "running" are checked in order:
    Stop the idle session and emit `session.idle_killed`.
 3. **Config drift**: Stored hash differs from current. Stop + start.
 
-Agents not running are subject to **crash loop quarantine**: if
-`crashTracker.isQuarantined()` returns true, the agent is skipped
-silently. `session.quarantined` is a registered/reserved event type, but
-there is no production emitter today. Operators that need this signal
-must read the crash tracker quarantine state; subscribing to
-`session.quarantined` will not observe transitions yet.
+Agents not running are subject to **crash loop quarantine**: if the
+session bead's `quarantined_until` is in the future, the reconciler skips
+the wake without recording a trace decision, so a quarantined session
+appears in `gc trace` only as a missing wake. `session.quarantined` is a
+registered/reserved event type, but there is no production emitter
+today. Operators that need this signal read `quarantined_until` from the
+session bead (the API's agent `quarantined` state does the same);
+subscribing to `session.quarantined` will not observe transitions yet.
 
 **Orphan cleanup** (Phase 2) handles sessions with the city prefix that
 are not in the desired set:
@@ -202,11 +207,6 @@ waves with bounded parallelism.
 
 ### Key Types
 
-- **`crashTracker`** (`cmd/gc/crash_tracker.go`): Interface for crash
-  loop detection. Production impl `memoryCrashTracker` holds an in-memory
-  map of session name to recent start timestamps. Prunes entries older
-  than `restart_window` on every call.
-
 - **`idleTracker`** (`cmd/gc/idle_tracker.go`): Interface for agent
   inactivity detection. Production impl `memoryIdleTracker` queries
   `runtime.Provider.GetLastActivity()` and compares against per-agent
@@ -239,19 +239,12 @@ indicate bugs.
   the same config and same running set produces no side effects. A
   healthy running agent with a matching hash is always skipped.
 
-- **Crash tracking is bounded**: `memoryCrashTracker.prune()` removes
-  entries older than `restart_window` on every `recordStart()` and
-  `isQuarantined()` call. Memory grows at most O(max_restarts *
-  num_agents).
+- **Quarantine auto-expires**: Once `quarantined_until` on the session
+  bead has passed, the agent is eligible to wake on the next tick.
 
-- **Quarantine auto-expires**: Once all start timestamps within the
-  sliding window have aged past `restart_window`, `isQuarantined()`
-  returns false and the agent is restarted on the next tick.
-
-- **Crash tracking resets on controller restart**: The crash tracker is
-  in-memory only. Controller restart clears all quarantine state. This is
-  intentional (Erlang/OTP parallel: supervisor restart clears child
-  restart counts).
+- **Quarantine survives controller restart**: Quarantine state lives in
+  session bead metadata (`wake_attempts`, `churn_count`,
+  `quarantined_until`), not controller memory. `gc session wake` clears it.
 
 - **Config drift uses content hashing, not timestamps**:
   `runtime.ConfigFingerprint()` hashes command + env + fingerprint
@@ -288,7 +281,7 @@ Health Patrol follows Erlang/OTP patterns mapped to Gas City:
 | Worker                   | Session running an `[[agent]]` role       |
 | Child spec               | `[[agent]]` entry in `city.toml`         |
 | one_for_one restart      | Restart dead agent only (no cascade)      |
-| max_restarts/max_seconds | `max_restarts` / `restart_window`         |
+| max_restarts/max_seconds | circuit breaker: `max_restarts` / `restart_window` (opt-in) |
 | Links (death propagates) | Not implemented (no `depends_on` yet)     |
 | "Let it crash"           | Persistent work + run-what's-on-your-hook: |
 |                          | agent dies, hook persists, fresh session  |
@@ -322,7 +315,6 @@ All Health Patrol implementation lives in `cmd/gc/`:
 | `cmd/gc/controller.go` | Controller lock, Unix socket, fsnotify config watcher, `controllerLoop()`, `tryReloadConfig()`, `runController()`, `gracefulStopAll()` |
 | `cmd/gc/session_reconciler.go` | `reconcileSessionBeads()` bead-driven state machine for desired/live convergence, orphan/suspended drains, crash handling, idle drains, config-drift repair, and pool slot cleanup |
 | `cmd/gc/session_lifecycle_parallel.go` | Dependency-aware bounded parallel session starts and force-stops |
-| `cmd/gc/crash_tracker.go` | `crashTracker` interface, `memoryCrashTracker` (in-memory restart history with sliding window pruning) |
 | `cmd/gc/idle_tracker.go` | `idleTracker` interface, `memoryIdleTracker` (per-agent timeout + GetLastActivity query) |
 | `cmd/gc/order_dispatch.go` | `orderDispatcher` interface, `memoryOrderDispatcher` (trigger evaluation, exec dispatch, wisp dispatch, tracking bead lifecycle) |
 | `internal/config/config.go` | `DaemonConfig` struct with `PatrolIntervalDuration()`, `MaxRestartsOrDefault()`, `RestartWindowDuration()`, `ShutdownTimeoutDuration()` |
@@ -339,8 +331,8 @@ sections of `city.toml`:
 ```toml
 [daemon]
 patrol_interval = "30s"     # reconciliation tick frequency (default: 30s)
-max_restarts = 5            # crash loop threshold (default: 5, 0 = unlimited)
-restart_window = "1h"       # sliding window for restart counting (default: 1h)
+max_restarts = 5            # named-session circuit-breaker threshold + startup retry limit (default: 5, 0 = unlimited)
+restart_window = "1h"       # circuit-breaker sliding window (default: 1h)
 shutdown_timeout = "5s"     # grace period before force-kill on shutdown (default: 5s)
 wisp_gc_interval = "5m"     # how often to purge expired wisps (disabled if unset)
 wisp_ttl = "24h"            # how long closed wisps survive (disabled if unset)
@@ -367,7 +359,6 @@ Each Health Patrol component has dedicated unit tests:
 | `cmd/gc/controller_test.go` | Controller loop tick behavior, config reload, dirty flag, fsnotify debounce, order dispatch integration |
 | `cmd/gc/session_reconciler_test.go` | Session reconciliation states, zombie capture, crash loop quarantine integration, idle drains, pool drain, suspended session handling |
 | `cmd/gc/session_lifecycle_parallel_test.go` | Dependency-aware bounded parallel starts and force-stops |
-| `cmd/gc/crash_tracker_test.go` | Sliding window pruning, quarantine threshold, clear history, nil-guard (disabled tracker) |
 | `cmd/gc/idle_tracker_test.go` | Timeout detection, zero time handling, per-agent timeout configuration, nil-guard |
 | `cmd/gc/order_dispatch_test.go` | Trigger evaluation (cooldown, cron, condition, event, manual), exec dispatch, wisp dispatch, tracking bead creation, timeout capping, rig-scoped orders |
 
@@ -382,10 +373,10 @@ stubbed `ExecRunner`) with no external infrastructure dependencies. See
   `one_for_one` (restart the dead agent, nothing else). There is no
   `depends_on` mechanism for agent dependency ordering.
 
-- **Crash tracker is in-memory only**: Crash history is lost on
-  controller restart. An agent that crash-looped before a controller
-  restart will be retried immediately. This is intentional (matches
-  Erlang/OTP behavior) but may surprise operators.
+- **Crash-loop state is bead-backed**: `wake_attempts`, `churn_count`, and
+  `quarantined_until` live on the session bead, so a quarantine survives a
+  controller restart. The named-session circuit breaker is in-memory and
+  resets on restart.
 
 - **Idle detection depends on provider support**: `GetLastActivity()`
   returns zero time if the session provider does not support activity

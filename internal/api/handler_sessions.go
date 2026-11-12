@@ -493,16 +493,6 @@ func (s *Server) handleSessionWake(w http.ResponseWriter, r *http.Request) {
 	if err := withdrawQueuedWaitNudges(s.state.NudgesBeadStore(), s.state.CityPath(), res.NudgeIDs); err != nil {
 		log.Printf("gc api: withdrawing queued wait nudges after wake %s: %v", id, err)
 	}
-	// Clear in-memory crash tracker so the reconciler doesn't immediately
-	// re-quarantine the session based on stale crash history. Read the RAW
-	// SessionNameMetadata (not Info.SessionName, which falls back to
-	// sessionNameFor(ID)) to preserve the skip-when-unset behavior. res.Info is
-	// the typed WakeResult projection (WI-4), so no raw bead is cracked here.
-	sessionName := res.Info.SessionNameMetadata
-	if sessionName != "" {
-		s.state.ClearCrashHistory(sessionName)
-	}
-
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
 }
 

@@ -50,7 +50,7 @@ automations, and garbage-collects expired wisps.
   and building the corresponding agent instances. Pool checks run in
   parallel via goroutines.
 
-- **Nil-Guard Tracker Pattern**: Optional subsystems (crash tracker, idle
+- **Nil-Guard Tracker Pattern**: Optional subsystems (idle
   tracker, wisp GC, order dispatcher) follow a nil-means-disabled
   convention. Callers check `if tracker != nil` before use. This avoids
   conditional plumbing and keeps the loop body clean.
@@ -303,7 +303,6 @@ All controller implementation lives in `cmd/gc/`:
 | `cmd/gc/formula_resolve.go` | `ResolveFormulas()` (layered symlink materialization) |
 | `cmd/gc/wisp_gc.go` | `wispGC` interface, `memoryWispGC` (TTL-based closed molecule purging) |
 | `cmd/gc/order_dispatch.go` | `orderDispatcher` interface, `memoryOrderDispatcher`, `buildOrderDispatcher()` |
-| `cmd/gc/crash_tracker.go` | `crashTracker` interface, `memoryCrashTracker` |
 | `cmd/gc/idle_tracker.go` | `idleTracker` interface, `memoryIdleTracker` |
 | `cmd/gc/cmd_agent_drain.go` | `drainOps` interface, `providerDrainOps` (session metadata-backed drain signals) |
 
@@ -323,8 +322,8 @@ The controller is configured via the `[daemon]` section of `city.toml`:
 ```toml
 [daemon]
 patrol_interval = "30s"     # reconciliation tick frequency (default: 30s)
-max_restarts = 5            # crash loop threshold (default: 5, 0 = unlimited)
-restart_window = "1h"       # sliding window for restart counting (default: 1h)
+max_restarts = 5            # named-session circuit-breaker threshold + startup retry limit (default: 5, 0 = unlimited)
+restart_window = "1h"       # circuit-breaker sliding window (default: 1h)
 shutdown_timeout = "5s"     # grace period before force-kill (default: 5s)
 wisp_gc_interval = "5m"     # wisp GC run frequency (disabled if unset)
 wisp_ttl = "24h"            # how long closed wisps survive (disabled if unset)
@@ -408,8 +407,8 @@ testing philosophy and tier boundaries.
   controller. File permissions (0o755 on `.gc/`) provide the only access
   control.
 
-- **Tracker state is in-memory only**: Crash tracker history, idle
-  tracker timestamps, and order dispatch state are all lost on
+- **Tracker state is in-memory only**: Idle tracker timestamps and
+  order dispatch state are lost on
   controller restart. This is intentional (matches Erlang/OTP supervisor
   restart semantics) but may surprise operators expecting persistence
   across restarts.
