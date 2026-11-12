@@ -415,6 +415,8 @@ testing philosophy and tier boundaries.
 
 ## See Also
 
+- [Session Reconciliation](session-reconciliation.md) -- contributor
+  walkthrough of the session reconciler's phases and decisions
 - [Health Patrol](health-patrol.md) -- reconciliation state machine,
   crash loop quarantine, idle tracking, and order dispatch details
 - [Architecture glossary](glossary.md) -- authoritative definitions
