@@ -3,6 +3,7 @@ package dispatch
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -164,6 +165,273 @@ func TestRetryLifecycleTransientThenPass(t *testing.T) {
 	}
 	if log[1]["outcome"] != "pass" || log[1]["action"] != "close" {
 		t.Errorf("log[1] = %v, want pass/close", log[1])
+	}
+}
+
+// TestRetryLifecycleAttachedAttemptExemptFromFalseScopeAbort reproduces
+// gc-yydp6f end to end: an Attach-spawned retry attempt that bare-closes with
+// a typed deliverable disposition (no flat gc.outcome) must carry
+// gc.logical_bead_id so isRetryAttemptSubject recognizes it, both at the
+// scope-check that blocks directly on the attempt bead and at
+// workflow-finalize's root-wide terminal-abort-scope scan. Without the fix,
+// buildAttemptRecipe stamped gc.control_for but not gc.logical_bead_id, so a
+// passing attempt with an abort_scope step and no flat outcome was
+// misclassified as a terminal failure and falsely aborted the scope /
+// failed the workflow despite the logical retry closing pass.
+func TestRetryLifecycleAttachedAttemptExemptFromFalseScopeAbort(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	spec := &formula.Step{
+		ID:    "review",
+		Title: "Review",
+		Type:  "task",
+		Retry: &formula.RetrySpec{MaxAttempts: 3},
+		Metadata: map[string]string{
+			"gc.on_fail": "abort_scope",
+		},
+	}
+	root, control := makeRetryControl(t, store, "mol-scoped-work.review", spec, 3)
+
+	// --- Attempt 1: transient failure, spawns attempt 2 via Attach ---
+	attempt1 := makeAttemptBead(t, store, root.ID, "mol-scoped-work.review.attempt.1", 1, map[string]string{
+		"gc.outcome":        "fail",
+		"gc.failure_class":  "transient",
+		"gc.failure_reason": "rate_limited",
+	})
+	mustDep(t, store, control.ID, attempt1.ID, "blocks")
+
+	result1, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRetryControl attempt 1: %v", err)
+	}
+	if result1.Action != "retry" {
+		t.Fatalf("attempt 1 action = %q, want retry", result1.Action)
+	}
+
+	attempt2 := findAttemptByRef(t, store, root.ID, "mol-scoped-work.review.attempt.2")
+	if attempt2.ID == "" {
+		t.Fatal("attempt 2 was not created by Attach")
+	}
+	if attempt2.Metadata["gc.on_fail"] != "abort_scope" {
+		t.Fatalf("attempt 2 gc.on_fail = %q, want abort_scope propagated from frozen step spec", attempt2.Metadata["gc.on_fail"])
+	}
+	// This is the regression guard: buildAttemptRecipe must stamp
+	// gc.logical_bead_id alongside gc.control_for so isRetryAttemptSubject
+	// recognizes this attempt root as retry-managed.
+	if attempt2.Metadata["gc.logical_bead_id"] != control.ID {
+		t.Fatalf("attempt 2 gc.logical_bead_id = %q, want %q (control ID)", attempt2.Metadata["gc.logical_bead_id"], control.ID)
+	}
+
+	// --- Attempt 2: deliverable pass, bare-closed (no flat gc.outcome) ---
+	// gc-outcome-close records work_id = the closed bead's own ID and does
+	// not set a flat gc.outcome; the disposition envelope is the only
+	// record of the passing verdict.
+	disposition := fmt.Sprintf(`{"contract_version":1,"disposition":"deliverable","work_id":%q,"recorded_by":"formula-step","reason":"done","producer":"formula-step"}`, attempt2.ID)
+	if err := store.SetMetadata(attempt2.ID, "gc.coordinator_outcome.producer_disposition", disposition); err != nil {
+		t.Fatalf("set producer_disposition: %v", err)
+	}
+	mustClose(t, store, attempt2.ID)
+
+	result2, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRetryControl attempt 2: %v", err)
+	}
+	if result2.Action != "pass" {
+		t.Fatalf("attempt 2 action = %q, want pass", result2.Action)
+	}
+	controlFinal := mustGet(t, store, control.ID)
+	if controlFinal.Status != "closed" || controlFinal.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("control = status %q outcome %q, want closed/pass", controlFinal.Status, controlFinal.Metadata["gc.outcome"])
+	}
+
+	// --- Scope check blocks directly on the attempt bead, mirroring the
+	// bug's exact wiring (scope-check -> attempt root, not the logical
+	// retry control). A downstream "submission" sibling remains open. ---
+	const scopeRef = "mol-scoped-work"
+	scopeBody := mustCreate(t, store, beads.Bead{
+		Title: "scoped work body",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    scopeRef,
+		},
+	})
+	submission := mustCreate(t, store, beads.Bead{
+		Title: "submission",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    scopeRef,
+			"gc.step_ref":     scopeRef + ".submission",
+		},
+	})
+	scopeCheck := mustCreate(t, store, beads.Bead{
+		Title: "scope check",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    scopeRef,
+		},
+	})
+	mustDep(t, store, scopeCheck.ID, attempt2.ID, "blocks")
+
+	scResult, err := processScopeCheck(store, mustGet(t, store, scopeCheck.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processScopeCheck: %v", err)
+	}
+	if !scResult.Processed || scResult.Action != "continue" {
+		t.Fatalf("scope-check result = %+v, want processed continue (no false abort)", scResult)
+	}
+	if scResult.Skipped != 0 {
+		t.Fatalf("scope-check skipped = %d, want 0 (no siblings skipped)", scResult.Skipped)
+	}
+	submissionAfterScopeCheck := mustGet(t, store, submission.ID)
+	if submissionAfterScopeCheck.Status != "open" {
+		t.Fatalf("submission status = %q after scope-check, want open (not skipped)", submissionAfterScopeCheck.Status)
+	}
+	scopeBodyAfterScopeCheck := mustGet(t, store, scopeBody.ID)
+	if scopeBodyAfterScopeCheck.Status != "open" {
+		t.Fatalf("scope body status = %q after scope-check, want open (scope not aborted or prematurely closed)", scopeBodyAfterScopeCheck.Status)
+	}
+
+	// --- Submission completes normally, then workflow-finalize must pass,
+	// proving the fix also prevents workflowRootHasTerminalAbortScopeFailure
+	// from downgrading the workflow outcome due to attempt 2's bare close. ---
+	if err := store.SetMetadata(submission.ID, "gc.outcome", "pass"); err != nil {
+		t.Fatalf("set submission outcome: %v", err)
+	}
+	mustClose(t, store, submission.ID)
+
+	finalizer := mustCreate(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	mustDep(t, store, finalizer.ID, control.ID, "blocks")
+	mustDep(t, store, finalizer.ID, submission.ID, "blocks")
+
+	finalResult, err := ProcessControl(store, mustGet(t, store, finalizer.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !finalResult.Processed || finalResult.Action != "workflow-pass" {
+		t.Fatalf("workflow-finalize result = %+v, want processed workflow-pass", finalResult)
+	}
+	rootAfter := mustGet(t, store, root.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("workflow root = status %q outcome %q, want closed/pass", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+// TestRetryLifecycleFailedAttemptWithFinalAttemptInFlightKeepsScopeOpen is
+// the gcf-vf45 incident shape (root gcf-yqqe, 2026-10-01): attempt 1 fails
+// transient, attempt 2 (Attach-spawned) fails transient with an explicit
+// gc.outcome=fail, and attempt 3 is still in progress. Attempt 2's own
+// scope-check must not abort the scope: the logical retry control, the
+// in-flight attempt 3 and the downstream submission all stay open, and the
+// retry control stays pending until attempt 3 records its outcome. When the
+// final attempt then fails, on_exhausted (default hard-fail) decides.
+func TestRetryLifecycleFailedAttemptWithFinalAttemptInFlightKeepsScopeOpen(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	spec := &formula.Step{
+		ID:       "implement",
+		Title:    "Implement",
+		Type:     "task",
+		Retry:    &formula.RetrySpec{MaxAttempts: 3},
+		Metadata: map[string]string{"gc.on_fail": "abort_scope"},
+	}
+	root, control := makeRetryControl(t, store, "mol-scoped-work.implement", spec, 3)
+
+	attempt1 := makeAttemptBead(t, store, root.ID, "mol-scoped-work.implement.attempt.1", 1, map[string]string{
+		"gc.outcome":        "fail",
+		"gc.failure_class":  "transient",
+		"gc.failure_reason": "anton_unavailable",
+	})
+	mustDep(t, store, control.ID, attempt1.ID, "blocks")
+	if r, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{}); err != nil || r.Action != "retry" {
+		t.Fatalf("attempt 1: result=%+v err=%v, want retry", r, err)
+	}
+
+	attempt2 := findAttemptByRef(t, store, root.ID, "mol-scoped-work.implement.attempt.2")
+	if attempt2.Metadata["gc.logical_bead_id"] != control.ID {
+		t.Fatalf("attempt 2 gc.logical_bead_id = %q, want %q", attempt2.Metadata["gc.logical_bead_id"], control.ID)
+	}
+	if err := store.SetMetadataBatch(attempt2.ID, map[string]string{
+		"gc.outcome":        "fail",
+		"gc.failure_class":  "transient",
+		"gc.failure_reason": "upstream_port_incompatible_with_base",
+	}); err != nil {
+		t.Fatalf("set attempt 2 outcome: %v", err)
+	}
+	mustClose(t, store, attempt2.ID)
+	if r, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{}); err != nil || r.Action != "retry" {
+		t.Fatalf("attempt 2: result=%+v err=%v, want retry", r, err)
+	}
+	attempt3 := findAttemptByRef(t, store, root.ID, "mol-scoped-work.implement.attempt.3")
+	if attempt3.ID == "" || attempt3.Status == "closed" {
+		t.Fatalf("attempt 3 = %+v, want an open in-flight attempt", attempt3)
+	}
+
+	const scopeRef = "body"
+	scopeBody := mustCreate(t, store, beads.Bead{
+		Title: "worktree body scope",
+		Metadata: map[string]string{
+			"gc.kind": "scope", "gc.scope_role": "body",
+			"gc.root_bead_id": root.ID, "gc.scope_ref": scopeRef,
+		},
+	})
+	submission := mustCreate(t, store, beads.Bead{
+		Title: "submit",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID, "gc.scope_ref": scopeRef,
+			"gc.step_ref": "mol-scoped-work.submit",
+		},
+	})
+	attempt2Check := mustCreate(t, store, beads.Bead{
+		Title: "attempt 2 scope check",
+		Metadata: map[string]string{
+			"gc.kind": "scope-check", "gc.root_bead_id": root.ID, "gc.scope_ref": scopeRef,
+			"gc.on_fail": "abort_scope",
+		},
+	})
+	mustDep(t, store, attempt2Check.ID, attempt2.ID, "blocks")
+
+	sc, err := processScopeCheck(store, mustGet(t, store, attempt2Check.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processScopeCheck(attempt 2): %v", err)
+	}
+	if sc.Action == "scope-fail" || sc.Skipped != 0 {
+		t.Fatalf("attempt 2 scope-check = %+v, want no abort and nothing skipped", sc)
+	}
+	for _, id := range []string{control.ID, attempt3.ID, submission.ID, scopeBody.ID} {
+		if b := mustGet(t, store, id); b.Status == "closed" {
+			t.Fatalf("%s closed with outcome %q while attempt 3 is in flight; want open", id, b.Metadata["gc.outcome"])
+		}
+	}
+	if _, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{}); !errors.Is(err, ErrControlPending) {
+		t.Fatalf("retry control with attempt 3 in flight: err=%v, want ErrControlPending", err)
+	}
+
+	if err := store.SetMetadataBatch(attempt3.ID, map[string]string{
+		"gc.outcome": "fail", "gc.failure_class": "transient", "gc.failure_reason": "still_broken",
+	}); err != nil {
+		t.Fatalf("set attempt 3 outcome: %v", err)
+	}
+	mustClose(t, store, attempt3.ID)
+	r, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("attempt 3 (exhausted): %v", err)
+	}
+	if r.Action == "retry" {
+		t.Fatalf("attempt 3 action = retry; want an exhausted terminal action")
+	}
+	if c := mustGet(t, store, control.ID); c.Status != "closed" || c.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("exhausted control = status %q outcome %q, want closed/fail (default on_exhausted=hard_fail)", c.Status, c.Metadata["gc.outcome"])
 	}
 }
 
