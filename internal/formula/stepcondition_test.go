@@ -358,3 +358,99 @@ func collectStepIDsForTest(steps []*Step) []string {
 	}
 	return ids
 }
+
+// gcf-g6x5q: a step dropped by a false condition is a pass-through for
+// ordering. Its dependents inherit its own needs instead of losing the edge,
+// so a -> b(false) -> c still runs c after a.
+func TestFilterStepsByConditionInheritsNeedsOfDroppedSteps(t *testing.T) {
+	off := "{{flag}} == yes"
+	vars := map[string]string{"flag": "no"}
+
+	find := func(steps []*Step, id string) *Step {
+		for _, s := range steps {
+			if s.ID == id {
+				return s
+			}
+		}
+		t.Fatalf("step %q missing from %v", id, steps)
+		return nil
+	}
+	equal := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	t.Run("single dropped step", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "a"},
+			{ID: "b", Condition: off, Needs: []string{"a"}},
+			{ID: "c", Needs: []string{"b"}},
+		}
+		got, err := FilterStepsByCondition(steps, vars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d steps, want 2 (b filtered)", len(got))
+		}
+		if c := find(got, "c"); !equal(c.Needs, []string{"a"}) {
+			t.Errorf("c.Needs = %v, want [a] inherited through dropped b", c.Needs)
+		}
+		if !equal(steps[2].Needs, []string{"b"}) {
+			t.Errorf("input mutated: c.Needs = %v", steps[2].Needs)
+		}
+	})
+
+	t.Run("chain of dropped steps and depends_on", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "a"},
+			{ID: "x"},
+			{ID: "b", Condition: off, Needs: []string{"a"}},
+			{ID: "c", Condition: off, DependsOn: []string{"b", "x"}},
+			{ID: "d", DependsOn: []string{"c", "a"}},
+		}
+		got, err := FilterStepsByCondition(steps, vars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := find(got, "d"); !equal(d.DependsOn, []string{"a", "x"}) {
+			t.Errorf("d.DependsOn = %v, want [a x] (deduped, transitive)", d.DependsOn)
+		}
+	})
+
+	t.Run("dropped step with no needs just drops the edge", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "b", Condition: off},
+			{ID: "c", Needs: []string{"b"}},
+		}
+		got, err := FilterStepsByCondition(steps, vars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c := find(got, "c"); len(c.Needs) != 0 {
+			t.Errorf("c.Needs = %v, want empty", c.Needs)
+		}
+	})
+
+	t.Run("children of a dropped parent inherit the parent's needs", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "a"},
+			{ID: "p", Condition: off, Needs: []string{"a"}, Children: []*Step{{ID: "p.1"}}},
+			{ID: "c", Needs: []string{"p.1"}},
+		}
+		got, err := FilterStepsByCondition(steps, vars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c := find(got, "c"); !equal(c.Needs, []string{"a"}) {
+			t.Errorf("c.Needs = %v, want [a] via dropped parent p", c.Needs)
+		}
+	})
+}

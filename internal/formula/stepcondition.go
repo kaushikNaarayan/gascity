@@ -110,6 +110,12 @@ func unquoteValue(s string) string {
 // Steps with conditions that evaluate to false are excluded from the result.
 // Children of excluded steps are also excluded.
 //
+// An excluded step is a pass-through for ordering (gcf-g6x5q): any remaining
+// step that needs or depends on it inherits the excluded step's own needs,
+// resolved transitively, so a -> b(false) -> c still orders c after a instead
+// of leaving c with no blocking edge. Children of an excluded step inherit the
+// parent's needs as well.
+//
 // Parameters:
 //   - steps: the steps to filter
 //   - vars: variable values for condition evaluation
@@ -119,7 +125,18 @@ func FilterStepsByCondition(steps []*Step, vars map[string]string) ([]*Step, err
 	if vars == nil {
 		vars = make(map[string]string)
 	}
+	dropped := make(map[string][]string)
+	result, err := filterStepsByCondition(steps, vars, dropped)
+	if err != nil {
+		return nil, err
+	}
+	if len(dropped) > 0 {
+		rewireDroppedStepDeps(result, dropped)
+	}
+	return result, nil
+}
 
+func filterStepsByCondition(steps []*Step, vars map[string]string, dropped map[string][]string) ([]*Step, error) {
 	result := make([]*Step, 0, len(steps))
 
 	for _, step := range steps {
@@ -130,7 +147,9 @@ func FilterStepsByCondition(steps []*Step, vars map[string]string) ([]*Step, err
 		}
 
 		if !include {
-			// Skip this step and all its children
+			// Skip this step and all its children, remembering their needs
+			// so dependents can be rewired through them.
+			recordDroppedStep(step, nil, dropped)
 			continue
 		}
 
@@ -139,7 +158,7 @@ func FilterStepsByCondition(steps []*Step, vars map[string]string) ([]*Step, err
 
 		// Recursively filter children
 		if len(step.Children) > 0 {
-			filteredChildren, err := FilterStepsByCondition(step.Children, vars)
+			filteredChildren, err := filterStepsByCondition(step.Children, vars, dropped)
 			if err != nil {
 				return nil, err
 			}
@@ -150,4 +169,67 @@ func FilterStepsByCondition(steps []*Step, vars map[string]string) ([]*Step, err
 	}
 
 	return result, nil
+}
+
+// recordDroppedStep records the direct needs of a dropped step and its whole
+// subtree. A child of a dropped step also carries its parent's needs.
+func recordDroppedStep(step *Step, inherited []string, dropped map[string][]string) {
+	deps := append(append(append([]string(nil), step.Needs...), step.DependsOn...), inherited...)
+	dropped[step.ID] = deps
+	for _, child := range step.Children {
+		recordDroppedStep(child, deps, dropped)
+	}
+}
+
+// rewireDroppedStepDeps replaces every reference to a dropped step in Needs and
+// DependsOn with that step's transitively resolved needs, de-duplicated and in
+// first-seen order.
+func rewireDroppedStepDeps(steps []*Step, dropped map[string][]string) {
+	resolved := make(map[string][]string, len(dropped))
+	var resolve func(id string, visiting map[string]bool) []string
+	resolve = func(id string, visiting map[string]bool) []string {
+		if r, ok := resolved[id]; ok {
+			return r
+		}
+		if visiting[id] {
+			return nil // cycle among dropped steps: contributes no edge
+		}
+		visiting[id] = true
+		var out []string
+		for _, dep := range dropped[id] {
+			if _, isDropped := dropped[dep]; isDropped {
+				out = append(out, resolve(dep, visiting)...)
+				continue
+			}
+			out = append(out, dep)
+		}
+		delete(visiting, id)
+		resolved[id] = out
+		return out
+	}
+	rewrite := func(ids []string) []string {
+		if len(ids) == 0 {
+			return ids
+		}
+		seen := make(map[string]bool, len(ids))
+		out := make([]string, 0, len(ids))
+		for _, id := range ids {
+			targets := []string{id}
+			if _, isDropped := dropped[id]; isDropped {
+				targets = resolve(id, map[string]bool{})
+			}
+			for _, t := range targets {
+				if !seen[t] {
+					seen[t] = true
+					out = append(out, t)
+				}
+			}
+		}
+		return out
+	}
+	for _, step := range steps {
+		step.Needs = rewrite(step.Needs)
+		step.DependsOn = rewrite(step.DependsOn)
+		rewireDroppedStepDeps(step.Children, dropped)
+	}
 }
