@@ -13,6 +13,15 @@ on:
         description: "Seconds a bd call may run before it is SIGQUIT-dumped"
         required: false
         default: "60"
+      bd_ref:
+        description: "beads commit/tag built from source for the LIVE leg (default = commit of the town's live bd 1.1.1-dev)"
+        required: false
+        default: "bf97b73749ac"
+      include_rc2:
+        description: "Also run a second leg with the VERSIONS-pinned bd release (rc.2)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -24,11 +33,15 @@ concurrency:
 jobs:
   burst:
     if: ${{ github.repository != 'gastownhall/gascity' }}
+    name: burst (${{ matrix.leg }})
     runs-on: [self-hosted, pool]
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        leg: ${{ fromJSON(inputs.include_rc2 && '["live","rc2"]' || '["live"]') }}
     env:
-      DOLT_VERSION: "2.1.10"
-      BD_VERSION: "v1.1.0"
       GO_VERSION: "1.26.5"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -37,22 +50,60 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: Verify jq is present (no sudo install on self-hosted)
         run: command -v jq || { echo "jq missing on this runner"; exit 1; }
-      - name: Install dolt v${{ env.DOLT_VERSION }} (cached, no sudo)
-        run: .github/scripts/install-dolt-archive.sh "${{ env.DOLT_VERSION }}" --cache
-      - name: Install bd ${{ env.BD_VERSION }} (cached, no sudo)
-        run: .github/scripts/install-bd-archive.sh "${{ env.BD_VERSION }}" --cache
+      - name: Resolve VERSIONS pin
+        id: pins
+        run: |
+          set -euo pipefail
+          bd_version="$(grep -E '^BD_VERSION=' VERSIONS | cut -d= -f2)"
+          dolt_version="$(grep -E '^DOLT_VERSION=' VERSIONS | cut -d= -f2)"
+          test -n "$bd_version" || { echo "::error::BD_VERSION not found in VERSIONS"; exit 1; }
+          test -n "$dolt_version" || { echo "::error::DOLT_VERSION not found in VERSIONS"; exit 1; }
+          echo "bd_version=v${bd_version}" >> "$GITHUB_OUTPUT"
+          echo "dolt_version=${dolt_version}" >> "$GITHUB_OUTPUT"
+      - name: Install dolt ${{ steps.pins.outputs.dolt_version }} (VERSIONS-pinned, cached, no sudo)
+        run: .github/scripts/install-dolt-archive.sh "${{ steps.pins.outputs.dolt_version }}" --cache
+      - name: Install bd rc.2 (VERSIONS-pinned release, cached, no sudo)
+        if: ${{ matrix.leg == 'rc2' }}
+        run: .github/scripts/install-bd-archive.sh "${{ steps.pins.outputs.bd_version }}" --cache
+      - name: Build live bd from source (${{ inputs.bd_ref || 'bf97b73749ac' }})
+        if: ${{ matrix.leg == 'live' }}
+        env:
+          BD_REF: ${{ inputs.bd_ref || 'bf97b73749ac' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bd-bin"
+          GOBIN="$RUNNER_TEMP/bd-bin" CGO_ENABLED=0 go install -tags gms_pure_go "github.com/steveyegge/beads/cmd/bd@${BD_REF}"
+          echo "$RUNNER_TEMP/bd-bin" >> "$GITHUB_PATH"
       - name: Build gc
         run: go build -o "$RUNNER_TEMP/bin/gc" ./cmd/gc && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Burst
         env:
+          BD_SOURCE: ${{ matrix.leg == 'live' && format('source commit {0}', inputs.bd_ref || 'bf97b73749ac') || format('release {0}', steps.pins.outputs.bd_version) }}
           BURST_SIZES: ${{ inputs.burst_sizes }}
           STUCK_AFTER_S: ${{ inputs.stuck_after_s }}
-          OUT_DIR: ${{ runner.temp }}/bd-burst-out
-        run: scripts/ci/bd-burst-repro.sh
+          OUT_DIR: ${{ runner.temp }}/bd-burst-out-${{ matrix.leg }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          { echo "leg: ${{ matrix.leg }}"; echo "bd: $(command -v bd)"; echo "bd source: $BD_SOURCE"; bd version 2>&1 | head -3; dolt version | head -1; } | tee "$OUT_DIR/bd-version.txt"
+          scripts/ci/bd-burst-repro.sh
+      - name: Print results (artifact storage may be over quota)
+        if: ${{ always() }}
+        run: |
+          out="${{ runner.temp }}/bd-burst-out-${{ matrix.leg }}"
+          [ -f "$out/bd-version.txt" ] && cat "$out/bd-version.txt"
+          if [ -f "$out/summary.txt" ]; then
+            cat "$out/summary.txt"
+            { echo "### leg: ${{ matrix.leg }}"; echo '```'; cat "$out/bd-version.txt" "$out/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          for d in "$out"/dumps/*; do
+            [ -f "$d" ] || continue
+            echo "== $d (first 20KB) =="; head -c 20000 "$d"
+          done
       - name: Upload dumps and results
         if: ${{ always() }}
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bd-burst-out
-          path: ${{ runner.temp }}/bd-burst-out
+          name: bd-burst-out-${{ matrix.leg }}
+          path: ${{ runner.temp }}/bd-burst-out-${{ matrix.leg }}
           if-no-files-found: warn
