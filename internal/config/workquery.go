@@ -318,6 +318,41 @@ func standardAssignedWorkQueryScript(topo QueryTopology) string {
 		standardAssignedReadyWorkQueryScript(topo)
 }
 
+// Bounds on the assigned in_progress `bd list` (gcf-6986 AC3). The window is
+// the deadline timeout(1) gives the call; the grace is how long it then waits
+// after SIGTERM before SIGKILL, because a bd wedged on a futex can ignore the
+// first signal.
+const (
+	inProgressListTimeoutSeconds   = 10
+	inProgressListKillGraceSeconds = 2
+)
+
+// boundedInProgressListShell returns the shell that reads the assigned
+// in_progress bead for the identifier in shell variable idVar into $r, bounded
+// by timeout(1) so one hung bd client cannot block the session-start hook
+// forever and leak the process.
+//
+// A timeout leaves the assigned-work state UNKNOWN, so it is never reported as
+// no work: the tier prints one stderr line naming the identifier and exits
+// non-zero, which `gc hook` turns into an error instead of an idle signal. A
+// seat that holds an in_progress bead must not be told it has none and go
+// claim other work. When timeout(1) is not on PATH the call runs bare, with one
+// stderr warning per script run.
+//
+// The status is read from the command substitution, so GNU timeout's 124
+// (deadline) and 137 (killed after the grace) are the timeout signals; any
+// other bd failure keeps the tier's existing fall-through.
+func boundedInProgressListShell(idVar string) string {
+	deadline := strconv.Itoa(inProgressListTimeoutSeconds)
+	grace := strconv.Itoa(inProgressListKillGraceSeconds)
+	return `tmo=""; if command -v timeout >/dev/null 2>&1; then tmo="timeout -k ` + grace + ` ` + deadline + `"; ` +
+		`elif [ -z "$gc_tmo_warned" ]; then gc_tmo_warned=1; ` +
+		`echo "gc: timeout(1) not found, running bd list unbounded" >&2; fi; ` +
+		`r=$($tmo bd list --status in_progress --assignee="$` + idVar + `" --json --limit=1 2>/dev/null); rc=$?; ` +
+		`if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then ` +
+		`echo "gc: bd list timed out after ` + deadline + `s for $` + idVar + `, in-progress state UNKNOWN" >&2; exit "$rc"; fi; `
+}
+
 // standardAssignedInProgressWorkQueryScript is the crash-recovery tier.
 //
 // It is the ONE read tier the federation swap deliberately leaves on `bd list`.
@@ -335,7 +370,7 @@ func standardAssignedWorkQueryScript(topo QueryTopology) string {
 func standardAssignedInProgressWorkQueryScript(topo QueryTopology) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		boundedInProgressListShell("id") +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		inProgressBlockedByEnrichmentScript("r") +
 		`fi; ` +
@@ -447,7 +482,7 @@ func legacyControlAssignedInProgressWorkQueryScript(topo QueryTopology) string {
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		boundedInProgressListShell("cand") +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
 		inProgressBlockedByEnrichmentScript("r") +
 		`fi; ` +
