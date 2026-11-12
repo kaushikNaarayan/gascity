@@ -1228,7 +1228,15 @@ func (e *Editor) DeleteRig(name string) error {
 		return err
 	}
 
-	return e.writeRemovingRigs(cfg, name)
+	if err := e.writeRemovingRigs(cfg, name); err != nil {
+		return err
+	}
+	// Drop the rig's explicit suspend/resume override so a rig re-added under
+	// the same name starts from its own suspended_on_start (gcf-c0vz4).
+	if err := suspensionstate.SetRigSuspended(e.fs, filepath.Dir(e.tomlPath), name, nil); err != nil {
+		return fmt.Errorf("rig %q removed, but clearing its suspension override failed: %w", name, err)
+	}
+	return nil
 }
 
 // ProviderUpdate holds optional fields for a partial provider update.

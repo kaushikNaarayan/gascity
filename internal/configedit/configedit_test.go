@@ -2082,6 +2082,46 @@ path = "/tmp/my-rig"
 	}
 }
 
+// gcf-c0vz4: deleting a rig must drop its explicit suspend/resume override
+// from .gc/runtime/suspension-state.json, or a rig re-added under the same name
+// silently inherits the old preference instead of its suspended_on_start.
+func TestDeleteRigClearsSuspensionOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+
+[[rigs]]
+name = "my-rig"
+path = "/tmp/my-rig"
+
+[[rigs]]
+name = "other-rig"
+path = "/tmp/other-rig"
+`)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendRig("my-rig"); err != nil {
+		t.Fatalf("SuspendRig(my-rig): %v", err)
+	}
+	if err := ed.SuspendRig("other-rig"); err != nil {
+		t.Fatalf("SuspendRig(other-rig): %v", err)
+	}
+
+	if err := ed.DeleteRig("my-rig"); err != nil {
+		t.Fatalf("DeleteRig: %v", err)
+	}
+
+	st, err := suspensionstate.Load(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("suspensionstate.Load: %v", err)
+	}
+	if _, ok := suspensionstate.ExplicitRig(st, "my-rig"); ok {
+		t.Error("deleted rig still has an explicit suspension override")
+	}
+	if suspended, ok := suspensionstate.ExplicitRig(st, "other-rig"); !ok || !suspended {
+		t.Errorf("other-rig override = (%v, %v), want (true, true): delete must not touch other rigs", suspended, ok)
+	}
+}
+
 func TestDeleteRigRemovesDeletedSiteBindingAndPreservesOrphan(t *testing.T) {
 	dir := t.TempDir()
 	city := `[workspace]

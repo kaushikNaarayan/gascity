@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/supervisor"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 // ---------------------------------------------------------------------------
@@ -873,6 +874,39 @@ func TestRigAnywhere_RigRemove(t *testing.T) {
 			if r.Name == "rm-rig" {
 				t.Error("rig should be removed from city.toml")
 			}
+		}
+	})
+
+	// gcf-c0vz4: a removed rig's explicit suspend/resume override must not
+	// survive in .gc/runtime/suspension-state.json for a same-name re-add.
+	t.Run("clears_suspension_override", func(t *testing.T) {
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+		resetFlags(t)
+
+		cityPath := setupCity(t, "susp-city")
+		rigDir := filepath.Join(t.TempDir(), "susp-rig")
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		toml := "[workspace]\nname = \"susp-city\"\n\n[[agent]]\nname = \"mayor\"\n\n[[rigs]]\nname = \"susp-rig\"\npath = \"" + rigDir + "\"\n"
+		writeRigAnywhereCityToml(t, cityPath, toml)
+		suspended := true
+		if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "susp-rig", &suspended); err != nil {
+			t.Fatalf("seeding suspension override: %v", err)
+		}
+
+		cityFlag = cityPath
+		var stdout, stderr bytes.Buffer
+		if code := cmdRigRemove("susp-rig", &stdout, &stderr); code != 0 {
+			t.Fatalf("cmdRigRemove = %d, stderr: %s", code, stderr.String())
+		}
+		st, err := suspensionstate.Load(fsys.OSFS{}, cityPath)
+		if err != nil {
+			t.Fatalf("suspensionstate.Load: %v", err)
+		}
+		if _, ok := suspensionstate.ExplicitRig(st, "susp-rig"); ok {
+			t.Error("removed rig still has an explicit suspension override")
 		}
 	})
 
