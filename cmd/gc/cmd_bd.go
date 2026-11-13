@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -395,6 +396,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	cmd.Dir = target.ScopeRoot
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
+	// bd list never returns ephemeral wisps but bd query does, so a JSON list
+	// is unioned with an ephemeral query leg (gcf-a65a). Its stdout is held
+	// back until the merge.
+	listPlan := planBdListEphemeral(bdArgs)
+	var listOut bytes.Buffer
+	switch {
+	case listPlan.applies && listPlan.blockedBy != "":
+		fmt.Fprintf(stderr, "gc bd: list: ephemeral wisps not merged: %s cannot be expressed in the ephemeral query; use gc bd query for wisps\n", listPlan.blockedBy) //nolint:errcheck // best-effort stderr
+	case listPlan.applies:
+		cmd.Stdout = &listOut
+	}
 	// A frontier read (`ready`, `list --ready`) that exits 0 with an empty
 	// result reads as "no work". On a ledger the pinned bd cannot read it is a
 	// false green (gcf-tf22), so an empty result is verified against the ledger
@@ -459,6 +471,10 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	if bdOutputIndicatesSilentFallback(stderrScan.String()) {
 		fmt.Fprintln(stderr, bdSilentFallbackUserMessage) //nolint:errcheck // best-effort stderr
 		return bdSilentFallbackExitCode
+	}
+
+	if listPlan.applies && listPlan.blockedBy == "" {
+		return emitBdListWithEphemeral(listPlan, bdPath, cmd.Dir, cmd.Env, listOut.Bytes(), stdout, stderr)
 	}
 
 	if frontierRead && (stdoutScan == nil || bdFrontierOutputIsEmpty(stdoutScan.String())) {
