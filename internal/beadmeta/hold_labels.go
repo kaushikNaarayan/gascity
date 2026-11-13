@@ -35,3 +35,17 @@ const (
 // The short rule: filter on holds when deciding what to DO, never when
 // deciding who EXISTS.
 var DispatchHoldLabels = []string{HoldMayorLabel, HoldExternalLabel}
+
+// HasDispatchHold reports whether labels carry any DispatchHoldLabels value.
+// Callers deciding what to DO (wake a session, serve work) skip such beads;
+// callers deciding who EXISTS must not call it (see DispatchHoldLabels).
+func HasDispatchHold(labels []string) bool {
+	for _, label := range labels {
+		for _, hold := range DispatchHoldLabels {
+			if label == hold {
+				return true
+			}
+		}
+	}
+	return false
+}

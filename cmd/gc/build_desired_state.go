@@ -1694,6 +1694,11 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
+			// A dispatch-held bead is not work for any worker (`gc hook
+			// --claim` refuses it), so it must not wake a session either.
+			if beadmeta.HasDispatchHold(b.Labels) {
+				continue
+			}
 			template := controllerDemandRouteTarget(cfg, b, group.templates)
 			if _, ok := group.templates[template]; !ok {
 				continue

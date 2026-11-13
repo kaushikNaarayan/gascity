@@ -13364,3 +13364,47 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 		}
 	}
 }
+
+// A routed, unassigned bead parked on a dispatch hold is not work for any
+// worker: `gc hook --claim` refuses it, so counting it as pool demand wakes a
+// session that can only drain (gcf-95q0t).
+func TestDefaultScaleCheckCountsExcludesDispatchHeldRoutedWork(t *testing.T) {
+	const template = "gascity/workflows.codex-min"
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   int
+	}{
+		{name: "unheld", labels: nil, want: 1},
+		{name: "hold mayor", labels: []string{beadmeta.HoldMayorLabel}, want: 0},
+		{name: "hold external", labels: []string{beadmeta.HoldExternalLabel}, want: 0},
+		{name: "unrelated label", labels: []string{"priority"}, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			if _, err := store.Create(beads.Bead{
+				Title:    "routed work",
+				Type:     "task",
+				Status:   "open",
+				Labels:   tc.labels,
+				Metadata: map[string]string{"gc.routed_to": template},
+			}); err != nil {
+				t.Fatalf("create routed bead: %v", err)
+			}
+			counts, demand, _, errs := defaultScaleCheckCountsAndDemand(nil, []defaultScaleCheckTarget{{
+				template: template,
+				storeKey: "rig:gascity",
+				store:    store,
+			}})
+			if len(errs) != 0 {
+				t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+			}
+			if got := counts[template]; got != tc.want {
+				t.Fatalf("count = %d, want %d", got, tc.want)
+			}
+			if got := len(demand[template].WorkBeadIDs); got != tc.want {
+				t.Fatalf("demand work beads = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
