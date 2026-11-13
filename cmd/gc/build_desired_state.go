@@ -1694,6 +1694,13 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
+			// A held bead is not work for the pool: `gc hook --claim` refuses
+			// to serve it, so counting it wakes a session that can only drain
+			// with no_work (gcf-95q0t). Assigned beads above stay
+			// hold-transparent so an owner never goes invisible.
+			if beadHasDispatchHold(b) {
+				continue
+			}
 			template := controllerDemandRouteTarget(cfg, b, group.templates)
 			if _, ok := group.templates[template]; !ok {
 				continue
@@ -2072,6 +2079,20 @@ func listBothTiersForControllerDemand(store beads.Store, query beads.ListQuery) 
 // inert on that backend, tracked separately.
 func listOpenForControllerDemandLive(store beads.Store) ([]beads.Bead, error) {
 	return beads.HandlesFor(store).Live.List(beads.ListQuery{Status: "open", AllowScan: true})
+}
+
+// beadHasDispatchHold reports whether b carries a canonical dispatch hold
+// label (beadmeta.DispatchHoldLabels), compared exactly like isHeldHookCandidate.
+func beadHasDispatchHold(b beads.Bead) bool {
+	for _, label := range b.Labels {
+		label = strings.TrimSpace(label)
+		for _, hold := range beadmeta.DispatchHoldLabels {
+			if strings.EqualFold(label, hold) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func readyForControllerDemand(store beads.Store) ([]beads.Bead, error) {

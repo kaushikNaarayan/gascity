@@ -1235,6 +1235,56 @@ func TestDefaultScaleCheckCountsCountsUnassignedRoutedPoolWork(t *testing.T) {
 	}
 }
 
+// A bead parked on a canonical dispatch hold is not work for the pool: claim
+// (`gc hook --claim`) refuses to serve it, so counting it as demand wakes a
+// session that can only drain with no_work (gcf-95q0t). An unheld sibling must
+// still count.
+func TestDefaultScaleCheckCountsExcludesDispatchHeldRoutedWork(t *testing.T) {
+	const template = "gascity/reviewer"
+	for _, hold := range beadmeta.DispatchHoldLabels {
+		t.Run(hold, func(t *testing.T) {
+			backing := beads.NewMemStore()
+			if _, err := backing.Create(beads.Bead{
+				Title:    "held routed work",
+				Type:     "task",
+				Status:   "open",
+				Labels:   []string{hold},
+				Metadata: map[string]string{"gc.routed_to": template},
+			}); err != nil {
+				t.Fatalf("create held bead: %v", err)
+			}
+			open, err := backing.Create(beads.Bead{
+				Title:    "open routed work",
+				Type:     "task",
+				Status:   "open",
+				Metadata: map[string]string{"gc.routed_to": template},
+			})
+			if err != nil {
+				t.Fatalf("create open bead: %v", err)
+			}
+			cache := beads.NewCachingStoreForTest(backing, nil)
+			if err := cache.PrimeActive(); err != nil {
+				t.Fatalf("PrimeActive: %v", err)
+			}
+
+			counts, demand, _, errs := defaultScaleCheckCountsAndDemand(&config.City{}, []defaultScaleCheckTarget{{
+				template: template,
+				storeKey: "rig:gascity",
+				store:    cache,
+			}})
+			if len(errs) != 0 {
+				t.Fatalf("errs = %v", errs)
+			}
+			if got := counts[template]; got != 1 {
+				t.Fatalf("counts[%q] = %d, want 1 (held bead must not count)", template, got)
+			}
+			if ids := demand[template].WorkBeadIDs; len(ids) != 1 || ids[0] != open.ID {
+				t.Fatalf("demand WorkBeadIDs = %v, want [%s]", ids, open.ID)
+			}
+		})
+	}
+}
+
 func TestDefaultScaleCheckCountsCountsRoutedVaporWispViaReady(t *testing.T) {
 	const template = "maintenance.dog"
 	backing := &demandListCountingStore{Store: beads.NewMemStore()}
